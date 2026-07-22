@@ -60,14 +60,23 @@ fn run() -> Result<(), String> {
             return Err(format!("missing core wasm {}", core.display()));
         }
         let out = staging.join(format!("{}.wasm", r.path));
+        let unstripped = out.with_extension("unstripped.wasm");
         fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
         command(
             Command::new("wasm-tools")
                 .args(["component", "new"])
                 .arg(&core)
                 .args(["-o"])
+                .arg(&unstripped),
+        )?;
+        command(
+            Command::new("wasm-tools")
+                .args(["strip", "--all"])
+                .arg(&unstripped)
+                .args(["-o"])
                 .arg(&out),
         )?;
+        fs::remove_file(&unstripped).map_err(|e| e.to_string())?;
         command(Command::new("wasm-tools").args(["validate"]).arg(&out))?
     }
     let dest = root.join("petal/hyperliquid");
