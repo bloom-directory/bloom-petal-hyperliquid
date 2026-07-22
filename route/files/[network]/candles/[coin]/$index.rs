@@ -1,0 +1,1 @@
+petal::route_file!(spec: petal::dir_spec(), list: crate::static_list(&[("1m.json",false,false),("5m.json",false,false),("15m.json",false,false),("1h.json",false,false),("4h.json",false,false),("1d.json",false,false)]));

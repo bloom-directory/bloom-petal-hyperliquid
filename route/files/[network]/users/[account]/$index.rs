@@ -1,0 +1,1 @@
+petal::route_file!(spec: petal::dir_spec(), list: crate::static_list(&[("clearinghouse.json",false,false),("spot_state.json",false,false),("open_orders.json",false,false),("frontend_open_orders.json",false,false),("fills.json",false,false),("portfolio.json",false,false),("rate_limit.json",false,false),("extra_agents.json",false,false),("funding",true,false)]));

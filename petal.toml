@@ -1,0 +1,27 @@
+schema = "bloom.petal.package.v1"
+name = "hyperliquid"
+
+[consent]
+summary = "Read Hyperliquid market and account data, submit bounded signed HyperCore actions, and manage agent sessions through Bloom approval."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign"]
+
+[[net.allow]]
+binding = "mainnet"
+host = "api.hyperliquid.xyz"
+methods = ["post"]
+paths = ["/info", "/exchange"]
+
+[[net.allow]]
+binding = "testnet"
+host = "api.hyperliquid-testnet.xyz"
+methods = ["post"]
+paths = ["/info", "/exchange"]
+
+[sign]
+allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.usd_send", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]

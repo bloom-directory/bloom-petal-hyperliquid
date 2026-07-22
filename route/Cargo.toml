@@ -1,0 +1,25 @@
+[package]
+name = "bloom-hyperliquid-petal-route"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+alloy = { version = "=2.1.1", default-features = false, features = ["dyn-abi", "sol-types", "std"] }
+alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+petal = { path = "../sdk" }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

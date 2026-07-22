@@ -1,0 +1,4 @@
+/petal/hyperliquid/**/*.wasm
+/artifacts/
+/target/
+**/target/
