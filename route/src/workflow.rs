@@ -93,7 +93,7 @@ fn load_json<T: for<'de> Deserialize<'de>>(key: String) -> Result<Option<T>, Dis
         .map(Some)
         .map_err(|e| backend(format!("stored state is invalid: {e}")))
 }
-fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchResponse> {
+fn http_raw(net: Network, path: &str, body: Value) -> Result<(u16, Vec<u8>), DispatchResponse> {
     let b = serde_json::to_vec(&body).map_err(|e| backend(e.to_string()))?;
     let (status, raw) = petal::sdk::http(
         "POST",
@@ -105,6 +105,10 @@ fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchRes
     if raw.len() > MAX_BODY {
         return Err(backend("Hyperliquid response too large"));
     };
+    Ok((status, raw))
+}
+fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchResponse> {
+    let (status, raw) = http_raw(net, path, body)?;
     let v: Value = serde_json::from_slice(&raw)
         .map_err(|e| backend(format!("Hyperliquid returned invalid JSON: {e}")))?;
     if !(200..300).contains(&status) {
@@ -114,6 +118,29 @@ fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchRes
         )));
     };
     Ok(v)
+}
+fn http_read_json(net: Network, path: &str, body: Value) -> DispatchResponse {
+    let (status, raw) = match http_raw(net, path, body) {
+        Ok(response) => response,
+        Err(e) => return e,
+    };
+    read_json_response(status, raw)
+}
+fn read_json_response(status: u16, raw: Vec<u8>) -> DispatchResponse {
+    if let Err(e) = serde_json::from_slice::<serde::de::IgnoredAny>(&raw) {
+        return backend(format!("Hyperliquid returned invalid JSON: {e}"));
+    }
+    if !(200..300).contains(&status) {
+        let v: Value = match serde_json::from_slice(&raw) {
+            Ok(v) => v,
+            Err(e) => return backend(format!("Hyperliquid returned invalid JSON: {e}")),
+        };
+        return backend(format!(
+            "Hyperliquid API status {status}: {}",
+            safe_json(&v)
+        ));
+    }
+    DispatchResponse::Read(raw)
 }
 fn safe_json(v: &Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_else(|_| "<invalid>".into());
@@ -165,10 +192,7 @@ pub fn read(ctx: &Ctx) -> DispatchResponse {
         Ok(x) => x,
         Err(e) => return e,
     };
-    match http_json(net, "/info", body) {
-        Ok(v) => ok_json(v),
-        Err(e) => e,
-    }
+    http_read_json(net, "/info", body)
 }
 
 fn read_request(ctx: &Ctx, r: &str) -> Result<Value, DispatchResponse> {
@@ -1833,6 +1857,15 @@ mod tests {
                 ],
             ),
             vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn public_read_response_preserves_large_json_without_reserializing() {
+        let raw = format!(r#"[{}]"#, vec![r#"{"value":"test"}"#; 50_000].join(",")).into_bytes();
+        assert_eq!(
+            read_json_response(200, raw.clone()),
+            DispatchResponse::Read(raw)
         );
     }
 }
