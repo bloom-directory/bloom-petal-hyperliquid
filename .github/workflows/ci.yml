@@ -56,6 +56,30 @@ jobs:
       - name: Build source package
         run: scripts/build.sh
 
+      - name: Check out pinned Petal tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/petal
+          ref: b69fe526b1bd65df81276c934a9d7403e2a735bf
+          path: .petal-tooling
+          persist-credentials: false
+
+      - name: Validate release packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --locked \
+            --release \
+            --manifest-path .petal-tooling/Cargo.toml \
+            -p bloom-petal-cli
+          cp .petal-tooling/target/release/petal "$RUNNER_TEMP/petal"
+          rm -rf .petal-tooling
+          "$RUNNER_TEMP/petal" package \
+            --root . \
+            --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
+            | jq -e '.routes == 62'
+
       - name: Check out Bloom CLI
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:

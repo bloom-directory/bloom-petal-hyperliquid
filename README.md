@@ -47,8 +47,9 @@ bloom vfs ls /petals/hyperliquid/mainnet
 ## Releases
 
 Installable archives are built by the tag-triggered release workflow using the
-pinned `bloom-directory/petal` packaging toolchain. Release tags use Semantic
-Versioning with a `v` prefix and publish:
+pinned `bloom-directory/petal` packaging toolchain. CI runs the same packaging
+validation before a tag is created. Release tags use Semantic Versioning with
+a `v` prefix and publish:
 
 - `hyperliquid-vX.Y.Z.petal.tar.gz`
 - `SHA256SUMS`
