@@ -1,6 +1,14 @@
 schema = "bloom.petal.package.v1"
 name = "hyperliquid"
 
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-hyperliquid"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["petal/hyperliquid"]
+
 [consent]
 summary = "Read Hyperliquid market and account data, submit bounded signed HyperCore actions, and manage agent sessions through Bloom approval."
 
