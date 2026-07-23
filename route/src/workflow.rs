@@ -929,7 +929,7 @@ fn session_write(ctx: &Ctx, body: &[u8]) -> DispatchResponse {
         return denied("session has expired");
     };
     if matches!(leaf.as_str(), "cancel_all" | "close_all") {
-        let key = match session_agent_key(n, &w, id, &s) {
+        let key = match session_agent_key(&w, id, &s) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -979,13 +979,10 @@ fn session_write(ctx: &Ctx, body: &[u8]) -> DispatchResponse {
         Err(e) => return invalid(e),
     };
     let sig = match signer.sign_hash_sync(&hash) {
-        Ok(x) => protocol::SignatureJson::from_raw(&x.as_bytes()).unwrap_or_else(|_| {
-            protocol::SignatureJson {
-                r: "0x".into(),
-                s: "0x".into(),
-                v: 0,
-            }
-        }),
+        Ok(x) => match protocol::SignatureJson::from_raw(&x.as_bytes()) {
+            Ok(v) => v,
+            Err(e) => return backend(e),
+        },
         Err(e) => return backend(format!("agent signing failed: {e}")),
     };
     let action_kind = req.action.kind();
@@ -1059,12 +1056,7 @@ fn session_write(ctx: &Ctx, body: &[u8]) -> DispatchResponse {
         }
     }
 }
-fn session_agent_key(
-    _n: Network,
-    w: &str,
-    id: &str,
-    s: &Session,
-) -> Result<Vec<u8>, DispatchResponse> {
+fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
     match petal::sdk::get(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
         Ok(Some(x)) => Ok(x),
         Ok(None) => Err(backend(

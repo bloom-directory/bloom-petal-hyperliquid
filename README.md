@@ -3,20 +3,21 @@
 This package moves Bloom's Hyperliquid HyperCore surface into a standalone
 local Petal. It exposes read-only market/account files, signed exchange
 actions, owner-approved USD transfers, and bounded API-agent sessions under
-`/petals/hyperliquid/`.
+`petal/hyperliquid/`.
 
 All HTTP access, persistence, and signing are mediated by Bloom. Private keys
-and signatures are never returned through the public
-filesystem. The exchange surface includes orders, cancels, cancel-by-cloid,
-scheduled cancel, leverage updates, raw signed payloads, and internal USD
-sends. Agent sessions include owner-approved creation, bounded agent-key
-actions, stop, cancel-all, close-all, and audit.
+and signatures are never returned through the public filesystem. The exchange
+surface covers orders, cancels, cancel-by-cloid, scheduled cancel, leverage
+updates, raw signed payloads, and internal USD sends. Agent sessions provide
+owner-approved creation, bounded agent-key actions, stop, cancel-all,
+close-all, and audit.
+
 A session request requires a stable `id` so an approval-required request can
-be retried with the exact same body without rotating its agent key.
-A successful write means the route completed; inspect the durable response,
+be retried with the exact same body without rotating its agent key. A
+successful write means the route completed; inspect the durable response,
 status, and error files before treating an action as submitted.
 
-Build and validate with:
+## Build
 
 ```sh
 scripts/build.sh
