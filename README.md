@@ -10,7 +10,7 @@ and signatures are never returned through the public
 filesystem. The exchange surface includes orders, cancels, cancel-by-cloid,
 scheduled cancel, leverage updates, raw signed payloads, and internal USD
 sends. Agent sessions include owner-approved creation, bounded agent-key
-actions, stop, cancel-all, close-all, audit, and fail-closed orphan recovery.
+actions, stop, cancel-all, close-all, and audit.
 A session request requires a stable `id` so an approval-required request can
 be retried with the exact same body without rotating its agent key.
 A successful write means the route completed; inspect the durable response,

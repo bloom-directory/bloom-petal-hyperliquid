@@ -129,7 +129,7 @@ pub fn read(ctx: &Ctx) -> DispatchResponse {
     }
     if r.ends_with("README.md") {
         return ok_json(
-            "# Hyperliquid Petal\n\nReads use Hyperliquid /info. Writes are signed through Bloom and persisted under inspectable response/status files. Exchange writes cover order, cancel, cancel-by-cloid, schedule-cancel, leverage, raw signed, and usdSend. Agent sessions provide bounded owner-approved trading, cancel-all, close-all, audit, and fail-closed orphan recovery.\n",
+            "# Hyperliquid Petal\n\nReads use Hyperliquid /info. Writes are signed through Bloom and persisted under inspectable response/status files. Exchange writes cover order, cancel, cancel-by-cloid, schedule-cancel, leverage, raw signed, and usdSend. Agent sessions provide bounded owner-approved trading, cancel-all, close-all, and audit.\n",
         );
     }
     if r.ends_with("asset_ids.md") {
@@ -858,7 +858,7 @@ fn session_read(ctx: &Ctx) -> DispatchResponse {
     }
     if matches!(
         file.as_str(),
-        "stop" | "cancel_all" | "close_all" | "orphan_cancel_all" | "orphan_close_all"
+        "stop" | "cancel_all" | "close_all"
     ) {
         return ok_json(json!({"description": format!("write anything to invoke session {file}")}));
     }
@@ -918,11 +918,6 @@ fn session_write(ctx: &Ctx, body: &[u8]) -> DispatchResponse {
             return e;
         };
         return ok_write();
-    };
-    if matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") {
-        return denied(
-            "orphan recovery requires owner Sealed Approval signing and is intentionally fail-closed",
-        );
     };
     if leaf == "audit.jsonl" {
         return denied("audit.jsonl is read-only");
