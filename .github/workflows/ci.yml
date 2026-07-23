@@ -50,9 +50,6 @@ jobs:
           cargo clippy --manifest-path sdk/Cargo.toml --locked --all-targets -- -D warnings
           cargo clippy --manifest-path xtask/Cargo.toml --locked --all-targets -- -D warnings
 
-      - name: Install WASM component tools
-        run: cargo install wasm-tools --version 1.254.0 --locked
-
       - name: Build source package
         run: scripts/build.sh
 
