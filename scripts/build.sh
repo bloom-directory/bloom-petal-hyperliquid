@@ -3,6 +3,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WASM_TOOLS_ROOT="$ROOT/target/wasm-tools"
 WASM_TOOLS_VERSION="1.254.0"
+if ! rustup target list --installed | grep -Fxq wasm32-unknown-unknown; then
+  rustup target add wasm32-unknown-unknown
+fi
 if command -v wasm-tools >/dev/null 2>&1 \
   && [ "$(wasm-tools --version)" = "wasm-tools $WASM_TOOLS_VERSION" ]; then
   WASM_TOOLS_BIN="$(command -v wasm-tools)"
