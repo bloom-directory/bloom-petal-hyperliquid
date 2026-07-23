@@ -3,7 +3,7 @@
 This package moves Bloom's Hyperliquid HyperCore surface into a standalone
 local Petal. It exposes read-only market/account files, signed exchange
 actions, owner-approved USD transfers, and bounded API-agent sessions under
-`petal/hyperliquid/`.
+`petals/hyperliquid/`.
 
 All HTTP access, persistence, and signing are mediated by Bloom. Private keys
 and signatures are never returned through the public filesystem. The exchange
@@ -23,3 +23,38 @@ status, and error files before treating an action as submitted.
 scripts/build.sh
 cargo run --manifest-path ../bloom/Cargo.toml -p bloom -- petals build .
 ```
+
+Run the host-side test suites with:
+
+```sh
+cargo test --manifest-path sdk/Cargo.toml --locked
+cargo test --manifest-path route/Cargo.toml --locked
+cargo test --manifest-path xtask/Cargo.toml --locked
+```
+
+## Installation
+
+Bloom provisions the pinned Hyperliquid release during `bloom init` when
+`hyperliquid` is present in `[petals].preinstalled` (it is part of Bloom's
+default set). To install this repository manually while developing:
+
+```sh
+bloom petals install https://github.com/bloom-directory/bloom-petal-hyperliquid
+bloom vfs cat /petals/hyperliquid/README.md
+bloom vfs ls /petals/hyperliquid/mainnet
+```
+
+## Releases
+
+Installable archives are built by the tag-triggered release workflow using the
+pinned `bloom-directory/petal` packaging toolchain. Release tags use Semantic
+Versioning with a `v` prefix and publish:
+
+- `hyperliquid-vX.Y.Z.petal.tar.gz`
+- `SHA256SUMS`
+- `petal-release.json`
+
+Published assets are immutable. Bloom's built-in catalog pins the release tag,
+source commit, archive name, and package hash. The generated route workspace
+uses `xtask/route-workspace.Cargo.lock`; route or dependency changes that make
+that lock stale fail the build until the lock is reviewed and regenerated.

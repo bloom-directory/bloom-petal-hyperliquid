@@ -856,10 +856,7 @@ fn session_read(ctx: &Ctx) -> DispatchResponse {
             "description": format!("write a bounded session {file} request; it is signed by the stored agent key")
         }));
     }
-    if matches!(
-        file.as_str(),
-        "stop" | "cancel_all" | "close_all"
-    ) {
+    if matches!(file.as_str(), "stop" | "cancel_all" | "close_all") {
         return ok_json(json!({"description": format!("write anything to invoke session {file}")}));
     }
     petal::error(-1, format!("unknown session file {file}"))

@@ -1,0 +1,23 @@
+name: Release Petal
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@b69fe526b1bd65df81276c934a9d7403e2a735bf
+    with:
+      petal-name: hyperliquid
+      petal-tooling-ref: "b69fe526b1bd65df81276c934a9d7403e2a735bf"
+      build-command: scripts/build.sh
+      package-root: .
+      expected-route-count: 62

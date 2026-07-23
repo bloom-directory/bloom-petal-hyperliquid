@@ -29,11 +29,11 @@ fn run() -> Result<(), String> {
     let build = root.join("target/hyperliquid-routes");
     let workspace = build.join("workspace");
     generate_workspace(&root, &workspace, &routes)?;
-    command(
-        Command::new("cargo")
-            .args(["generate-lockfile", "--offline", "--manifest-path"])
-            .arg(workspace.join("Cargo.toml")),
-    )?;
+    fs::copy(
+        root.join("xtask/route-workspace.Cargo.lock"),
+        workspace.join("Cargo.lock"),
+    )
+    .map_err(|e| format!("install pinned route workspace lock: {e}"))?;
     command(
         Command::new("cargo")
             .args([
@@ -42,7 +42,7 @@ fn run() -> Result<(), String> {
                 "--target",
                 "wasm32-unknown-unknown",
                 "--release",
-                "--offline",
+                "--locked",
                 "--manifest-path",
             ])
             .arg(workspace.join("Cargo.toml")),
