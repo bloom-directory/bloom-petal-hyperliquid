@@ -1,0 +1,13 @@
+schema = "bloom.petal.build.v1"
+name = "hyperliquid"
+routes = "route/files"
+output = "petal/hyperliquid"
+
+[route_crate]
+package = "bloom-hyperliquid-petal-route"
+path = "route"
+alias = "hl_route"
+
+[sdk]
+package = "petal"
+path = "sdk"

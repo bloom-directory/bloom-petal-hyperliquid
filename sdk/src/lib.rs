@@ -128,6 +128,12 @@ pub struct Spec {
     pub ttl: Option<u64>,
     pub side_effecting: bool,
 }
+impl Spec {
+    pub const fn caps(mut self, caps: &'static [&'static str]) -> Self {
+        self.caps = caps;
+        self
+    }
+}
 pub const NONE: &[&str] = &[];
 pub const READ: &[&str] = &["bloom:http", "bloom:store"];
 pub const WRITE: &[&str] = &["bloom:http", "bloom:store", "bloom:sign"];
