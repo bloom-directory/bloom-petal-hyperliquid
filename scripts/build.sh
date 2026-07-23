@@ -16,5 +16,9 @@ else
   cargo install --locked --root "$WASM_TOOLS_ROOT" wasm-tools --version "$WASM_TOOLS_VERSION"
   WASM_TOOLS_BIN="$WASM_TOOLS_ROOT/bin/wasm-tools"
 fi
-PATH="$(dirname "$WASM_TOOLS_BIN"):$PATH" \
+WASM_TOOLS_DIR="$(dirname "$WASM_TOOLS_BIN")"
+if [ -n "${GITHUB_PATH:-}" ]; then
+  printf '%s\n' "$WASM_TOOLS_DIR" >> "$GITHUB_PATH"
+fi
+PATH="$WASM_TOOLS_DIR:$PATH" \
   cargo run --locked --manifest-path "$ROOT/xtask/Cargo.toml" --release
