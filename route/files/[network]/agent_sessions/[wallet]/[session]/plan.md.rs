@@ -1,1 +1,17 @@
-petal::route_file!(spec: petal::store_read_spec(), read: crate::read);
+petal::route_file!(spec: petal::read_spec(), read: |ctx: &petal::Ctx| {
+    let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+        crate::parse_address(value)
+            .map(|address| format!("{address:#x}"))
+            .map_err(|error| petal::error(-3, error))
+    }) {
+        Ok(wallet) => wallet,
+        Err(response) => return response,
+    };
+    let session = match petal::param(ctx, "session") {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    petal::read_json(&format!(
+        "# Hyperliquid agent session\n\n- Wallet: `{wallet}`\n- Session: `{session}`\n\nThe session key is retained only in Bloom's private store.\n"
+    ))
+});

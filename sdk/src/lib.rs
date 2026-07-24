@@ -352,6 +352,30 @@ pub mod sdk {
 
 #[macro_export]
 macro_rules! route_file {
+    (spec: $spec:expr, read: $read:expr, write: $write:expr) => {
+        pub struct Route;
+        impl $crate::RawGuest for Route {
+            fn metadata(c: $crate::RawCtx) -> Result<$crate::RouteMeta, $crate::RouteError> {
+                let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
+                $crate::metadata(&c, $spec)
+            }
+            fn lookup(c: $crate::RawCtx) -> Result<$crate::Entry, $crate::RouteError> {
+                let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
+                Ok($crate::petal_entry(&c, $spec))
+            }
+            fn list(_: $crate::RawCtx) -> Result<Vec<$crate::Entry>, $crate::RouteError> {
+                Err($crate::RouteError::Invalid("not a directory".into()))
+            }
+            fn read(c: $crate::RawCtx) -> Result<Vec<u8>, $crate::RouteError> {
+                let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
+                $crate::framework_read(($read)(&c))
+            }
+            fn write(c: $crate::RawCtx, b: Vec<u8>) -> Result<(), $crate::RouteError> {
+                let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
+                $crate::framework_write(($write)(&c, &b))
+            }
+        }
+    };
     (spec: $spec:expr, read: $read:expr) => {
         pub struct Route;
         impl $crate::RawGuest for Route {
@@ -390,8 +414,10 @@ macro_rules! route_file {
                 Err($crate::RouteError::Invalid("not a directory".into()))
             }
             fn read(c: $crate::RawCtx) -> Result<Vec<u8>, $crate::RouteError> {
-                let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
-                $crate::framework_read(crate::read(&c))
+                let _ = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);
+                Err($crate::RouteError::Denied(
+                    "path has no read handler".into(),
+                ))
             }
             fn write(c: $crate::RawCtx, b: Vec<u8>) -> Result<(), $crate::RouteError> {
                 let c = $crate::Ctx::bind::<crate::__PetalRouteIdentity>(c);

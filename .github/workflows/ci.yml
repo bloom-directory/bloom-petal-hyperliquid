@@ -38,6 +38,9 @@ jobs:
           cargo fmt --manifest-path sdk/Cargo.toml -- --check
           cargo fmt --manifest-path xtask/Cargo.toml -- --check
 
+      - name: Check route architecture
+        run: scripts/check-route-architecture.sh
+
       - name: Run tests
         run: |
           cargo test --manifest-path route/Cargo.toml --locked

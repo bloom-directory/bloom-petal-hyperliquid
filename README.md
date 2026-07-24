@@ -20,6 +20,7 @@ status, and error files before treating an action as submitted.
 ## Build
 
 ```sh
+scripts/check-route-architecture.sh
 scripts/build.sh
 cargo run --manifest-path ../bloom/Cargo.toml -p bloom -- petals build .
 ```
