@@ -1,7 +1,7 @@
 petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
     read: |_ctx: &petal::Ctx| {
-        petal::read_json(&crate::serde_json::json!({
+        petal::read_json_value(&crate::serde_json::json!({
             "description": "write a bounded session cancel.json request; it is signed by the stored agent key"
         }))
     },

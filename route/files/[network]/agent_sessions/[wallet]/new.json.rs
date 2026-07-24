@@ -1,7 +1,7 @@
 petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
-        petal::read_json(&crate::serde_json::json!({
+        petal::read_json_value(&crate::serde_json::json!({
             "description": "write an owner-approved agent session request"
         }))
     },
@@ -23,6 +23,6 @@ petal::route_file!(
             Ok(wallet) => wallet,
             Err(response) => return response,
         };
-        crate::create_session(ctx, network, wallet, body)
+        crate::create_session(network, wallet, body)
     }
 );

@@ -14,8 +14,8 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Err(response) => return response,
     };
     match crate::load_wallet_session_error(network, &wallet) {
-        Ok(Some(error)) => petal::read_json(&crate::serde_json::json!({"error": error})),
-        Ok(None) => petal::read_json(&crate::serde_json::json!({"error": null})),
+        Ok(Some(error)) => petal::read_json_value(&crate::serde_json::json!({"error": error})),
+        Ok(None) => petal::read_json_value(&crate::serde_json::json!({"error": null})),
         Err(response) => response,
     }
 });

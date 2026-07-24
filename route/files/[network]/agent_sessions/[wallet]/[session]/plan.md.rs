@@ -1,4 +1,4 @@
-petal::route_file!(spec: petal::read_spec(), read: |ctx: &petal::Ctx| {
+petal::route_file!(spec: petal::static_read_spec(), read: |ctx: &petal::Ctx| {
     let wallet = match petal::param(ctx, "wallet").and_then(|value| {
         crate::parse_address(value)
             .map(|address| format!("{address:#x}"))
@@ -11,7 +11,7 @@ petal::route_file!(spec: petal::read_spec(), read: |ctx: &petal::Ctx| {
         Ok(session) => session,
         Err(response) => return response,
     };
-    petal::read_json(&format!(
+    petal::read_json_value(&format!(
         "# Hyperliquid agent session\n\n- Wallet: `{wallet}`\n- Session: `{session}`\n\nThe session key is retained only in Bloom's private store.\n"
     ))
 });

@@ -2,7 +2,7 @@
 
 This package moves Bloom's Hyperliquid HyperCore surface into a standalone
 local Petal. It exposes read-only market/account files, signed exchange
-actions, owner-approved USD transfers, and bounded API-agent sessions under
+actions, owner-approved USDC transfers, and bounded API-agent sessions under
 `petals/hyperliquid/`.
 
 All HTTP access, persistence, and signing are mediated by Bloom. Private keys
@@ -10,7 +10,9 @@ and signatures are never returned through the public filesystem. The exchange
 surface covers orders, cancels, cancel-by-cloid, scheduled cancel, leverage
 updates, raw signed payloads, and internal USD sends. Agent sessions provide
 owner-approved creation, bounded agent-key actions, stop, cancel-all,
-close-all, and audit.
+close-all, and audit. The canonical transfer route is `usd_send.json`;
+`send_asset.json` remains as a compatibility alias and does not implement
+Hyperliquid's distinct generalized `sendAsset` action.
 
 A session request requires a stable `id` so an approval-required request can
 be retried with the exact same body without rotating its agent key. A
@@ -28,9 +30,7 @@ cargo run --manifest-path ../bloom/Cargo.toml -p bloom -- petals build .
 Run the host-side test suites with:
 
 ```sh
-cargo test --manifest-path sdk/Cargo.toml --locked
 cargo test --manifest-path route/Cargo.toml --locked
-cargo test --manifest-path xtask/Cargo.toml --locked
 ```
 
 ## Installation
@@ -57,6 +57,5 @@ a `v` prefix and publish:
 - `petal-release.json`
 
 Published assets are immutable. Bloom's built-in catalog pins the release tag,
-source commit, archive name, and package hash. The generated route workspace
-uses `xtask/route-workspace.Cargo.lock`; route or dependency changes that make
-that lock stale fail the build until the lock is reviewed and regenerated.
+source commit, archive name, and package hash. The route crate and canonical
+Petal SDK are locked in `route/Cargo.lock`.

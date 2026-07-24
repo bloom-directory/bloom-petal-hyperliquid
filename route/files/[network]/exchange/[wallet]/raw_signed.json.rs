@@ -1,8 +1,8 @@
 petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
     read: |_ctx: &petal::Ctx| {
-        petal::read_json(&crate::serde_json::json!({
-            "description": "write a Hyperliquid raw_signed.json request; signed actions require Bloom approval"
+        petal::read_json_value(&crate::serde_json::json!({
+            "description": "submit a pre-signed Hyperliquid action; Bloom validates and relays the supplied signature but does not create or approve it"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

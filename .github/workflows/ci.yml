@@ -22,36 +22,33 @@ jobs:
           persist-credentials: false
 
       - name: Show Rust toolchain
-        run: rustup show
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             route
-            sdk
-            xtask
 
       - name: Check formatting
-        run: |
-          cargo fmt --manifest-path route/Cargo.toml -- --check
-          cargo fmt --manifest-path sdk/Cargo.toml -- --check
-          cargo fmt --manifest-path xtask/Cargo.toml -- --check
+        run: cargo fmt --manifest-path route/Cargo.toml -- --check
 
       - name: Check route architecture
         run: scripts/check-route-architecture.sh
 
       - name: Run tests
-        run: |
-          cargo test --manifest-path route/Cargo.toml --locked
-          cargo test --manifest-path sdk/Cargo.toml --locked
-          cargo test --manifest-path xtask/Cargo.toml --locked
+        run: cargo test --manifest-path route/Cargo.toml --locked
 
       - name: Run clippy
-        run: |
-          cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
-          cargo clippy --manifest-path sdk/Cargo.toml --locked --all-targets -- -D warnings
-          cargo clippy --manifest-path xtask/Cargo.toml --locked --all-targets -- -D warnings
+        run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Install component tools
+        run: cargo install wasm-tools --version 1.249.0 --locked
+
+      - name: Install canonical Petal toolchain
+        run: cargo install --git https://github.com/bloom-directory/petal --rev b9fc22d6d8211bc41304b38b1ef8b5269c8035bd --locked bloom-petal-cli
 
       - name: Build source package
         run: scripts/build.sh
@@ -60,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/petal
-          ref: b69fe526b1bd65df81276c934a9d7403e2a735bf
+          ref: b9fc22d6d8211bc41304b38b1ef8b5269c8035bd
           path: .petal-tooling
           persist-credentials: false
 
@@ -78,7 +75,7 @@ jobs:
           "$RUNNER_TEMP/petal" package \
             --root . \
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
-            | jq -e '.routes == 62'
+            | jq -e '.routes == 63'
 
       - name: Check out Bloom CLI
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -104,6 +101,11 @@ jobs:
             | grep -Fq 'Hyperliquid Petal'
           "$RUNNER_TEMP/bloom" --home "$home" vfs ls /petals/hyperliquid/mainnet \
             | grep -Fq 'mids.json'
+          "$RUNNER_TEMP/bloom" --home "$home" vfs cat /petals/hyperliquid/testnet/status.json \
+            | jq -e '.network == "Testnet"'
+          "$RUNNER_TEMP/bloom" --home "$home" vfs cat \
+            /petals/hyperliquid/testnet/exchange/0x0000000000000000000000000000000000000000/usd_send.json \
+            | jq -e '.body.amount | contains("6 decimal")'
 
       - name: Validate GitHub source install
         shell: bash
