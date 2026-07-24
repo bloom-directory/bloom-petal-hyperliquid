@@ -2,18 +2,13 @@ mod protocol;
 mod workflow;
 
 pub use protocol::*;
+pub use serde_json;
 pub use workflow::*;
 
 pub fn route_entry(ctx: &petal::Ctx, spec: petal::Spec) -> petal::Entry {
     petal::petal_entry(ctx, spec)
 }
 
-pub fn read(ctx: &petal::Ctx) -> petal::DispatchResponse {
-    workflow::read(ctx)
-}
-pub fn write(ctx: &petal::Ctx, body: &[u8]) -> petal::DispatchResponse {
-    workflow::write(ctx, body)
-}
 pub fn list(_ctx: &petal::Ctx, names: &[(&str, bool, bool)]) -> Vec<petal::Entry> {
     static_list(names)
 }
