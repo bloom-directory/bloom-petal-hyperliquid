@@ -1,5 +1,5 @@
-use alloy::primitives::{Address, B256, Signature};
 use alloy_dyn_abi::eip712::TypedData;
+use alloy_primitives::{Address, B256, Signature};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
@@ -47,6 +47,7 @@ impl Network {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureJson {
     pub r: String,
     pub s: String,
@@ -88,6 +89,7 @@ impl SignatureJson {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[serde(deny_unknown_fields)]
 pub enum ExchangeAction {
     #[serde(rename = "order")]
     Order {
@@ -142,12 +144,20 @@ impl ExchangeAction {
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Order { orders, .. } => {
+            Self::Order {
+                orders, builder, ..
+            } => {
                 if orders.is_empty() {
                     return Err("orders must not be empty".into());
                 }
                 for o in orders {
                     o.validate()?;
+                }
+                if let Some(builder) = builder {
+                    parse_address(&builder.address)?;
+                    if builder.address != builder.address.to_ascii_lowercase() {
+                        return Err("builder address must be lowercase".into());
+                    }
                 }
             }
             Self::Cancel { cancels, fast } => {
@@ -180,6 +190,7 @@ impl ExchangeAction {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderWire {
     #[serde(rename = "a")]
     pub asset: u32,
@@ -203,6 +214,11 @@ impl OrderWire {
         if let Some(c) = &self.cloid {
             cloid(c)?;
         }
+        match (&self.order_type.limit, &self.order_type.trigger) {
+            (Some(_), None) => {}
+            (None, Some(trigger)) => decimal("triggerPx", &trigger.trigger_px)?,
+            _ => return Err("order type must contain exactly one of limit or trigger".into()),
+        }
         Ok(())
     }
 }
@@ -216,6 +232,7 @@ pub enum Grouping {
     PositionTpsl,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuilderFee {
     #[serde(rename = "b")]
     pub address: String,
@@ -223,6 +240,7 @@ pub struct BuilderFee {
     pub fee_tenths_bps: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderTypeWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<LimitOrderType>,
@@ -230,10 +248,12 @@ pub struct OrderTypeWire {
     pub trigger: Option<TriggerOrderType>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitOrderType {
     pub tif: TimeInForce,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TriggerOrderType {
     #[serde(rename = "isMarket")]
     pub is_market: bool,
@@ -257,6 +277,7 @@ pub enum TpSl {
     Sl,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelWire {
     #[serde(rename = "a")]
     pub asset: u32,
@@ -264,12 +285,14 @@ pub struct CancelWire {
     pub oid: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelByCloidWire {
     pub asset: u32,
     pub cloid: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignSubmit {
     pub action: ExchangeAction,
     #[serde(default)]
@@ -280,6 +303,7 @@ pub struct SignSubmit {
     pub expires_after: Option<u64>,
 }
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedSubmit {
     pub action: ExchangeAction,
     pub nonce: u64,
@@ -366,16 +390,19 @@ pub fn l1_signing_hash(
     Ok(hash)
 }
 fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData, String> {
-    let type_fields = match kind {
-        "approveAgent" => {
-            json!([{"name":"hyperliquidChain","type":"string"},{"name":"agentAddress","type":"address"},{"name":"agentName","type":"string"},{"name":"nonce","type":"uint64"}])
-        }
-        "usdSend" => {
-            json!([{"name":"hyperliquidChain","type":"string"},{"name":"destination","type":"string"},{"name":"amount","type":"string"},{"name":"time","type":"uint64"}])
-        }
+    let (type_name, type_fields) = match kind {
+        "approveAgent" => (
+            "ApproveAgent",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"agentAddress","type":"address"},{"name":"agentName","type":"string"},{"name":"nonce","type":"uint64"}]),
+        ),
+        "usdSend" => (
+            "UsdSend",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"destination","type":"string"},{"name":"amount","type":"string"},{"name":"time","type":"uint64"}]),
+        ),
         _ => return Err("unsupported user action".into()),
     };
-    serde_json::from_value(json!({"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],format!("HyperliquidTransaction:{kind}"):type_fields},"primaryType":format!("HyperliquidTransaction:{kind}"),"domain":{"name":"HyperliquidSignTransaction","version":"1","chainId":network.signature_chain_id(),"verifyingContract":"0x0000000000000000000000000000000000000000"},"message":message})).map_err(|e|e.to_string())
+    let primary_type = format!("HyperliquidTransaction:{type_name}");
+    serde_json::from_value(json!({"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],primary_type.clone():type_fields},"primaryType":primary_type,"domain":{"name":"HyperliquidSignTransaction","version":"1","chainId":network.signature_chain_id(),"verifyingContract":"0x0000000000000000000000000000000000000000"},"message":message})).map_err(|e|e.to_string())
 }
 pub fn approve_agent_hash(
     network: Network,
@@ -497,14 +524,94 @@ mod tests {
     }
 
     #[test]
-    fn exchange_hash_is_stable_and_network_independent() {
+    fn l1_hash_matches_official_sdk_vectors() {
         let a = cancel();
-        let one = l1_signing_hash(Network::Mainnet, &a, 123, None, None).unwrap();
-        let two = l1_signing_hash(Network::Mainnet, &a, 123, None, None).unwrap();
-        assert_eq!(one, two);
-        assert_ne!(
-            one,
-            l1_signing_hash(Network::Testnet, &a, 123, None, None).unwrap()
+        assert_eq!(
+            format!(
+                "{:#x}",
+                l1_signing_hash(Network::Mainnet, &a, 123, None, None).unwrap()
+            ),
+            "0x7cb15de4533207eb7ed1d50d08d207b39d8f4f080373f4047e19ed3025e1e0ca"
+        );
+        assert_eq!(
+            format!(
+                "{:#x}",
+                l1_signing_hash(Network::Testnet, &a, 123, None, None).unwrap()
+            ),
+            "0x9a1e431de1fe475322c242fb1683d63f13a866cdcfdd2851ff7a627eb141e77f"
+        );
+    }
+
+    #[test]
+    fn every_supported_l1_action_matches_official_sdk_vectors() {
+        let cases = [
+            (
+                json!({
+                    "type": "order",
+                    "orders": [{
+                        "a": 0,
+                        "b": true,
+                        "p": "100",
+                        "s": "0.01",
+                        "r": false,
+                        "t": {"limit": {"tif": "Gtc"}}
+                    }],
+                    "grouping": "na"
+                }),
+                "0x3e4725cbdfbc7859f0eac9a6f0f5e23c08b451a789ba28d2e604539a10f55d99",
+            ),
+            (
+                json!({
+                    "type": "cancelByCloid",
+                    "cancels": [{
+                        "asset": 0,
+                        "cloid": "0x00000000000000000000000000000001"
+                    }]
+                }),
+                "0xf69225f3a4dfaa49730f3b3e4e562c05215744fcf4b78f95700c096612bb627a",
+            ),
+            (
+                json!({"type": "scheduleCancel", "time": 123456789}),
+                "0x5eaf78ea6168a8b021b5f0be05b98730c3ea50bd3dfb77111d3599d2eaf2c000",
+            ),
+            (
+                json!({
+                    "type": "updateLeverage",
+                    "asset": 0,
+                    "isCross": true,
+                    "leverage": 3
+                }),
+                "0x0fd70a29585f861b7494fecd56775498fa6f5b17d44094b147e0d4d7a5ad673a",
+            ),
+        ];
+        for (value, expected) in cases {
+            let action: ExchangeAction = serde_json::from_value(value).unwrap();
+            let hash = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
+            assert_eq!(format!("{hash:#x}"), expected);
+        }
+    }
+
+    #[test]
+    fn vault_and_expiry_hash_matches_official_sdk_vector() {
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0,
+                "b": true,
+                "p": "100",
+                "s": "0.01",
+                "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        let vault = parse_address("0x0000000000000000000000000000000000000003").unwrap();
+        let hash =
+            l1_signing_hash(Network::Mainnet, &action, 123, Some(vault), Some(999999)).unwrap();
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0xd1d31414c406d9f99e01134e80157b5ef8ff36b0e554935a6a526134ac111438"
         );
     }
 
@@ -525,12 +632,54 @@ mod tests {
     }
 
     #[test]
+    fn write_models_reject_unknown_fields_and_invalid_order_types() {
+        assert!(
+            serde_json::from_value::<SignSubmit>(json!({
+                "action": {"type": "scheduleCancel"},
+                "nonse": 1
+            }))
+            .is_err()
+        );
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0,
+                "b": true,
+                "p": "100",
+                "s": "0.01",
+                "r": false,
+                "t": {}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(
+            action.validate(),
+            Err("order type must contain exactly one of limit or trigger".into())
+        );
+    }
+
+    #[test]
     fn user_hash_contains_correct_wire_action() {
         let destination = parse_address("0x0000000000000000000000000000000000000001").unwrap();
         let (action, hash) = usd_send_hash(Network::Testnet, destination, "1.25", 99).unwrap();
         assert_eq!(action["type"], "usdSend");
         assert_eq!(action["time"], 99);
-        assert_ne!(hash, B256::ZERO);
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0x76e0a8bd20747053a2b976294b2e490756b4f22d64bb496d0161beea903ccfd3"
+        );
+    }
+
+    #[test]
+    fn approve_agent_hash_matches_official_sdk_vector() {
+        let agent = parse_address("0x0000000000000000000000000000000000000002").unwrap();
+        let (action, hash) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        assert_eq!(action["type"], "approveAgent");
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0x83174cd6237cd6f87b18b95f027955cdf8f19ed616da0843224f9ceb64f1b2ff"
+        );
     }
 
     #[test]

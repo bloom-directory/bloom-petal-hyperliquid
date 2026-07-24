@@ -1,17 +1,20 @@
-use alloy::primitives::{B256, Signature};
+use alloy_primitives::{Address, B256, Signature};
 use k256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha3::Digest;
 
 use crate::protocol::{self, ExchangeAction, Network, SignSubmit};
-use petal::{Ctx, DispatchResponse};
+use petal::{
+    Ctx, DispatchResponse, HostStatus, HttpRequest, SdkError, SignHashOutcome, SignRequest,
+};
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
+const CLOSE_SLIPPAGE: f64 = 0.05;
 
 struct PrivateKeySigner {
     key: SigningKey,
-    address: alloy::primitives::Address,
+    address: Address,
 }
 impl PrivateKeySigner {
     fn from_bytes(raw: &[u8]) -> Result<Self, String> {
@@ -23,10 +26,10 @@ impl PrivateKeySigner {
         let digest = sha3::Keccak256::digest(&public.as_bytes()[1..]);
         Ok(Self {
             key,
-            address: alloy::primitives::Address::from_slice(&digest[12..]),
+            address: Address::from_slice(&digest[12..]),
         })
     }
-    fn address(&self) -> alloy::primitives::Address {
+    fn address(&self) -> Address {
         self.address
     }
     fn sign_hash_sync(&self, hash: &B256) -> Result<Signature, String> {
@@ -65,9 +68,6 @@ fn wallet(ctx: &Ctx) -> Result<String, DispatchResponse> {
         .map(|a| format!("{a:#x}"))
         .map_err(invalid)
 }
-fn route(ctx: &Ctx) -> &'static str {
-    petal::current_route_path(ctx)
-}
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
 }
@@ -76,33 +76,69 @@ fn secret_key(parts: &[&str]) -> String {
 }
 fn save_json(key: String, v: &impl Serialize, secret: bool) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::put(&key, &b, secret).map_err(backend)
+    petal::sdk::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
 }
 fn save_json_new(key: String, v: &impl Serialize, secret: bool) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::put_new(&key, &b, secret).map_err(backend)
+    petal::sdk::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
+}
+fn load_bytes_result(key: &str) -> Result<Option<Vec<u8>>, SdkError> {
+    match petal::sdk::store_get(key, MAX_BODY) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn load_bytes(key: &str) -> Result<Option<Vec<u8>>, DispatchResponse> {
+    load_bytes_result(key).map_err(|e| backend(e.message()))
+}
+fn load_secret_bytes(key: &str) -> Result<Option<Vec<u8>>, DispatchResponse> {
+    petal::bindings::bloom::store::kv::get("secrets", key).map_err(backend)
+}
+fn delete_secret(key: &str) -> Result<(), DispatchResponse> {
+    petal::bindings::bloom::store::kv::delete("secrets", key).map_err(backend)
 }
 fn load_json<T: for<'de> Deserialize<'de>>(key: String) -> Result<Option<T>, DispatchResponse> {
-    let Some(b) = petal::sdk::get(&key).map_err(backend)? else {
+    let Some(b) = load_bytes(&key)? else {
         return Ok(None);
     };
     serde_json::from_slice(&b)
         .map(Some)
         .map_err(|e| backend(format!("stored state is invalid: {e}")))
 }
+fn load_secret_json<T: for<'de> Deserialize<'de>>(
+    key: String,
+) -> Result<Option<T>, DispatchResponse> {
+    let Some(bytes) = load_secret_bytes(&key)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| backend(format!("stored secret state is invalid: {e}")))
+}
 fn http_raw(net: Network, path: &str, body: Value) -> Result<(u16, Vec<u8>), DispatchResponse> {
     let b = serde_json::to_vec(&body).map_err(|e| backend(e.to_string()))?;
-    let (status, raw) = petal::sdk::http(
-        "POST",
-        &format!("{}{path}", net.url()),
-        vec![("content-type".into(), "application/json".into())],
-        b,
+    let response = petal::sdk::http_fetch(
+        &HttpRequest {
+            method: "POST".into(),
+            url: format!("{}{path}", net.url()),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: b,
+        },
+        MAX_BODY,
     )
-    .map_err(backend)?;
-    if raw.len() > MAX_BODY {
-        return Err(backend("Hyperliquid response too large"));
-    };
-    Ok((status, raw))
+    .map_err(|e| backend(e.message()))?;
+    Ok((response.status, response.body))
+}
+fn sign_hash(wallet: &str, hash: &B256, purpose: &str) -> Result<SignHashOutcome, String> {
+    let mut hash32 = [0_u8; 32];
+    hash32.copy_from_slice(hash.as_slice());
+    petal::sdk::sign_hash(&SignRequest {
+        wallet: wallet.into(),
+        hash32,
+        purpose: purpose.into(),
+    })
+    .map_err(|e| e.message())
 }
 pub fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchResponse> {
     let (status, raw) = http_raw(net, path, body)?;
@@ -155,10 +191,10 @@ pub fn exchange_last_response(n: Network, w: &str) -> DispatchResponse {
         w,
         "last_response.json",
     ]);
-    match petal::sdk::get(&key) {
-        Ok(Some(b)) => DispatchResponse::Read(b),
+    match load_bytes(&key) {
+        Ok(Some(bytes)) => DispatchResponse::Read(bytes),
         Ok(None) => invalid("no exchange response has been recorded"),
-        Err(e) => backend(e),
+        Err(response) => response,
     }
 }
 
@@ -171,13 +207,15 @@ pub fn validate_body_size(body: &[u8]) -> Result<(), DispatchResponse> {
 }
 
 pub fn owner_action_write(
-    ctx: &Ctx,
     n: Network,
     w: String,
     operation: &str,
     body: &[u8],
     req: SignSubmit,
 ) -> DispatchResponse {
+    if let Err(error) = req.action.validate() {
+        return invalid(error);
+    }
     let (nonce, pending_nonce_key, completed) = match owner_nonce(n, &w, operation, body, req.nonce)
     {
         Ok(x) => x,
@@ -197,12 +235,12 @@ pub fn owner_action_write(
         Ok(h) => h,
         Err(e) => return invalid(e),
     };
-    let sig = match petal::sdk::sign(&w, hash.as_slice(), req.action.intent()) {
-        Ok(petal::sdk::Sign::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
+    let sig = match sign_hash(&w, &hash, req.action.intent()) {
+        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         },
-        Ok(petal::sdk::Sign::Approval {
+        Ok(SignHashOutcome::ApprovalRequired {
             action_id,
             ceremony_url,
             expires_ms,
@@ -221,7 +259,6 @@ pub fn owner_action_write(
                 return e;
             }
             return approval(
-                ctx,
                 "exchange",
                 &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
             );
@@ -296,57 +333,33 @@ fn owner_nonce(
     }
     let key = owner_nonce_key(n, w, leaf, body);
     let now = petal::sdk::now_ms();
-    for _ in 0..4 {
-        if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-            if pending.completed {
-                return Ok((pending.nonce, Some(key), true));
-            }
-            if pending.expires_ms <= now {
-                return Err(invalid(
-                    "approval expired; retry with an explicit fresh nonce",
-                ));
-            }
-            return Ok((pending.nonce, Some(key), false));
-        }
-        let candidate = PendingNonce {
-            nonce: now,
-            expires_ms: u64::MAX,
-            completed: false,
-        };
-        if save_json_new(key.clone(), &candidate, false).is_ok() {
-            return Ok((candidate.nonce, Some(key), false));
-        }
-    }
-    Err(backend(
-        "owner nonce reservation changed concurrently; retry",
-    ))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PendingNonce {
-    nonce: u64,
-    expires_ms: u64,
-    #[serde(default)]
-    completed: bool,
-}
-fn session_nonce(
-    n: Network,
-    w: &str,
-    id: &str,
-    action: &ExchangeAction,
-    explicit: Option<u64>,
-) -> Result<(u64, Option<String>, bool), DispatchResponse> {
-    if let Some(nonce) = explicit {
-        return Ok((nonce, None, false));
-    }
-    let encoded = rmp_serde::to_vec_named(action).map_err(|e| backend(e.to_string()))?;
-    let digest = hex::encode(sha3::Keccak256::digest(encoded));
-    let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        return Ok((pending.nonce, Some(key), pending.completed));
+        if pending.completed {
+            return Ok((pending.nonce, Some(key), true));
+        }
+        if pending.expires_ms <= now {
+            return Err(invalid(
+                "approval expired; retry with an explicit fresh nonce",
+            ));
+        }
+        return Ok((pending.nonce, Some(key), false));
     }
+    let marker = hex::encode(sha3::Keccak256::digest(body));
+    let nonce = reserve_nonce(
+        &state_key(&[
+            "exchange",
+            "nonces",
+            if matches!(n, Network::Mainnet) {
+                "mainnet"
+            } else {
+                "testnet"
+            },
+            w,
+        ]),
+        &marker,
+    )?;
     let candidate = PendingNonce {
-        nonce: petal::sdk::now_ms(),
+        nonce,
         expires_ms: u64::MAX,
         completed: false,
     };
@@ -357,6 +370,70 @@ fn session_nonce(
             None => Err(first_error),
         },
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingNonce {
+    nonce: u64,
+    expires_ms: u64,
+    #[serde(default)]
+    completed: bool,
+}
+fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
+    let now = petal::sdk::now_ms();
+    for offset in 0..1024_u64 {
+        let nonce = now.saturating_add(offset);
+        let key = format!("{prefix}/{nonce}.json");
+        match save_json_new(key.clone(), &marker, false) {
+            Ok(()) => return Ok(nonce),
+            Err(first_error) => match load_bytes(&key) {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Err(first_error),
+                Err(response) => return Err(response),
+            },
+        }
+    }
+    Err(backend("unable to reserve a unique Hyperliquid nonce"))
+}
+fn session_nonce(
+    n: Network,
+    w: &str,
+    id: &str,
+    action: &ExchangeAction,
+    vault: Option<&str>,
+    expires: Option<u64>,
+    explicit: Option<u64>,
+) -> Result<(u64, Option<String>, bool), DispatchResponse> {
+    if let Some(nonce) = explicit {
+        return Ok((nonce, None, false));
+    }
+    let digest = session_operation_digest(action, vault, expires)?;
+    let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
+    if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
+        return Ok((pending.nonce, Some(key), pending.completed));
+    }
+    let nonce = reserve_nonce(&session_key(n, w, id, "nonces"), &digest)?;
+    let candidate = PendingNonce {
+        nonce,
+        expires_ms: u64::MAX,
+        completed: false,
+    };
+    match save_json_new(key.clone(), &candidate, false) {
+        Ok(()) => Ok((candidate.nonce, Some(key), false)),
+        Err(first_error) => match load_json::<PendingNonce>(key.clone())? {
+            Some(winner) => Ok((winner.nonce, Some(key), winner.completed)),
+            None => Err(first_error),
+        },
+    }
+}
+fn session_operation_digest(
+    action: &ExchangeAction,
+    vault: Option<&str>,
+    expires: Option<u64>,
+) -> Result<String, DispatchResponse> {
+    let encoded =
+        rmp_serde::to_vec_named(&(action, vault, expires)).map_err(|e| backend(e.to_string()))?;
+    Ok(hex::encode(sha3::Keccak256::digest(encoded)))
 }
 
 pub fn submit_l1(
@@ -397,16 +474,17 @@ pub fn submit_l1(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UsdSend {
     destination: String,
     amount: String,
     #[serde(default)]
     nonce: Option<u64>,
 }
-pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+pub fn usd_send(n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<UsdSend>(body) {
         Ok(x) => x,
-        Err(e) => return invalid(format!("invalid send_asset body: {e}")),
+        Err(e) => return invalid(format!("invalid usd_send body: {e}")),
     };
     if let Err(e) = protocol::validate_usdc_amount(&req.amount) {
         return invalid(e);
@@ -427,12 +505,12 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match petal::sdk::sign(&w, hash.as_slice(), "hyperliquid.usd_send") {
-        Ok(petal::sdk::Sign::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
+    let sig = match sign_hash(&w, &hash, "hyperliquid.usd_send") {
+        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         },
-        Ok(petal::sdk::Sign::Approval {
+        Ok(SignHashOutcome::ApprovalRequired {
             action_id,
             ceremony_url,
             expires_ms,
@@ -451,7 +529,6 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
                 return e;
             }
             return approval(
-                ctx,
                 "usd_send",
                 &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
             );
@@ -507,8 +584,7 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         Err(e) => e,
     }
 }
-fn approval(ctx: &Ctx, kind: &str, v: &Value) -> DispatchResponse {
-    let _ = save_json(state_key(&["approvals", route(ctx)]), v, false);
+fn approval(kind: &str, v: &Value) -> DispatchResponse {
     denied(format!("approval required for {kind}: {}", safe_json(v)))
 }
 fn valid_session_id(raw: &str) -> Result<(), String> {
@@ -556,6 +632,7 @@ struct Pending {
     completed: bool,
 }
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewSession {
     id: String,
     #[serde(default)]
@@ -617,14 +694,39 @@ pub fn load_session_error(
     load_json(session_key(n, w, id, "last_error.json"))
 }
 
+fn retire_session_key(
+    n: Network,
+    w: &str,
+    id: &str,
+    session: &Session,
+) -> Result<(), DispatchResponse> {
+    delete_secret(&secret_key(&[
+        "sessions",
+        &session.network,
+        w,
+        id,
+        "agent_key",
+    ]))?;
+    let pending_key = session_key(n, w, id, "pending.json");
+    if let Some(mut pending) = load_secret_json::<Pending>(pending_key.clone())? {
+        pending.key_hex.clear();
+        pending.completed = true;
+        pending.session.stopped = true;
+        save_json(pending_key, &pending, true)?;
+    }
+    Ok(())
+}
+
 fn active_session(n: Network, w: &str, id: &str) -> Result<Session, DispatchResponse> {
     let Some(session) = load_session(n, w, id)? else {
         return Err(petal::error(-1, "session not found"));
     };
     if session.stopped {
+        retire_session_key(n, w, id, &session)?;
         return Err(denied("session is stopped"));
     }
     if session.expires_ms <= petal::sdk::now_ms() {
+        retire_session_key(n, w, id, &session)?;
         return Err(denied("session has expired"));
     }
     Ok(session)
@@ -639,6 +741,9 @@ pub fn stop_session(n: Network, w: &str, id: &str) -> DispatchResponse {
     };
     session.stopped = true;
     session.last_error = None;
+    if let Err(response) = retire_session_key(n, w, id, &session) {
+        return response;
+    }
     match save_json(session_key(n, w, id, "session.json"), &session, false) {
         Ok(()) => ok_write(),
         Err(response) => response,
@@ -683,24 +788,17 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
     if let Err(e) = session_policy(&s, &req.action) {
         return denied(e);
     };
-    let key = match petal::sdk::get(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
+    let key = match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
         Ok(Some(x)) => x,
         Ok(None) => {
             return backend("session agent key is missing; recover the session through the owner");
         }
-        Err(e) => return backend(e),
+        Err(response) => return response,
     };
     let signer = match PrivateKeySigner::from_bytes(&key) {
         Ok(x) => x,
         Err(e) => return backend(format!("agent key invalid: {e}")),
     };
-    let (nonce, operation_key, completed) = match session_nonce(n, w, id, &req.action, req.nonce) {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    if completed {
-        return ok_write();
-    }
     let vault = match req.vault_address.as_deref() {
         Some(x) => match protocol::parse_address(x) {
             Ok(a) => Some(a),
@@ -708,6 +806,21 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
         },
         None => None,
     };
+    let (nonce, operation_key, completed) = match session_nonce(
+        n,
+        w,
+        id,
+        &req.action,
+        req.vault_address.as_deref(),
+        req.expires_after,
+        req.nonce,
+    ) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if completed {
+        return ok_write();
+    }
     let hash = match protocol::l1_signing_hash(n, &req.action, nonce, vault, req.expires_after) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -753,7 +866,7 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
             if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
                 return e;
             };
-            let _ = petal::sdk::delete(&session_key(n, w, id, "last_error.json"));
+            let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
             let _ = append_audit(
                 n,
                 w,
@@ -791,12 +904,12 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
     }
 }
 fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
-    match petal::sdk::get(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
+    match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
         Ok(Some(x)) => Ok(x),
         Ok(None) => Err(backend(
             "session agent key is missing; recover the session through the owner",
         )),
-        Err(e) => Err(backend(e)),
+        Err(response) => Err(response),
     }
 }
 fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), DispatchResponse> {
@@ -808,25 +921,27 @@ fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), Disp
         .unwrap_or_else(petal::sdk::now_ms);
     let digest = hex::encode(sha3::Keccak256::digest(&line));
     let key = session_key(n, w, id, &format!("audit/{time:020}-{digest}.jsonl"));
-    match petal::sdk::put_new(&key, &line, false) {
+    match petal::sdk::store_put_new(&key, &line, false) {
         Ok(()) => Ok(()),
-        Err(e) => match petal::sdk::get(&key) {
+        Err(e) => match load_bytes(&key) {
             Ok(Some(existing)) if existing == line => Ok(()),
-            _ => Err(backend(e)),
+            _ => Err(backend(e.message())),
         },
     }
 }
 
 pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
-    let mut out = petal::sdk::get(&session_key(n, w, id, "audit.jsonl"))?.unwrap_or_default();
+    let mut out = load_bytes_result(&session_key(n, w, id, "audit.jsonl"))
+        .map_err(|e| e.message())?
+        .unwrap_or_default();
     if out.len() > MAX_BODY {
         out.clear();
     }
     let prefix = session_key(n, w, id, "audit/");
-    let mut keys = petal::sdk::list(&prefix)?;
+    let mut keys = petal::sdk::store_list(&prefix, MAX_BODY).map_err(|e| e.message())?;
     keys.sort();
     for key in keys.iter().skip(keys.len().saturating_sub(1024)) {
-        let Some(line) = petal::sdk::get(key)? else {
+        let Some(line) = load_bytes_result(key).map_err(|e| e.message())? else {
             continue;
         };
         if out.len().saturating_add(line.len()) > MAX_BODY {
@@ -854,7 +969,8 @@ fn session_agent_submit(
         Ok(x) => x,
         Err(e) => return backend(format!("agent key invalid: {e}")),
     };
-    let (nonce, operation_key, completed) = match session_nonce(n, w, id, &action, None) {
+    let (nonce, operation_key, completed) = match session_nonce(n, w, id, &action, None, None, None)
+    {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -899,7 +1015,7 @@ fn session_agent_submit(
             if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
                 return e;
             };
-            let _ = petal::sdk::delete(&session_key(n, w, id, "last_error.json"));
+            let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
             let _ = append_audit(
                 n,
                 w,
@@ -1031,7 +1147,11 @@ fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String>
     if !x.is_finite() || x <= 0.0 {
         return Err("market price must be positive".into());
     };
-    let y = if buy { x * 1.5 } else { x * 0.5 };
+    let y = if buy {
+        x * (1.0 + CLOSE_SLIPPAGE)
+    } else {
+        x * (1.0 - CLOSE_SLIPPAGE)
+    };
     let significant_precision = 4 - y.log10().floor() as i32;
     let precision = significant_precision.min(6_u32.saturating_sub(sz_decimals) as i32);
     let factor = 10_f64.powi(-precision);
@@ -1176,7 +1296,7 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
                 cancels.iter().all(|o| allowed(o.asset))
             }
             ExchangeAction::UpdateLeverage { asset, .. } => allowed(*asset),
-            ExchangeAction::ScheduleCancel { .. } => true,
+            ExchangeAction::ScheduleCancel { .. } => false,
         };
         if !all_allowed {
             return Err("asset is outside the session allow-list".into());
@@ -1184,7 +1304,7 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<NewSession>(body) {
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
@@ -1198,7 +1318,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     let now = petal::sdk::now_ms();
     let request_digest = hex::encode(sha3::Keccak256::digest(body));
     let pending_key = session_key(n, &w, &req.id, "pending.json");
-    let pending = match load_json::<Pending>(pending_key.clone()) {
+    let pending = match load_secret_json::<Pending>(pending_key.clone()) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -1252,7 +1372,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         },
         None => match petal::sdk::random_bytes(32) {
             Ok(x) => x,
-            Err(e) => return backend(e),
+            Err(e) => return backend(e.message()),
         },
     };
     let signer = match PrivateKeySigner::from_bytes(&key) {
@@ -1323,12 +1443,12 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     {
         return e;
     };
-    let sig = match petal::sdk::sign(&w, hash.as_slice(), "hyperliquid.approve_agent") {
-        Ok(petal::sdk::Sign::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
+    let sig = match sign_hash(&w, &hash, "hyperliquid.approve_agent") {
+        Ok(SignHashOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         },
-        Ok(petal::sdk::Sign::Approval {
+        Ok(SignHashOutcome::ApprovalRequired {
             action_id,
             ceremony_url,
             expires_ms,
@@ -1348,7 +1468,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                 return e;
             }
             return approval(
-                ctx,
                 "approve_agent",
                 &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms,"session":session.id}),
             );
@@ -1399,7 +1518,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                 pending_key,
                 &Pending {
                     session: session.clone(),
-                    key_hex: hex::encode(&key),
+                    key_hex: String::new(),
                     nonce,
                     approval_expires_ms: None,
                     request_digest,
@@ -1416,13 +1535,9 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     }
 }
 
-pub fn session_children(ctx: &Ctx) -> Vec<petal::Entry> {
-    let Ok(n) = network(ctx) else {
-        return Vec::new();
-    };
-    let Ok(w) = wallet(ctx) else {
-        return Vec::new();
-    };
+pub fn session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
+    let n = network(ctx)?;
+    let w = wallet(ctx)?;
     let prefix = state_key(&[
         "sessions",
         if matches!(n, Network::Mainnet) {
@@ -1433,16 +1548,12 @@ pub fn session_children(ctx: &Ctx) -> Vec<petal::Entry> {
         &w,
         "",
     ]);
-    let ids = completed_session_ids(&prefix, petal::sdk::list(&prefix).unwrap_or_default());
-    ids.into_iter()
-        .map(|id| petal::Entry {
-            name: id,
-            kind: petal::EntryKind::Dir,
-            mode: 0o755,
-            size: Some(0),
-            link_target: None,
-        })
-        .collect()
+    let keys =
+        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+    Ok(completed_session_ids(&prefix, keys)
+        .into_iter()
+        .map(petal::dir)
+        .collect())
 }
 fn completed_session_ids(prefix: &str, keys: Vec<String>) -> Vec<String> {
     keys.into_iter()
@@ -1452,11 +1563,11 @@ fn completed_session_ids(prefix: &str, keys: Vec<String>) -> Vec<String> {
         })
         .collect()
 }
-pub fn wallet_session_children(ctx: &Ctx) -> Vec<petal::Entry> {
+pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
     let mut out =
-        crate::static_list(&[("new.json", false, true), ("last_error.json", false, true)]);
-    out.extend(session_children(ctx));
-    out
+        crate::static_list(&[("new.json", false, true), ("last_error.json", false, false)]);
+    out.extend(session_children(ctx)?);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1495,6 +1606,13 @@ mod tests {
             session_policy(&bounded_session(), &action),
             Err("asset is outside the session allow-list".into())
         );
+        assert_eq!(
+            session_policy(
+                &bounded_session(),
+                &ExchangeAction::ScheduleCancel { time: Some(123) }
+            ),
+            Err("asset is outside the session allow-list".into())
+        );
     }
 
     #[test]
@@ -1517,6 +1635,25 @@ mod tests {
         assert_eq!(
             session_policy(&bounded_session(), &excessive_leverage),
             Err("requested leverage exceeds session bound".into())
+        );
+    }
+
+    #[test]
+    fn session_operation_identity_includes_vault_and_expiry() {
+        let action = ExchangeAction::ScheduleCancel { time: Some(123) };
+        let base = session_operation_digest(&action, None, None).unwrap();
+        assert_ne!(
+            base,
+            session_operation_digest(
+                &action,
+                Some("0x0000000000000000000000000000000000000001"),
+                None
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            base,
+            session_operation_digest(&action, None, Some(999_999)).unwrap()
         );
     }
 
@@ -1550,9 +1687,9 @@ mod tests {
     }
 
     #[test]
-    fn close_price_obeys_perpetual_tick_precision() {
-        assert_eq!(close_price("42.123", true, 2).unwrap(), "63.185");
-        assert_eq!(close_price("123456", false, 0).unwrap(), "61728");
+    fn close_price_uses_bounded_slippage_and_perpetual_tick_precision() {
+        assert_eq!(close_price("42.123", true, 2).unwrap(), "44.23");
+        assert_eq!(close_price("123456", false, 0).unwrap(), "117280");
         assert_eq!(canonical_abs_decimal("-1.2300"), "1.23");
     }
 

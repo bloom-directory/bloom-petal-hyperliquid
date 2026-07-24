@@ -2,7 +2,12 @@ petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "deprecated compatibility alias for usd_send.json; this submits Hyperliquid usdSend, not sendAsset"
+            "description": "write a Hyperliquid usdSend request; owner signing may require Bloom approval",
+            "body": {
+                "destination": "0x-prefixed account address",
+                "amount": "positive USDC decimal with at most 6 decimal places",
+                "nonce": "optional timestamp in milliseconds"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

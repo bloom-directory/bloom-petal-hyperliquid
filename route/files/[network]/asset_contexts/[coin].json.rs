@@ -1,4 +1,4 @@
-petal::route_file!(spec: petal::http_read_spec(), read: |ctx: &petal::Ctx| {
+petal::route_file!(spec: petal::http_read_spec(5_000), read: |ctx: &petal::Ctx| {
     let network = match petal::param(ctx, "network").and_then(|value| {
         crate::Network::parse(value).map_err(|error| petal::error(-3, error))
     }) {
@@ -27,10 +27,10 @@ petal::route_file!(spec: petal::http_read_spec(), read: |ctx: &petal::Ctx| {
             asset.get("name").and_then(crate::serde_json::Value::as_str) == Some(coin)
         })
     {
-        return petal::read_json(&crate::serde_json::json!({
+        return petal::read_json_value(&crate::serde_json::json!({
             "meta": asset,
             "context": contexts.get(index).cloned().unwrap_or(crate::serde_json::Value::Null)
         }));
     }
-    petal::read_json(&crate::serde_json::json!({"coin": coin, "found": false}))
+    petal::read_json_value(&crate::serde_json::json!({"coin": coin, "found": false}))
 });

@@ -4,11 +4,14 @@ Read `README.md` and inspect the target file before every write. Market and
 account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
-`schedule_cancel.json`, `update_leverage.json`, `raw_signed.json`, and
-`send_asset.json`. Owner-signed actions may return an approval-required error;
+`cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
+`raw_signed.json`, and `usd_send.json`. `send_asset.json` is a deprecated alias
+for `usd_send.json`; it does not implement Hyperliquid's generalized
+`sendAsset` action. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
-are created through `agent_sessions/<wallet>/new.json` with a stable `id` and must be inspected
-through their `status.json`, `last_response.json`, and `last_error.json` files.
+are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
+must be inspected through their `status.json`, `last_response.json`, and
+`last_error.json` files.
 
 Route files own their parameter parsing, `/info` request bodies, response
 projection, read descriptions, write-action compatibility, and endpoint
