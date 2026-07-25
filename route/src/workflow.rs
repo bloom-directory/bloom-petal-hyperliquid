@@ -1610,4 +1610,16 @@ mod tests {
             DispatchResponse::Read(raw)
         );
     }
+
+    #[test]
+    fn last_response_key_is_network_scoped() {
+        assert_eq!(
+            last_response_key(Network::Mainnet, "0xabc"),
+            "state/exchange/mainnet/0xabc/last_response.json"
+        );
+        assert_eq!(
+            last_response_key(Network::Testnet, "0xabc"),
+            "state/exchange/testnet/0xabc/last_response.json"
+        );
+    }
 }

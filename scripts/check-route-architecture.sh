@@ -71,6 +71,11 @@ while IFS= read -r route_file; do
   fi
 done < <(search_files 'petal::write_spec' route/files)
 
+if search_files 'secret_key\|load_secret_bytes\|load_secret_json\|"secrets"' route/files >/dev/null; then
+  echo "route architecture check: route files must not reference secret-namespace accessors" >&2
+  failed=1
+fi
+
 if [[ "$failed" -ne 0 ]]; then
   exit 1
 fi
