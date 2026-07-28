@@ -74,11 +74,19 @@ fn state_key(parts: &[&str]) -> String {
 fn secret_key(parts: &[&str]) -> String {
     format!("secrets/{}", parts.join("/"))
 }
-fn save_json(key: String, v: &impl Serialize, secret: bool) -> Result<(), DispatchResponse> {
+fn save_json(
+    key: String,
+    v: &(impl Serialize + ?Sized),
+    secret: bool,
+) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
     petal::sdk::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
 }
-fn save_json_new(key: String, v: &impl Serialize, secret: bool) -> Result<(), DispatchResponse> {
+fn save_json_new(
+    key: String,
+    v: &(impl Serialize + ?Sized),
+    secret: bool,
+) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
     petal::sdk::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
 }
@@ -181,17 +189,7 @@ fn safe_json(v: &Value) -> String {
 }
 
 pub fn exchange_last_response(n: Network, w: &str) -> DispatchResponse {
-    let key = state_key(&[
-        "exchange",
-        if matches!(n, Network::Mainnet) {
-            "mainnet"
-        } else {
-            "testnet"
-        },
-        w,
-        "last_response.json",
-    ]);
-    match load_bytes(&key) {
+    match load_bytes(&last_response_key(n, w)) {
         Ok(Some(bytes)) => DispatchResponse::Read(bytes),
         Ok(None) => invalid("no exchange response has been recorded"),
         Err(response) => response,
@@ -203,6 +201,71 @@ pub fn validate_body_size(body: &[u8]) -> Result<(), DispatchResponse> {
         Err(invalid("request body is too large"))
     } else {
         Ok(())
+    }
+}
+
+fn last_response_key(n: Network, w: &str) -> String {
+    state_key(&[
+        "exchange",
+        if matches!(n, Network::Mainnet) {
+            "mainnet"
+        } else {
+            "testnet"
+        },
+        w,
+        "last_response.json",
+    ])
+}
+
+fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
+    save_json(
+        key.to_owned(),
+        &PendingNonce {
+            nonce,
+            expires_ms: u64::MAX,
+            completed,
+        },
+        false,
+    )
+}
+
+fn owner_sign_or_approval(
+    w: &str,
+    hash: &B256,
+    intent: &str,
+    pending_nonce_key: Option<&str>,
+    nonce: u64,
+    approval_kind: &str,
+) -> Result<protocol::SignatureJson, DispatchResponse> {
+    match sign_hash(w, hash, intent) {
+        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
+            Ok(x) => Ok(x),
+            Err(e) => Err(invalid(e)),
+        },
+        Ok(SignHashOutcome::ApprovalRequired {
+            action_id,
+            ceremony_url,
+            expires_ms,
+        }) => {
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_json(
+                    key.to_owned(),
+                    &PendingNonce {
+                        nonce,
+                        expires_ms,
+                        completed: false,
+                    },
+                    false,
+                )
+            {
+                return Err(e);
+            }
+            Err(approval(
+                approval_kind,
+                &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
+            ))
+        }
+        Err(e) => Err(denied(format!("signing denied: {e}"))),
     }
 }
 
@@ -235,46 +298,19 @@ pub fn owner_action_write(
         Ok(h) => h,
         Err(e) => return invalid(e),
     };
-    let sig = match sign_hash(&w, &hash, req.action.intent()) {
-        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
-            Ok(x) => x,
-            Err(e) => return invalid(e),
-        },
-        Ok(SignHashOutcome::ApprovalRequired {
-            action_id,
-            ceremony_url,
-            expires_ms,
-        }) => {
-            if let Some(key) = pending_nonce_key
-                && let Err(e) = save_json(
-                    key,
-                    &PendingNonce {
-                        nonce,
-                        expires_ms,
-                        completed: false,
-                    },
-                    false,
-                )
-            {
-                return e;
-            }
-            return approval(
-                "exchange",
-                &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
-            );
-        }
-        Err(e) => return denied(format!("signing denied: {e}")),
+    let sig = match owner_sign_or_approval(
+        &w,
+        &hash,
+        req.action.intent(),
+        pending_nonce_key.as_deref(),
+        nonce,
+        "exchange",
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
     };
     if let Some(key) = pending_nonce_key.as_ref()
-        && let Err(e) = save_json(
-            key.clone(),
-            &PendingNonce {
-                nonce,
-                expires_ms: u64::MAX,
-                completed: false,
-            },
-            false,
-        )
+        && let Err(e) = save_pending(key, nonce, false)
     {
         return e;
     }
@@ -289,15 +325,7 @@ pub fn owner_action_write(
     );
     if matches!(response, DispatchResponse::Write)
         && let Some(key) = pending_nonce_key
-        && let Err(e) = save_json(
-            key,
-            &PendingNonce {
-                nonce,
-                expires_ms: u64::MAX,
-                completed: true,
-            },
-            false,
-        )
+        && let Err(e) = save_pending(&key, nonce, true)
     {
         return e;
     }
@@ -454,17 +482,7 @@ pub fn submit_l1(
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 return backend(e);
             }
-            let key = state_key(&[
-                "exchange",
-                if matches!(n, Network::Mainnet) {
-                    "mainnet"
-                } else {
-                    "testnet"
-                },
-                &w,
-                "last_response.json",
-            ]);
-            if let Err(e) = save_json(key, &v, false) {
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
             ok_write()
@@ -505,46 +523,19 @@ pub fn usd_send(n: Network, w: String, body: &[u8]) -> DispatchResponse {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match sign_hash(&w, &hash, "hyperliquid.usd_send") {
-        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
-            Ok(x) => x,
-            Err(e) => return invalid(e),
-        },
-        Ok(SignHashOutcome::ApprovalRequired {
-            action_id,
-            ceremony_url,
-            expires_ms,
-        }) => {
-            if let Some(key) = pending_nonce_key
-                && let Err(e) = save_json(
-                    key,
-                    &PendingNonce {
-                        nonce,
-                        expires_ms,
-                        completed: false,
-                    },
-                    false,
-                )
-            {
-                return e;
-            }
-            return approval(
-                "usd_send",
-                &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
-            );
-        }
-        Err(e) => return denied(format!("signing denied: {e}")),
+    let sig = match owner_sign_or_approval(
+        &w,
+        &hash,
+        "hyperliquid.usd_send",
+        pending_nonce_key.as_deref(),
+        nonce,
+        "usd_send",
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
     };
     if let Some(key) = pending_nonce_key.as_ref()
-        && let Err(e) = save_json(
-            key.clone(),
-            &PendingNonce {
-                nonce,
-                expires_ms: u64::MAX,
-                completed: false,
-            },
-            false,
-        )
+        && let Err(e) = save_pending(key, nonce, false)
     {
         return e;
     }
@@ -553,29 +544,11 @@ pub fn usd_send(n: Network, w: String, body: &[u8]) -> DispatchResponse {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 return backend(e);
             }
-            let key = state_key(&[
-                "exchange",
-                if matches!(n, Network::Mainnet) {
-                    "mainnet"
-                } else {
-                    "testnet"
-                },
-                &w,
-                "last_response.json",
-            ]);
-            if let Err(e) = save_json(key, &v, false) {
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
             if let Some(key) = pending_nonce_key
-                && let Err(e) = save_json(
-                    key,
-                    &PendingNonce {
-                        nonce,
-                        expires_ms: u64::MAX,
-                        completed: true,
-                    },
-                    false,
-                )
+                && let Err(e) = save_pending(&key, nonce, true)
             {
                 return e;
             }
@@ -774,46 +747,57 @@ pub fn close_all_session(n: Network, w: &str, id: &str) -> DispatchResponse {
     session_close_all(n, w, id, &mut session, &key)
 }
 
-pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> DispatchResponse {
-    let mut s = match active_session(n, w, id) {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
-    if s.stopped {
-        return denied("session is stopped");
-    };
-    if s.expires_ms <= petal::sdk::now_ms() {
-        return denied("session has expired");
-    };
-    if let Err(e) = session_policy(&s, &req.action) {
+fn record_session_error(
+    n: Network,
+    w: &str,
+    id: &str,
+    s: &mut Session,
+    nonce: u64,
+    action_kind: &str,
+    msg: &str,
+) {
+    s.last_error = Some(msg.to_owned());
+    let _ = save_json(session_key(n, w, id, "session.json"), s, false);
+    let _ = save_json(session_key(n, w, id, "last_error.json"), msg, false);
+    let _ = append_audit(
+        n,
+        w,
+        id,
+        &json!({"time_ms":nonce,"event":"session_action_error","action":action_kind,"error":msg}),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_submit(
+    n: Network,
+    w: &str,
+    id: &str,
+    s: &mut Session,
+    key: &[u8],
+    action: ExchangeAction,
+    vault: Option<Address>,
+    vault_str: Option<String>,
+    expires: Option<u64>,
+    explicit_nonce: Option<u64>,
+) -> DispatchResponse {
+    if let Err(e) = action.validate() {
+        return invalid(e);
+    }
+    if let Err(e) = session_policy(s, &action) {
         return denied(e);
-    };
-    let key = match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
-        Ok(Some(x)) => x,
-        Ok(None) => {
-            return backend("session agent key is missing; recover the session through the owner");
-        }
-        Err(response) => return response,
-    };
-    let signer = match PrivateKeySigner::from_bytes(&key) {
+    }
+    let signer = match PrivateKeySigner::from_bytes(key) {
         Ok(x) => x,
         Err(e) => return backend(format!("agent key invalid: {e}")),
-    };
-    let vault = match req.vault_address.as_deref() {
-        Some(x) => match protocol::parse_address(x) {
-            Ok(a) => Some(a),
-            Err(e) => return invalid(e),
-        },
-        None => None,
     };
     let (nonce, operation_key, completed) = match session_nonce(
         n,
         w,
         id,
-        &req.action,
-        req.vault_address.as_deref(),
-        req.expires_after,
-        req.nonce,
+        &action,
+        vault_str.as_deref(),
+        expires,
+        explicit_nonce,
     ) {
         Ok(x) => x,
         Err(e) => return e,
@@ -821,7 +805,7 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
     if completed {
         return ok_write();
     }
-    let hash = match protocol::l1_signing_hash(n, &req.action, nonce, vault, req.expires_after) {
+    let hash = match protocol::l1_signing_hash(n, &action, nonce, vault, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
@@ -832,40 +816,25 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
         },
         Err(e) => return backend(format!("agent signing failed: {e}")),
     };
-    let action_kind = req.action.kind();
-    let payload = match protocol::exchange_payload(
-        req.action,
-        nonce,
-        sig,
-        req.vault_address,
-        req.expires_after,
-    ) {
+    let action_kind = action.kind();
+    let payload = match protocol::exchange_payload(action, nonce, sig, vault_str, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
     match http_json(n, "/exchange", payload) {
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
-                let msg = e.clone();
-                s.last_error = Some(msg.clone());
-                let _ = save_json(session_key(n, w, id, "session.json"), &s, false);
-                let _ = save_json(session_key(n, w, id, "last_error.json"), &msg, false);
-                let _ = append_audit(
-                    n,
-                    w,
-                    id,
-                    &json!({"time_ms":nonce,"event":"session_action_error","action":action_kind,"error":msg}),
-                );
+                record_session_error(n, w, id, s, nonce, action_kind, &e);
                 return backend(e);
             }
             s.last_response = Some(v.clone());
             s.last_error = None;
-            if let Err(e) = save_json(session_key(n, w, id, "session.json"), &s, false) {
+            if let Err(e) = save_json(session_key(n, w, id, "session.json"), s, false) {
                 return e;
-            };
+            }
             if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
                 return e;
-            };
+            }
             let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
             let _ = append_audit(
                 n,
@@ -874,15 +843,7 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
                 &json!({"time_ms":nonce,"event":"session_action","action":action_kind,"response":v}),
             );
             if let Some(key) = operation_key
-                && let Err(e) = save_json(
-                    key,
-                    &PendingNonce {
-                        nonce,
-                        expires_ms: u64::MAX,
-                        completed: true,
-                    },
-                    false,
-                )
+                && let Err(e) = save_pending(&key, nonce, true)
             {
                 return e;
             }
@@ -890,18 +851,40 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
         }
         Err(e) => {
             let msg = format!("{e:?}");
-            s.last_error = Some(msg.clone());
-            let _ = save_json(session_key(n, w, id, "session.json"), &s, false);
-            let _ = save_json(session_key(n, w, id, "last_error.json"), &msg, false);
-            let _ = append_audit(
-                n,
-                w,
-                id,
-                &json!({"time_ms":nonce,"event":"session_action_error","action":action_kind,"error":msg}),
-            );
+            record_session_error(n, w, id, s, nonce, action_kind, &msg);
             e
         }
     }
+}
+
+pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> DispatchResponse {
+    let mut s = match active_session(n, w, id) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let key = match session_agent_key(w, id, &s) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let vault = match req.vault_address.as_deref() {
+        Some(x) => match protocol::parse_address(x) {
+            Ok(a) => Some(a),
+            Err(e) => return invalid(e),
+        },
+        None => None,
+    };
+    session_submit(
+        n,
+        w,
+        id,
+        &mut s,
+        &key,
+        req.action,
+        vault,
+        req.vault_address,
+        req.expires_after,
+        req.nonce,
+    )
 }
 fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
     match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
@@ -959,98 +942,7 @@ fn session_agent_submit(
     key: &[u8],
     action: ExchangeAction,
 ) -> DispatchResponse {
-    if let Err(e) = action.validate() {
-        return invalid(e);
-    }
-    if let Err(e) = session_policy(s, &action) {
-        return denied(e);
-    };
-    let signer = match PrivateKeySigner::from_bytes(key) {
-        Ok(x) => x,
-        Err(e) => return backend(format!("agent key invalid: {e}")),
-    };
-    let (nonce, operation_key, completed) = match session_nonce(n, w, id, &action, None, None, None)
-    {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    if completed {
-        return ok_write();
-    }
-    let hash = match protocol::l1_signing_hash(n, &action, nonce, None, None) {
-        Ok(x) => x,
-        Err(e) => return invalid(e),
-    };
-    let sig = match signer.sign_hash_sync(&hash) {
-        Ok(x) => match protocol::SignatureJson::from_raw(&x.as_bytes()) {
-            Ok(v) => v,
-            Err(e) => return backend(e),
-        },
-        Err(e) => return backend(format!("agent signing failed: {e}")),
-    };
-    let payload = match protocol::exchange_payload(action.clone(), nonce, sig, None, None) {
-        Ok(x) => x,
-        Err(e) => return invalid(e),
-    };
-    match http_json(n, "/exchange", payload) {
-        Ok(v) => {
-            if let Err(e) = protocol::validate_exchange_response(&v) {
-                let msg = e.clone();
-                s.last_error = Some(msg.clone());
-                let _ = save_json(session_key(n, w, id, "session.json"), s, false);
-                let _ = save_json(session_key(n, w, id, "last_error.json"), &msg, false);
-                let _ = append_audit(
-                    n,
-                    w,
-                    id,
-                    &json!({"time_ms":nonce,"event":"session_action_error","action":action.kind(),"error":msg}),
-                );
-                return backend(e);
-            }
-            s.last_response = Some(v.clone());
-            s.last_error = None;
-            if let Err(e) = save_json(session_key(n, w, id, "session.json"), s, false) {
-                return e;
-            };
-            if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
-                return e;
-            };
-            let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
-            let _ = append_audit(
-                n,
-                w,
-                id,
-                &json!({"time_ms":nonce,"event":"session_action","action":action.kind(),"response":v}),
-            );
-            if let Some(key) = operation_key
-                && let Err(e) = save_json(
-                    key,
-                    &PendingNonce {
-                        nonce,
-                        expires_ms: u64::MAX,
-                        completed: true,
-                    },
-                    false,
-                )
-            {
-                return e;
-            }
-            ok_write()
-        }
-        Err(e) => {
-            let msg = format!("{e:?}");
-            s.last_error = Some(msg.clone());
-            let _ = save_json(session_key(n, w, id, "session.json"), s, false);
-            let _ = save_json(session_key(n, w, id, "last_error.json"), &msg, false);
-            let _ = append_audit(
-                n,
-                w,
-                id,
-                &json!({"time_ms":nonce,"event":"session_action_error","action":action.kind(),"error":msg}),
-            );
-            e
-        }
-    }
+    session_submit(n, w, id, s, key, action, None, None, None, None)
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -1716,6 +1608,18 @@ mod tests {
         assert_eq!(
             read_json_response(200, raw.clone()),
             DispatchResponse::Read(raw)
+        );
+    }
+
+    #[test]
+    fn last_response_key_is_network_scoped() {
+        assert_eq!(
+            last_response_key(Network::Mainnet, "0xabc"),
+            "state/exchange/mainnet/0xabc/last_response.json"
+        );
+        assert_eq!(
+            last_response_key(Network::Testnet, "0xabc"),
+            "state/exchange/testnet/0xabc/last_response.json"
         );
     }
 }
