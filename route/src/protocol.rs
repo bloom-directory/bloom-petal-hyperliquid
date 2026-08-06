@@ -739,15 +739,22 @@ mod tests {
     fn payload_preimages_preserve_official_signing_hashes() {
         let agent = parse_address("0x0000000000000000000000000000000000000002").unwrap();
         let (_, expected) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
-        let (_, payload) = approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        let (_, payload) =
+            approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
         assert_eq!(payload.hash, expected);
-        assert_eq!(B256::from_slice(&Keccak256::digest(&payload.preimage)), expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
+        );
 
         let action = cancel();
         let expected = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
         let payload = l1_signing_payload(Network::Mainnet, &action, 123, None, None).unwrap();
         assert_eq!(payload.hash, expected);
-        assert_eq!(B256::from_slice(&Keccak256::digest(&payload.preimage)), expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
+        );
     }
 
     #[test]
