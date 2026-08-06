@@ -290,9 +290,8 @@ fn owner_sign_or_approval(
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
         },
-        Ok(SignOutcome::ApprovalRequired {
+        Ok(SignOutcome::ApprovalPending {
             action_id,
-            ceremony_url,
             expires_ms,
         }) => {
             if let Some(key) = pending_nonce_key
@@ -310,7 +309,7 @@ fn owner_sign_or_approval(
             }
             Err(approval(
                 approval_kind,
-                &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms}),
+                &json!({"action_id":action_id,"expires_ms":expires_ms}),
             ))
         }
         Err(e) => Err(denied(format!("signing denied: {e}"))),
@@ -1419,9 +1418,8 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             Ok(x) => x,
             Err(e) => return invalid(e),
         },
-        Ok(SignOutcome::ApprovalRequired {
+        Ok(SignOutcome::ApprovalPending {
             action_id,
-            ceremony_url,
             expires_ms,
         }) => {
             if let Err(e) = save_json(
@@ -1440,7 +1438,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             }
             return approval(
                 "approve_agent",
-                &json!({"action_id":action_id,"ceremony_url":ceremony_url,"expires_ms":expires_ms,"session":session.id}),
+                &json!({"action_id":action_id,"expires_ms":expires_ms,"session":session.id}),
             );
         }
         Err(e) => return denied(format!("signing denied: {e}")),
