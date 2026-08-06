@@ -2,11 +2,13 @@ use alloy_primitives::{Address, B256, Signature};
 use k256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use sha3::Digest;
 
 use crate::protocol::{self, ExchangeAction, Network, SignSubmit};
 use petal::{
-    Ctx, DispatchResponse, HostStatus, HttpRequest, SdkError, SignHashOutcome, SignRequest,
+    Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
+    SignSelector,
 };
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -63,10 +65,13 @@ fn network(ctx: &Ctx) -> Result<Network, DispatchResponse> {
     Network::parse(p(ctx, "network")?).map_err(invalid)
 }
 fn wallet(ctx: &Ctx) -> Result<String, DispatchResponse> {
-    let raw = p(ctx, "wallet")?;
-    protocol::parse_address(raw)
-        .map(|a| format!("{a:#x}"))
-        .map_err(invalid)
+    parse_wallet_id(p(ctx, "wallet")?).map_err(invalid)
+}
+pub fn parse_wallet_id(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '/') {
+        return Err("wallet id must be 1-128 characters without '/' or control characters".into());
+    }
+    Ok(raw.to_owned())
 }
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
@@ -138,13 +143,55 @@ fn http_raw(net: Network, path: &str, body: Value) -> Result<(u16, Vec<u8>), Dis
     .map_err(|e| backend(e.message()))?;
     Ok((response.status, response.body))
 }
-fn sign_hash(wallet: &str, hash: &B256, purpose: &str) -> Result<SignHashOutcome, String> {
-    let mut hash32 = [0_u8; 32];
-    hash32.copy_from_slice(hash.as_slice());
-    petal::sdk::sign_hash(&SignRequest {
+fn route_id(ctx: &Ctx) -> Result<&str, String> {
+    ctx.params
+        .iter()
+        .find_map(|(name, value)| (name == "bloom.route_id").then_some(value.as_str()))
+        .ok_or_else(|| "trusted Petal route id is unavailable".into())
+}
+fn sign_payload(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    operation_class: &str,
+) -> Result<SignOutcome, String> {
+    let payload_digest = Sha256::digest(&payload.preimage);
+    let route = route_id(ctx)?;
+    let nonce_digest = Sha256::digest(
+        [
+            ctx.package_hash.as_bytes(),
+            route.as_bytes(),
+            operation_class.as_bytes(),
+            payload.hash.as_slice(),
+        ]
+        .concat(),
+    );
+    let claim = json!({
+        "package_hash": ctx.package_hash,
+        "route": route,
+        "operation_class": operation_class,
+        "crypto_suite": "secp256k1-keccak256-recoverable",
+        "payload_digest": hex::encode(payload_digest),
+        "ordered_hashes": [hex::encode(payload.hash)],
+        "declared_debits": [],
+        "declared_destinations": [],
+        "declared_fee": {"kind": "none"},
+        "nonce": hex::encode(&nonce_digest[..16]),
+        "claim_assurance": {"kind": "machine_asserted"}
+    });
+    petal::sdk::sign_payload(&PayloadSignRequest {
         wallet: wallet.into(),
-        hash32,
-        purpose: purpose.into(),
+        preimage: payload.preimage.clone(),
+        claimed_hash: payload.hash.into(),
+        signature_algorithm: "secp256k1-keccak256-recoverable".into(),
+        operation_class: operation_class.into(),
+        petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
+        claim_assurance_evidence: None,
+        approval_hint: None,
+        action: None,
+        advisory: None,
+        selector: SignSelector::Exact,
+        key_ref_jcs: None,
     })
     .map_err(|e| e.message())
 }
@@ -230,19 +277,20 @@ fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchRe
 }
 
 fn owner_sign_or_approval(
+    ctx: &Ctx,
     w: &str,
-    hash: &B256,
+    payload: &protocol::SigningPayload,
     intent: &str,
     pending_nonce_key: Option<&str>,
     nonce: u64,
     approval_kind: &str,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
-    match sign_hash(w, hash, intent) {
-        Ok(SignHashOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
+    match sign_payload(ctx, w, payload, intent) {
+        Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
         },
-        Ok(SignHashOutcome::ApprovalRequired {
+        Ok(SignOutcome::ApprovalRequired {
             action_id,
             ceremony_url,
             expires_ms,
@@ -270,6 +318,7 @@ fn owner_sign_or_approval(
 }
 
 pub fn owner_action_write(
+    ctx: &Ctx,
     n: Network,
     w: String,
     operation: &str,
@@ -294,13 +343,15 @@ pub fn owner_action_write(
         },
         None => None,
     };
-    let hash = match protocol::l1_signing_hash(n, &req.action, nonce, vault, req.expires_after) {
-        Ok(h) => h,
-        Err(e) => return invalid(e),
-    };
+    let payload =
+        match protocol::l1_signing_payload(n, &req.action, nonce, vault, req.expires_after) {
+            Ok(h) => h,
+            Err(e) => return invalid(e),
+        };
     let sig = match owner_sign_or_approval(
+        ctx,
         &w,
-        &hash,
+        &payload,
         req.action.intent(),
         pending_nonce_key.as_deref(),
         nonce,
@@ -499,7 +550,7 @@ struct UsdSend {
     #[serde(default)]
     nonce: Option<u64>,
 }
-pub fn usd_send(n: Network, w: String, body: &[u8]) -> DispatchResponse {
+pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<UsdSend>(body) {
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid usd_send body: {e}")),
@@ -519,13 +570,14 @@ pub fn usd_send(n: Network, w: String, body: &[u8]) -> DispatchResponse {
     if completed {
         return ok_write();
     }
-    let (action, hash) = match protocol::usd_send_hash(n, dest, &req.amount, nonce) {
+    let (action, payload) = match protocol::usd_send_payload(n, dest, &req.amount, nonce) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
     let sig = match owner_sign_or_approval(
+        ctx,
         &w,
-        &hash,
+        &payload,
         "hyperliquid.usd_send",
         pending_nonce_key.as_deref(),
         nonce,
@@ -580,6 +632,7 @@ pub struct Session {
     pub schema: String,
     pub network: String,
     pub wallet: String,
+    pub owner_address: String,
     pub id: String,
     pub agent_address: String,
     pub agent_name: String,
@@ -608,6 +661,8 @@ struct Pending {
 #[serde(deny_unknown_fields)]
 struct NewSession {
     id: String,
+    #[serde(default)]
+    owner_address: Option<String>,
     #[serde(default)]
     duration_ms: Option<u64>,
     #[serde(default)]
@@ -994,7 +1049,11 @@ fn session_cancel_all(
     s: &mut Session,
     key: &[u8],
 ) -> DispatchResponse {
-    let open = match http_json(n, "/info", json!({"type":"openOrders","user":w})) {
+    let open = match http_json(
+        n,
+        "/info",
+        json!({"type":"openOrders","user":s.owner_address}),
+    ) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1069,7 +1128,11 @@ fn session_close_all(
     s: &mut Session,
     key: &[u8],
 ) -> DispatchResponse {
-    let state = match http_json(n, "/info", json!({"type":"clearinghouseState","user":w})) {
+    let state = match http_json(
+        n,
+        "/info",
+        json!({"type":"clearinghouseState","user":s.owner_address}),
+    ) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1196,7 +1259,7 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
+pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<NewSession>(body) {
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
@@ -1271,6 +1334,21 @@ pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
         Ok(x) => x,
         Err(e) => return backend(format!("agent key generation failed: {e}")),
     };
+    let owner_address = match req
+        .owner_address
+        .as_deref()
+        .or_else(|| protocol::parse_address(&w).ok().map(|_| w.as_str()))
+    {
+        Some(address) => match protocol::parse_address(address) {
+            Ok(address) => format!("{address:#x}"),
+            Err(e) => return invalid(format!("owner_address: {e}")),
+        },
+        None => {
+            return invalid(
+                "owner_address is required when wallet is a wallet id rather than an address",
+            );
+        }
+    };
     let generated_session = Session {
         schema: "bloom.hyperliquid_agent_session.v1".into(),
         network: if matches!(n, Network::Mainnet) {
@@ -1279,6 +1357,7 @@ pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
             "testnet".into()
         },
         wallet: w.clone(),
+        owner_address,
         id: req.id.clone(),
         agent_address: format!("{:#x}", signer.address()),
         agent_name: req
@@ -1314,8 +1393,8 @@ pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
     if addr != format!("{:#x}", signer.address()) {
         return backend("pending session agent key does not match its address");
     }
-    let (action, hash) =
-        match protocol::approve_agent_hash(n, signer.address(), &session.agent_name, nonce) {
+    let (action, payload) =
+        match protocol::approve_agent_payload(n, signer.address(), &session.agent_name, nonce) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         };
@@ -1335,12 +1414,12 @@ pub fn create_session(n: Network, w: String, body: &[u8]) -> DispatchResponse {
     {
         return e;
     };
-    let sig = match sign_hash(&w, &hash, "hyperliquid.approve_agent") {
-        Ok(SignHashOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
+    let sig = match sign_payload(ctx, &w, &payload, "hyperliquid.approve_agent") {
+        Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         },
-        Ok(SignHashOutcome::ApprovalRequired {
+        Ok(SignOutcome::ApprovalRequired {
             action_id,
             ceremony_url,
             expires_ms,
@@ -1471,6 +1550,7 @@ mod tests {
             schema: "bloom.hyperliquid_agent_session.v1".into(),
             network: "testnet".into(),
             wallet: "0x0000000000000000000000000000000000000001".into(),
+            owner_address: "0x0000000000000000000000000000000000000001".into(),
             id: "test".into(),
             agent_address: "0x0000000000000000000000000000000000000002".into(),
             agent_name: "test".into(),

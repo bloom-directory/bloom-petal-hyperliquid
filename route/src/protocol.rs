@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningPayload {
+    pub preimage: Vec<u8>,
+    pub hash: B256,
+}
+
+fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(td.domain().separator().as_slice());
+    preimage.extend_from_slice(td.hash_struct().map_err(|e| e.to_string())?.as_slice());
+    let hash = B256::from_slice(&Keccak256::digest(&preimage));
+    Ok(SigningPayload { preimage, hash })
+}
+
 pub const MAINNET_URL: &str = "https://api.hyperliquid.xyz";
 pub const TESTNET_URL: &str = "https://api.hyperliquid-testnet.xyz";
 
@@ -389,6 +404,18 @@ pub fn l1_signing_hash(
     let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
     Ok(hash)
 }
+pub fn l1_signing_payload(
+    network: Network,
+    action: &ExchangeAction,
+    nonce: u64,
+    vault: Option<Address>,
+    expires: Option<u64>,
+) -> Result<SigningPayload, String> {
+    typed_signing_payload(&typed_agent(
+        network,
+        action_hash(action, nonce, vault, expires)?,
+    )?)
+}
 fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData, String> {
     let (type_name, type_fields) = match kind {
         "approveAgent" => (
@@ -418,6 +445,19 @@ pub fn approve_agent_hash(
         hash,
     ))
 }
+pub fn approve_agent_payload(
+    network: Network,
+    agent: Address,
+    name: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = json!({"hyperliquidChain":network.chain(),"agentAddress":format!("{agent:#x}"),"agentName":name,"nonce":nonce});
+    let payload = typed_signing_payload(&user_typed(network, "approveAgent", msg)?)?;
+    Ok((
+        json!({"type":"approveAgent","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"agentAddress":format!("{agent:#x}"),"agentName":name,"nonce":nonce}),
+        payload,
+    ))
+}
 pub fn usd_send_hash(
     network: Network,
     destination: Address,
@@ -430,6 +470,19 @@ pub fn usd_send_hash(
     Ok((
         json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
         hash,
+    ))
+}
+pub fn usd_send_payload(
+    network: Network,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = json!({"hyperliquidChain":network.chain(),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce});
+    let payload = typed_signing_payload(&user_typed(network, "usdSend", msg)?)?;
+    Ok((
+        json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
+        payload,
     ))
 }
 pub fn user_payload(action: Value, nonce: u64, sig: SignatureJson) -> Value {
@@ -680,6 +733,21 @@ mod tests {
             format!("{hash:#x}"),
             "0x83174cd6237cd6f87b18b95f027955cdf8f19ed616da0843224f9ceb64f1b2ff"
         );
+    }
+
+    #[test]
+    fn payload_preimages_preserve_official_signing_hashes() {
+        let agent = parse_address("0x0000000000000000000000000000000000000002").unwrap();
+        let (_, expected) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        let (_, payload) = approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        assert_eq!(payload.hash, expected);
+        assert_eq!(B256::from_slice(&Keccak256::digest(&payload.preimage)), expected);
+
+        let action = cancel();
+        let expected = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
+        let payload = l1_signing_payload(Network::Mainnet, &action, 123, None, None).unwrap();
+        assert_eq!(payload.hash, expected);
+        assert_eq!(B256::from_slice(&Keccak256::digest(&payload.preimage)), expected);
     }
 
     #[test]
