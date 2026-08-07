@@ -980,12 +980,24 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
 }
 fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
     match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
-        Ok(Some(x)) => Ok(x),
+        Ok(Some(bytes)) => decode_agent_key(&bytes).map_err(|error| backend(error)),
         Ok(None) => Err(backend(
             "session agent key is missing; recover the session through the owner",
         )),
         Err(response) => Err(response),
     }
+}
+
+fn decode_agent_key(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if bytes.len() == 32 {
+        return Ok(bytes.to_vec());
+    }
+    let decoded: Vec<u8> =
+        serde_json::from_slice(bytes).map_err(|_| "session agent key encoding is invalid")?;
+    if decoded.len() != 32 {
+        return Err("session agent key must be 32 bytes");
+    }
+    Ok(decoded)
 }
 fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), DispatchResponse> {
     let mut line = serde_json::to_vec(event).map_err(|e| backend(e.to_string()))?;
@@ -1496,11 +1508,13 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 return backend(e);
             }
-            if let Err(e) = save_json(
-                secret_key(&["sessions", &session.network, &w, &session.id, "agent_key"]),
+            if let Err(e) = petal::sdk::store_put(
+                &secret_key(&["sessions", &session.network, &w, &session.id, "agent_key"]),
                 &key,
                 true,
-            ) {
+            )
+            .map_err(|error| backend(error.message()))
+            {
                 return e;
             }
             if let Err(e) = save_json(
@@ -1626,6 +1640,20 @@ mod tests {
         assert_eq!(
             session_preflight(&request),
             Err("agent_name must contain between 1 and 16 characters".into())
+        );
+    }
+
+    #[test]
+    fn agent_key_decoder_accepts_raw_and_legacy_json_storage() {
+        let key = [7_u8; 32];
+        assert_eq!(decode_agent_key(&key).unwrap(), key);
+        assert_eq!(
+            decode_agent_key(&serde_json::to_vec(&key.to_vec()).unwrap()).unwrap(),
+            key
+        );
+        assert_eq!(
+            decode_agent_key(b"[1,2,3]"),
+            Err("session agent key must be 32 bytes")
         );
     }
 
