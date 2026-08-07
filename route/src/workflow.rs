@@ -155,7 +155,11 @@ fn sign_payload(
     payload: &protocol::SigningPayload,
     operation_class: &str,
 ) -> Result<SignOutcome, String> {
-    let payload_digest = Sha256::digest(&payload.preimage);
+    let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
+        preimage: payload.preimage.clone(),
+        claimed_hash: payload.hash.into(),
+    }])
+    .map_err(|error| error.message())?;
     let route = route_id(ctx)?;
     let nonce_digest = Sha256::digest(
         [
@@ -675,6 +679,40 @@ struct NewSession {
     #[serde(default)]
     nonce: Option<u64>,
 }
+
+fn default_agent_name(session_id: &str) -> String {
+    let readable = format!("bloom-{session_id}");
+    if readable.chars().count() <= 16 {
+        return readable;
+    }
+    let digest = hex::encode(sha3::Keccak256::digest(session_id.as_bytes()));
+    format!("bloom-{}", &digest[..10])
+}
+
+fn validate_agent_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.chars().count() > 16 {
+        Err("agent_name must contain between 1 and 16 characters")
+    } else {
+        Ok(())
+    }
+}
+
+fn session_preflight(req: &NewSession) -> Result<String, String> {
+    if req
+        .max_leverage
+        .is_some_and(|value| !(1..=50).contains(&value))
+    {
+        return Err("max_leverage must be 1..=50".into());
+    }
+    valid_session_id(&req.id)?;
+    let agent_name = req
+        .agent_name
+        .clone()
+        .unwrap_or_else(|| default_agent_name(&req.id));
+    validate_agent_name(&agent_name).map_err(str::to_owned)?;
+    Ok(agent_name)
+}
+
 fn session_key(n: Network, w: &str, id: &str, file: &str) -> String {
     state_key(&[
         "sessions",
@@ -1263,12 +1301,10 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
-    if req.max_leverage.is_some_and(|x| !(1..=50).contains(&x)) {
-        return invalid("max_leverage must be 1..=50");
-    }
-    if let Err(e) = valid_session_id(&req.id) {
-        return invalid(e);
-    }
+    let agent_name = match session_preflight(&req) {
+        Ok(agent_name) => agent_name,
+        Err(error) => return invalid(error),
+    };
     let now = petal::sdk::now_ms();
     let request_digest = hex::encode(sha3::Keccak256::digest(body));
     let pending_key = session_key(n, &w, &req.id, "pending.json");
@@ -1359,9 +1395,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         owner_address,
         id: req.id.clone(),
         agent_address: format!("{:#x}", signer.address()),
-        agent_name: req
-            .agent_name
-            .unwrap_or_else(|| format!("bloom-{}", req.id)),
+        agent_name,
         created_ms: now,
         expires_ms: now.saturating_add(req.duration_ms.unwrap_or(3_600_000).min(86_400_000)),
         max_notional_usd: req.max_notional_usd,
@@ -1560,6 +1594,69 @@ mod tests {
             stopped: false,
             last_response: None,
             last_error: None,
+        }
+    }
+
+    #[test]
+    fn session_preflight_rejects_agent_names_before_host_calls() {
+        assert_eq!(
+            validate_agent_name(""),
+            Err("agent_name must contain between 1 and 16 characters")
+        );
+        assert_eq!(
+            validate_agent_name("seventeen-letters!"),
+            Err("agent_name must contain between 1 and 16 characters")
+        );
+        assert_eq!(validate_agent_name("bloom-btc10f"), Ok(()));
+        assert_eq!(default_agent_name("short"), "bloom-short");
+        let generated = default_agent_name("manual-mainnet-integration-1785491512-23341");
+        assert_eq!(generated.chars().count(), 16);
+        assert!(generated.starts_with("bloom-"));
+
+        let request = NewSession {
+            id: "session".into(),
+            owner_address: None,
+            duration_ms: None,
+            agent_name: Some("agent-name-is-far-too-long".into()),
+            max_notional_usd: None,
+            max_leverage: None,
+            assets: Vec::new(),
+            nonce: None,
+        };
+        assert_eq!(
+            session_preflight(&request),
+            Err("agent_name must contain between 1 and 16 characters".into())
+        );
+    }
+
+    #[test]
+    fn activated_agent_key_signs_order_and_cancel_without_owner_authority() {
+        let signer = PrivateKeySigner::from_bytes(&[7; 32]).unwrap();
+        let actions = [
+            serde_json::from_value(json!({
+                "type": "order",
+                "orders": [{
+                    "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                    "t": {"limit": {"tif": "Gtc"}}
+                }],
+                "grouping": "na"
+            }))
+            .unwrap(),
+            ExchangeAction::Cancel {
+                cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+                fast: None,
+            },
+        ];
+
+        for (offset, action) in actions.into_iter().enumerate() {
+            let nonce = 1_700_000_000_000 + offset as u64;
+            let hash =
+                protocol::l1_signing_hash(Network::Mainnet, &action, nonce, None, None).unwrap();
+            let signature = signer.sign_hash_sync(&hash).unwrap();
+            let signature = protocol::SignatureJson::from_raw(&signature.as_bytes()).unwrap();
+            let payload = protocol::exchange_payload(action, nonce, signature, None, None).unwrap();
+            assert_eq!(payload["nonce"], nonce);
+            assert!(payload.get("signature").is_some());
         }
     }
 
