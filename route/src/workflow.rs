@@ -154,6 +154,7 @@ fn sign_payload(
     wallet: &str,
     payload: &protocol::SigningPayload,
     operation_class: &str,
+    approval_hint: Option<String>,
 ) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
@@ -191,7 +192,7 @@ fn sign_payload(
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
         claim_assurance_evidence: None,
-        approval_hint: None,
+        approval_hint,
         action: None,
         advisory: None,
         selector: SignSelector::Exact,
@@ -269,11 +270,13 @@ fn last_response_key(n: Network, w: &str) -> String {
 }
 
 fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
+    let existing = load_json::<PendingNonce>(key.to_owned())?;
     save_json(
         key.to_owned(),
         &PendingNonce {
             nonce,
-            expires_ms: u64::MAX,
+            expires_ms: existing.as_ref().map_or(u64::MAX, |state| state.expires_ms),
+            action_id: existing.and_then(|state| state.action_id),
             completed,
         },
         false,
@@ -289,7 +292,15 @@ fn owner_sign_or_approval(
     nonce: u64,
     approval_kind: &str,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
-    match sign_payload(ctx, w, payload, intent) {
+    let approval_hint = match pending_nonce_key {
+        Some(key) => load_json::<PendingNonce>(key.to_owned())?.and_then(|state| {
+            (state.expires_ms > petal::sdk::now_ms())
+                .then_some(state.action_id)
+                .flatten()
+        }),
+        None => None,
+    };
+    match sign_payload(ctx, w, payload, intent, approval_hint) {
         Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
@@ -304,6 +315,7 @@ fn owner_sign_or_approval(
                     &PendingNonce {
                         nonce,
                         expires_ms,
+                        action_id: Some(action_id.clone()),
                         completed: false,
                     },
                     false,
@@ -443,6 +455,7 @@ fn owner_nonce(
     let candidate = PendingNonce {
         nonce,
         expires_ms: u64::MAX,
+        action_id: None,
         completed: false,
     };
     match save_json_new(key.clone(), &candidate, false) {
@@ -458,6 +471,8 @@ fn owner_nonce(
 struct PendingNonce {
     nonce: u64,
     expires_ms: u64,
+    #[serde(default)]
+    action_id: Option<String>,
     #[serde(default)]
     completed: bool,
 }
@@ -498,6 +513,7 @@ fn session_nonce(
     let candidate = PendingNonce {
         nonce,
         expires_ms: u64::MAX,
+        action_id: None,
         completed: false,
     };
     match save_json_new(key.clone(), &candidate, false) {
@@ -655,6 +671,8 @@ struct Pending {
     nonce: u64,
     #[serde(default)]
     approval_expires_ms: Option<u64>,
+    #[serde(default)]
+    approval_action_id: Option<String>,
     #[serde(default)]
     request_digest: String,
     #[serde(default)]
@@ -878,6 +896,9 @@ fn session_submit(
     if let Err(e) = session_policy(s, &action) {
         return denied(e);
     }
+    if let Err(e) = verify_live_session_leverage(n, s, &action) {
+        return e;
+    }
     let signer = match PrivateKeySigner::from_bytes(key) {
         Ok(x) => x,
         Err(e) => return backend(format!("agent key invalid: {e}")),
@@ -980,7 +1001,7 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
 }
 fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
     match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
-        Ok(Some(bytes)) => decode_agent_key(&bytes).map_err(|error| backend(error)),
+        Ok(Some(bytes)) => decode_agent_key(&bytes).map_err(backend),
         Ok(None) => Err(backend(
             "session agent key is missing; recover the session through the owner",
         )),
@@ -1308,6 +1329,77 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A session cap is meaningful only if the venue-side setting is bounded before
+/// an agent signs an order. Hyperliquid retains leverage independently of the
+/// Petal session, so checking only a proposed `updateLeverage` would leave an
+/// existing cross-leverage setting usable by later orders.
+fn verify_live_session_leverage(
+    n: Network,
+    session: &Session,
+    action: &ExchangeAction,
+) -> Result<(), DispatchResponse> {
+    let Some(max_leverage) = session.max_leverage else {
+        return Ok(());
+    };
+    let ExchangeAction::Order { orders, .. } = action else {
+        return Ok(());
+    };
+    let required_assets = orders
+        .iter()
+        .filter(|order| !order.reduce_only)
+        .map(|order| order.asset)
+        .collect::<std::collections::BTreeSet<_>>();
+    if required_assets.is_empty() {
+        return Ok(());
+    }
+    let assets = asset_metadata(n)?;
+    let names = assets
+        .iter()
+        .map(|(name, asset)| (asset.id, name.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let state = http_json(
+        n,
+        "/info",
+        json!({"type":"clearinghouseState","user":session.owner_address}),
+    )?;
+    for asset in required_assets {
+        let Some(name) = names.get(&asset) else {
+            return Err(denied(
+                "session order references an unknown perpetual asset",
+            ));
+        };
+        let leverage = venue_leverage(&state, name).ok_or_else(|| {
+            denied(format!(
+                "cannot verify venue leverage for {name}; set venue leverage to the session cap before submitting orders"
+            ))
+        })?;
+        if leverage > max_leverage {
+            return Err(denied("venue leverage exceeds session bound"));
+        }
+    }
+    Ok(())
+}
+
+fn venue_leverage(state: &Value, asset_name: &str) -> Option<u32> {
+    state
+        .get("assetPositions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|item| {
+            let position = item.get("position").unwrap_or(item);
+            (position.get("coin").and_then(Value::as_str) == Some(asset_name))
+                .then(|| {
+                    position
+                        .get("leverage")
+                        .and_then(|value| value.get("value"))
+                })
+                .flatten()
+                .and_then(value_string)
+        })?
+        .parse::<u32>()
+        .ok()
+}
 pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<NewSession>(body) {
         Ok(x) => x,
@@ -1338,6 +1430,13 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             return invalid("session approval expired; create a fresh session id");
         }
     }
+    let approval_hint = pending.as_ref().and_then(|state| {
+        state
+            .approval_expires_ms
+            .is_some_and(|expires_ms| expires_ms > now)
+            .then(|| state.approval_action_id.clone())
+            .flatten()
+    });
     let had_pending = pending.is_some();
     if let Some(cap) = &req.max_notional_usd {
         let parsed = match cap.parse::<f64>() {
@@ -1451,6 +1550,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                 key_hex: hex::encode(&key),
                 nonce,
                 approval_expires_ms: None,
+                approval_action_id: None,
                 request_digest: request_digest.clone(),
                 completed: false,
             },
@@ -1459,7 +1559,13 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     {
         return e;
     };
-    let sig = match sign_payload(ctx, &w, &payload, "hyperliquid.approve_agent") {
+    let sig = match sign_payload(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.approve_agent",
+        approval_hint,
+    ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(x) => x,
             Err(e) => return invalid(e),
@@ -1475,6 +1581,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                     key_hex: hex::encode(&key),
                     nonce,
                     approval_expires_ms: Some(expires_ms),
+                    approval_action_id: Some(action_id.clone()),
                     request_digest: request_digest.clone(),
                     completed: false,
                 },
@@ -1496,6 +1603,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             key_hex: hex::encode(&key),
             nonce,
             approval_expires_ms: None,
+            approval_action_id: None,
             request_digest: request_digest.clone(),
             completed: false,
         },
@@ -1538,6 +1646,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                     key_hex: String::new(),
                     nonce,
                     approval_expires_ms: None,
+                    approval_action_id: None,
                     request_digest,
                     completed: true,
                 },
@@ -1654,6 +1763,25 @@ mod tests {
         assert_eq!(
             decode_agent_key(b"[1,2,3]"),
             Err("session agent key must be 32 bytes")
+        );
+    }
+
+    #[test]
+    fn venue_leverage_requires_a_valid_matching_position() {
+        let state = json!({"assetPositions": [{
+            "position": {"coin": "BTC", "leverage": {"value": "20"}}
+        }]});
+        assert_eq!(venue_leverage(&state, "BTC"), Some(20));
+        assert_eq!(venue_leverage(&state, "ETH"), None);
+        assert_eq!(venue_leverage(&json!({"assetPositions": []}), "BTC"), None);
+        assert_eq!(
+            venue_leverage(
+                &json!({"assetPositions": [{"position": {
+                    "coin": "BTC", "leverage": {"value": "cross"}
+                }}]}),
+                "BTC"
+            ),
+            None
         );
     }
 
