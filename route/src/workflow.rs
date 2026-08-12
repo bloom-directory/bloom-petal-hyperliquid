@@ -1,5 +1,4 @@
-use alloy_primitives::{Address, B256, Signature};
-use k256::ecdsa::SigningKey;
+use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -13,38 +12,6 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-
-struct PrivateKeySigner {
-    key: SigningKey,
-    address: Address,
-}
-impl PrivateKeySigner {
-    fn from_bytes(raw: &[u8]) -> Result<Self, String> {
-        if raw.len() != 32 {
-            return Err("private key must be 32 bytes".into());
-        }
-        let key = SigningKey::from_slice(raw).map_err(|e| e.to_string())?;
-        let public = key.verifying_key().to_encoded_point(false);
-        let digest = sha3::Keccak256::digest(&public.as_bytes()[1..]);
-        Ok(Self {
-            key,
-            address: Address::from_slice(&digest[12..]),
-        })
-    }
-    fn address(&self) -> Address {
-        self.address
-    }
-    fn sign_hash_sync(&self, hash: &B256) -> Result<Signature, String> {
-        let (sig, recovery) = self
-            .key
-            .sign_prehash_recoverable(hash.as_slice())
-            .map_err(|e| e.to_string())?;
-        let mut raw = [0u8; 65];
-        raw[..64].copy_from_slice(&sig.to_bytes());
-        raw[64] = recovery.to_byte();
-        Signature::from_raw(&raw).map_err(|e| e.to_string())
-    }
-}
 
 fn ok_write() -> DispatchResponse {
     DispatchResponse::Write
@@ -76,9 +43,6 @@ pub fn parse_wallet_id(raw: &str) -> Result<String, String> {
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
 }
-fn secret_key(parts: &[&str]) -> String {
-    format!("secrets/{}", parts.join("/"))
-}
 fn save_json(
     key: String,
     v: &(impl Serialize + ?Sized),
@@ -107,9 +71,6 @@ fn load_bytes(key: &str) -> Result<Option<Vec<u8>>, DispatchResponse> {
 }
 fn load_secret_bytes(key: &str) -> Result<Option<Vec<u8>>, DispatchResponse> {
     petal::bindings::bloom::store::kv::get("secrets", key).map_err(backend)
-}
-fn delete_secret(key: &str) -> Result<(), DispatchResponse> {
-    petal::bindings::bloom::store::kv::delete("secrets", key).map_err(backend)
 }
 fn load_json<T: for<'de> Deserialize<'de>>(key: String) -> Result<Option<T>, DispatchResponse> {
     let Some(b) = load_bytes(&key)? else {
@@ -155,6 +116,7 @@ fn sign_payload(
     payload: &protocol::SigningPayload,
     operation_class: &str,
     approval_hint: Option<String>,
+    key_ref_jcs: Option<Vec<u8>>,
 ) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
@@ -195,8 +157,12 @@ fn sign_payload(
         approval_hint,
         action: None,
         advisory: None,
-        selector: SignSelector::Exact,
-        key_ref_jcs: None,
+        selector: if key_ref_jcs.is_some() {
+            SignSelector::Reusable
+        } else {
+            SignSelector::Exact
+        },
+        key_ref_jcs,
     })
     .map_err(|e| e.message())
 }
@@ -300,7 +266,7 @@ fn owner_sign_or_approval(
         }),
         None => None,
     };
-    match sign_payload(ctx, w, payload, intent, approval_hint) {
+    match sign_payload(ctx, w, payload, intent, approval_hint, None) {
         Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
@@ -654,6 +620,7 @@ pub struct Session {
     pub owner_address: String,
     pub id: String,
     pub agent_address: String,
+    pub key_ref_jcs: Vec<u8>,
     pub agent_name: String,
     pub created_ms: u64,
     pub expires_ms: u64,
@@ -667,7 +634,6 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
     session: Session,
-    key_hex: String,
     nonce: u64,
     #[serde(default)]
     approval_expires_ms: Option<u64>,
@@ -677,6 +643,27 @@ struct Pending {
     request_digest: String,
     #[serde(default)]
     completed: bool,
+}
+
+fn request_session_key(
+    wallet: &str,
+    session_id: &str,
+    lifetime_ms: u64,
+) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
+    petal::sdk::derive_key(&petal::PetalKeyRequest {
+        wallet_id: wallet.into(),
+        key_slot: format!("hyperliquid-{session_id}"),
+        allowed_routes: [
+            "r000008", "r000009", "r000010", "r000013", "r000015", "r000019",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
+        allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+        maximum_lifetime_ms: lifetime_ms,
+    })
+    .map_err(|error| backend(error.message()))
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -781,18 +768,10 @@ fn retire_session_key(
     n: Network,
     w: &str,
     id: &str,
-    session: &Session,
+    _session: &Session,
 ) -> Result<(), DispatchResponse> {
-    delete_secret(&secret_key(&[
-        "sessions",
-        &session.network,
-        w,
-        id,
-        "agent_key",
-    ]))?;
     let pending_key = session_key(n, w, id, "pending.json");
     if let Some(mut pending) = load_secret_json::<Pending>(pending_key.clone())? {
-        pending.key_hex.clear();
         pending.completed = true;
         pending.session.stopped = true;
         save_json(pending_key, &pending, true)?;
@@ -833,28 +812,20 @@ pub fn stop_session(n: Network, w: &str, id: &str) -> DispatchResponse {
     }
 }
 
-pub fn cancel_all_session(n: Network, w: &str, id: &str) -> DispatchResponse {
+pub fn cancel_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
     let mut session = match active_session(n, w, id) {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let key = match session_agent_key(w, id, &session) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    session_cancel_all(n, w, id, &mut session, &key)
+    session_cancel_all(ctx, n, w, id, &mut session)
 }
 
-pub fn close_all_session(n: Network, w: &str, id: &str) -> DispatchResponse {
+pub fn close_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
     let mut session = match active_session(n, w, id) {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let key = match session_agent_key(w, id, &session) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    session_close_all(n, w, id, &mut session, &key)
+    session_close_all(ctx, n, w, id, &mut session)
 }
 
 fn record_session_error(
@@ -879,11 +850,11 @@ fn record_session_error(
 
 #[allow(clippy::too_many_arguments)]
 fn session_submit(
+    ctx: &Ctx,
     n: Network,
     w: &str,
     id: &str,
     s: &mut Session,
-    key: &[u8],
     action: ExchangeAction,
     vault: Option<Address>,
     vault_str: Option<String>,
@@ -899,10 +870,6 @@ fn session_submit(
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
         return e;
     }
-    let signer = match PrivateKeySigner::from_bytes(key) {
-        Ok(x) => x,
-        Err(e) => return backend(format!("agent key invalid: {e}")),
-    };
     let (nonce, operation_key, completed) = match session_nonce(
         n,
         w,
@@ -918,16 +885,32 @@ fn session_submit(
     if completed {
         return ok_write();
     }
-    let hash = match protocol::l1_signing_hash(n, &action, nonce, vault, expires) {
+    let signing_payload = match protocol::l1_signing_payload(n, &action, nonce, vault, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match signer.sign_hash_sync(&hash) {
-        Ok(x) => match protocol::SignatureJson::from_raw(&x.as_bytes()) {
+    let sig = match sign_payload(
+        ctx,
+        w,
+        &signing_payload,
+        "hyperliquid.agent_action",
+        None,
+        Some(s.key_ref_jcs.clone()),
+    ) {
+        Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
             Err(e) => return backend(e),
         },
-        Err(e) => return backend(format!("agent signing failed: {e}")),
+        Ok(SignOutcome::ApprovalPending {
+            action_id,
+            expires_ms,
+        }) => {
+            return approval(
+                "agent_action",
+                &json!({"action_id": action_id, "expires_ms": expires_ms, "session": id}),
+            );
+        }
+        Err(e) => return denied(format!("agent signing denied: {e}")),
     };
     let action_kind = action.kind();
     let payload = match protocol::exchange_payload(action, nonce, sig, vault_str, expires) {
@@ -970,13 +953,15 @@ fn session_submit(
     }
 }
 
-pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> DispatchResponse {
+pub fn session_action_write(
+    ctx: &Ctx,
+    n: Network,
+    w: &str,
+    id: &str,
+    req: SignSubmit,
+) -> DispatchResponse {
     let mut s = match active_session(n, w, id) {
         Ok(session) => session,
-        Err(response) => return response,
-    };
-    let key = match session_agent_key(w, id, &s) {
-        Ok(key) => key,
         Err(response) => return response,
     };
     let vault = match req.vault_address.as_deref() {
@@ -987,38 +972,17 @@ pub fn session_action_write(n: Network, w: &str, id: &str, req: SignSubmit) -> D
         None => None,
     };
     session_submit(
+        ctx,
         n,
         w,
         id,
         &mut s,
-        &key,
         req.action,
         vault,
         req.vault_address,
         req.expires_after,
         req.nonce,
     )
-}
-fn session_agent_key(w: &str, id: &str, s: &Session) -> Result<Vec<u8>, DispatchResponse> {
-    match load_secret_bytes(&secret_key(&["sessions", &s.network, w, id, "agent_key"])) {
-        Ok(Some(bytes)) => decode_agent_key(&bytes).map_err(backend),
-        Ok(None) => Err(backend(
-            "session agent key is missing; recover the session through the owner",
-        )),
-        Err(response) => Err(response),
-    }
-}
-
-fn decode_agent_key(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
-    if bytes.len() == 32 {
-        return Ok(bytes.to_vec());
-    }
-    let decoded: Vec<u8> =
-        serde_json::from_slice(bytes).map_err(|_| "session agent key encoding is invalid")?;
-    if decoded.len() != 32 {
-        return Err("session agent key must be 32 bytes");
-    }
-    Ok(decoded)
 }
 fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), DispatchResponse> {
     let mut line = serde_json::to_vec(event).map_err(|e| backend(e.to_string()))?;
@@ -1060,14 +1024,14 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 fn session_agent_submit(
+    ctx: &Ctx,
     n: Network,
     w: &str,
     id: &str,
     s: &mut Session,
-    key: &[u8],
     action: ExchangeAction,
 ) -> DispatchResponse {
-    session_submit(n, w, id, s, key, action, None, None, None, None)
+    session_submit(ctx, n, w, id, s, action, None, None, None, None)
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -1113,11 +1077,11 @@ fn asset_ids(n: Network) -> Result<std::collections::BTreeMap<String, u32>, Disp
     })
 }
 fn session_cancel_all(
+    ctx: &Ctx,
     n: Network,
     w: &str,
     id: &str,
     s: &mut Session,
-    key: &[u8],
 ) -> DispatchResponse {
     let open = match http_json(
         n,
@@ -1159,7 +1123,7 @@ fn session_cancel_all(
         Ok(v) => v,
         Err(e) => return invalid(e.to_string()),
     };
-    session_agent_submit(n, w, id, s, key, action)
+    session_agent_submit(ctx, n, w, id, s, action)
 }
 fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String> {
     let x: f64 = raw
@@ -1192,11 +1156,11 @@ fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String>
     Ok(out)
 }
 fn session_close_all(
+    ctx: &Ctx,
     n: Network,
     w: &str,
     id: &str,
     s: &mut Session,
-    key: &[u8],
 ) -> DispatchResponse {
     let state = match http_json(
         n,
@@ -1268,7 +1232,7 @@ fn session_close_all(
         grouping: protocol::Grouping::Na,
         builder: None,
     };
-    session_agent_submit(n, w, id, s, key, action)
+    session_agent_submit(ctx, n, w, id, s, action)
 }
 fn canonical_abs_decimal(raw: &str) -> String {
     let mut value = raw.strip_prefix('-').unwrap_or(raw).to_owned();
@@ -1466,19 +1430,36 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         }
         normalized
     };
-    let key = match pending.as_ref() {
-        Some(p) => match hex::decode(&p.key_hex) {
-            Ok(x) if x.len() == 32 => x,
-            _ => return backend("pending session agent key is invalid"),
-        },
-        None => match petal::sdk::random_bytes(32) {
-            Ok(x) => x,
-            Err(e) => return backend(e.message()),
-        },
-    };
-    let signer = match PrivateKeySigner::from_bytes(&key) {
-        Ok(x) => x,
-        Err(e) => return backend(format!("agent key generation failed: {e}")),
+    let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
+    let derived = match request_session_key(&w, &req.id, lifetime_ms) {
+        Ok(petal::PetalKeyOutcome::Pending {
+            operation_id,
+            scope_digest,
+        }) => {
+            return approval(
+                "derive_agent_key",
+                &json!({
+                    "operation_id": operation_id,
+                    "scope_digest": scope_digest,
+                    "session": req.id
+                }),
+            );
+        }
+        Ok(petal::PetalKeyOutcome::Ready {
+            operation_id: _,
+            scope_digest: _,
+            key_ref_jcs,
+            addresses,
+        }) => {
+            let Some(address) = addresses
+                .into_iter()
+                .find(|address| protocol::parse_address(address).is_ok())
+            else {
+                return backend("derived KeyRef has no EVM address");
+            };
+            (key_ref_jcs, address)
+        }
+        Err(response) => return response,
     };
     let owner_address = match req
         .owner_address
@@ -1505,10 +1486,11 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         wallet: w.clone(),
         owner_address,
         id: req.id.clone(),
-        agent_address: format!("{:#x}", signer.address()),
+        agent_address: derived.1.clone(),
+        key_ref_jcs: derived.0.clone(),
         agent_name,
         created_ms: now,
-        expires_ms: now.saturating_add(req.duration_ms.unwrap_or(3_600_000).min(86_400_000)),
+        expires_ms: now.saturating_add(lifetime_ms),
         max_notional_usd: req.max_notional_usd,
         max_leverage: req.max_leverage,
         assets: session_assets,
@@ -1533,12 +1515,15 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         }
         None => (generated_session, req.nonce.unwrap_or(now)),
     };
-    let addr = session.agent_address.clone();
-    if addr != format!("{:#x}", signer.address()) {
-        return backend("pending session agent key does not match its address");
+    if session.key_ref_jcs != derived.0 || session.agent_address != derived.1 {
+        return backend("pending session does not match the Signer-owned KeyRef");
     }
+    let agent_address = match protocol::parse_address(&session.agent_address) {
+        Ok(address) => address,
+        Err(error) => return backend(error),
+    };
     let (action, payload) =
-        match protocol::approve_agent_payload(n, signer.address(), &session.agent_name, nonce) {
+        match protocol::approve_agent_payload(n, agent_address, &session.agent_name, nonce) {
             Ok(x) => x,
             Err(e) => return invalid(e),
         };
@@ -1547,7 +1532,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             pending_key.clone(),
             &Pending {
                 session: session.clone(),
-                key_hex: hex::encode(&key),
                 nonce,
                 approval_expires_ms: None,
                 approval_action_id: None,
@@ -1565,6 +1549,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         &payload,
         "hyperliquid.approve_agent",
         approval_hint,
+        None,
     ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(x) => x,
@@ -1578,7 +1563,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                 pending_key.clone(),
                 &Pending {
                     session: session.clone(),
-                    key_hex: hex::encode(&key),
                     nonce,
                     approval_expires_ms: Some(expires_ms),
                     approval_action_id: Some(action_id.clone()),
@@ -1600,7 +1584,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         pending_key.clone(),
         &Pending {
             session: session.clone(),
-            key_hex: hex::encode(&key),
             nonce,
             approval_expires_ms: None,
             approval_action_id: None,
@@ -1615,15 +1598,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 return backend(e);
-            }
-            if let Err(e) = petal::sdk::store_put(
-                &secret_key(&["sessions", &session.network, &w, &session.id, "agent_key"]),
-                &key,
-                true,
-            )
-            .map_err(|error| backend(error.message()))
-            {
-                return e;
             }
             if let Err(e) = save_json(
                 session_key(n, &w, &session.id, "session.json"),
@@ -1643,7 +1617,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
                 pending_key,
                 &Pending {
                     session: session.clone(),
-                    key_hex: String::new(),
                     nonce,
                     approval_expires_ms: None,
                     approval_action_id: None,
@@ -1654,7 +1627,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             ) {
                 return e;
             }
-            let _ = addr;
             ok_write()
         }
         Err(e) => e,
@@ -1708,6 +1680,7 @@ mod tests {
             owner_address: "0x0000000000000000000000000000000000000001".into(),
             id: "test".into(),
             agent_address: "0x0000000000000000000000000000000000000002".into(),
+            key_ref_jcs: br#"{"backend":"fixture"}"#.to_vec(),
             agent_name: "test".into(),
             created_ms: 1,
             expires_ms: u64::MAX,
@@ -1753,20 +1726,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_key_decoder_accepts_raw_and_legacy_json_storage() {
-        let key = [7_u8; 32];
-        assert_eq!(decode_agent_key(&key).unwrap(), key);
-        assert_eq!(
-            decode_agent_key(&serde_json::to_vec(&key.to_vec()).unwrap()).unwrap(),
-            key
-        );
-        assert_eq!(
-            decode_agent_key(b"[1,2,3]"),
-            Err("session agent key must be 32 bytes")
-        );
-    }
-
-    #[test]
     fn venue_leverage_requires_a_valid_matching_position() {
         let state = json!({"assetPositions": [{
             "position": {"coin": "BTC", "leverage": {"value": "20"}}
@@ -1786,8 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn activated_agent_key_signs_order_and_cancel_without_owner_authority() {
-        let signer = PrivateKeySigner::from_bytes(&[7; 32]).unwrap();
+    fn agent_actions_produce_signer_payloads_without_local_key_material() {
         let actions = [
             serde_json::from_value(json!({
                 "type": "order",
@@ -1806,13 +1764,13 @@ mod tests {
 
         for (offset, action) in actions.into_iter().enumerate() {
             let nonce = 1_700_000_000_000 + offset as u64;
-            let hash =
-                protocol::l1_signing_hash(Network::Mainnet, &action, nonce, None, None).unwrap();
-            let signature = signer.sign_hash_sync(&hash).unwrap();
-            let signature = protocol::SignatureJson::from_raw(&signature.as_bytes()).unwrap();
-            let payload = protocol::exchange_payload(action, nonce, signature, None, None).unwrap();
-            assert_eq!(payload["nonce"], nonce);
-            assert!(payload.get("signature").is_some());
+            let payload =
+                protocol::l1_signing_payload(Network::Mainnet, &action, nonce, None, None).unwrap();
+            assert_eq!(
+                payload.hash,
+                protocol::l1_signing_hash(Network::Mainnet, &action, nonce, None, None).unwrap()
+            );
+            assert!(!payload.preimage.is_empty());
         }
     }
 

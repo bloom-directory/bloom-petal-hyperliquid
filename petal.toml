@@ -32,4 +32,4 @@ allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.usd_send", "hyperli
 
 [store]
 namespaces = ["state"]
-secret_namespaces = ["secrets"]
+secret_namespaces = ["secrets"] # approval reconciliation only; never key material

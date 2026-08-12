@@ -25,6 +25,6 @@ petal::route_file!(
             Ok(session) => session,
             Err(response) => return response,
         };
-        crate::close_all_session(network, &wallet, session)
+        crate::close_all_session(ctx, network, &wallet, session)
     }
 );

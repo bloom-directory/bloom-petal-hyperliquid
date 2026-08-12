@@ -41,6 +41,6 @@ petal::route_file!(
                 ),
             );
         }
-        crate::session_action_write(network, &wallet, session, request)
+        crate::session_action_write(ctx, network, &wallet, session, request)
     }
 );

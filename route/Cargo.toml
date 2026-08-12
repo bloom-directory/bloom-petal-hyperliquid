@@ -13,8 +13,7 @@ crate-type = ["rlib"]
 alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
 alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std"] }
 hex = "0.4"
-k256 = { version = "0.13", features = ["ecdsa"] }
-petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "eda6647c523bba161eaa22812aa0e75ec7782404" }
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "25c89810ecc79481b11a8a4460dfd7b9aa8473fa" }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
