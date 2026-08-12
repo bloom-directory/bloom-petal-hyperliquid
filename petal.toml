@@ -13,7 +13,7 @@ outputs = ["petal/hyperliquid"]
 summary = "Read Hyperliquid market and account data, submit bounded signed HyperCore actions, and manage agent sessions through Bloom approval."
 
 [caps]
-allowed = ["bloom:http", "bloom:store", "bloom:sign"]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:key.derive"]
 
 [[net.allow]]
 binding = "mainnet"
