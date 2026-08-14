@@ -669,6 +669,7 @@ fn request_session_key(
 #[serde(deny_unknown_fields)]
 struct NewSession {
     id: String,
+    wallet_id: String,
     #[serde(default)]
     owner_address: Option<String>,
     #[serde(default)]
@@ -1369,6 +1370,10 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
+    let wallet_id = match parse_wallet_id(&req.wallet_id) {
+        Ok(wallet_id) => wallet_id,
+        Err(error) => return invalid(format!("wallet_id: {error}")),
+    };
     let agent_name = match session_preflight(&req) {
         Ok(agent_name) => agent_name,
         Err(error) => return invalid(error),
@@ -1431,7 +1436,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(&w, &req.id, lifetime_ms) {
+    let derived = match request_session_key(&wallet_id, &req.id, lifetime_ms) {
         Ok(petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
@@ -1711,6 +1716,7 @@ mod tests {
 
         let request = NewSession {
             id: "session".into(),
+            wallet_id: "harbor-eval-1".into(),
             owner_address: None,
             duration_ms: None,
             agent_name: Some("agent-name-is-far-too-long".into()),
