@@ -652,7 +652,7 @@ fn request_session_key(
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
-        key_slot: format!("hyperliquid-{session_id}"),
+        key_slot: session_key_slot(session_id),
         allowed_routes: [
             "r000008", "r000009", "r000010", "r000013", "r000015", "r000019",
         ]
@@ -664,6 +664,17 @@ fn request_session_key(
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
+}
+
+fn session_key_slot(session_id: &str) -> String {
+    let digest = Sha256::digest(
+        [
+            b"bloom-hyperliquid-session-key/v1\0".as_slice(),
+            session_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    format!("hyperliquid-{}", &hex::encode(digest)[..52])
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1729,6 +1740,21 @@ mod tests {
             session_preflight(&request),
             Err("agent_name must contain between 1 and 16 characters".into())
         );
+    }
+
+    #[test]
+    fn session_key_slots_are_lowercase_broker_tokens_for_timestamped_ids() {
+        let first = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef");
+        let second = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef");
+
+        assert_eq!(first.len(), 64);
+        assert!(first.starts_with("hyperliquid-"));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' })
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
