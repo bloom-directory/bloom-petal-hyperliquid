@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/petal
-          ref: 42bd25589ff721ce14f43f21e9eaf702bfbc42e5
+          ref: 61938d0c127cfe03c7e3e55baed0ba1439bc5ca2
           path: .petal-tooling
           persist-credentials: false
 
