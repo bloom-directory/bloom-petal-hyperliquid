@@ -1,6 +1,11 @@
 petal::route_file!(
     spec: petal::signing_write_spec("hyperliquid.approve_agent")
-        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
+        .caps(&[
+            "bloom:http",
+            "bloom:store",
+            "bloom:sign",
+            "bloom:key.derive",
+        ]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
             "description": "write an owner-approved agent session request"
