@@ -77,47 +77,15 @@ jobs:
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
             | jq -e '.routes == 63'
 
-      - name: Check out Bloom CLI
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: bloom-directory/bloom
-          ref: master
-          path: bloom
-          persist-credentials: false
-
-      - name: Build Bloom CLI
-        run: |
-          cargo build --release --manifest-path bloom/Cargo.toml -p bloom --bin bloom
-          cp bloom/target/release/bloom "$RUNNER_TEMP/bloom"
-          rm -rf bloom
-
-      - name: Smoke install and dispatch
+      # The current triad runtime is authenticated-daemon-only, so this job
+      # deliberately stops at immutable package validation. End-to-end install
+      # and dispatch are exercised by the linked Bloom/Harbor integration lane.
+      - name: Validate triad host contracts in built routes
         shell: bash
         run: |
           set -euo pipefail
-          home="$(mktemp -d)"
-          "$RUNNER_TEMP/bloom" --home "$home" petals install "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat /petals/hyperliquid/README.md \
-            | grep -Fq 'Hyperliquid Petal'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs ls /petals/hyperliquid/mainnet \
-            | grep -Fq 'mids.json'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat /petals/hyperliquid/testnet/status.json \
-            | jq -e '.network == "Testnet"'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat \
-            /petals/hyperliquid/testnet/exchange/0x0000000000000000000000000000000000000000/usd_send.json \
-            | jq -e '.body.amount | contains("6 decimal")'
-
-      - name: Validate GitHub source install
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_url="https://github.com/${GITHUB_REPOSITORY}"
-          source_ref="$GITHUB_SHA"
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            source_url="$(jq -r '.pull_request.head.repo.html_url' "$GITHUB_EVENT_PATH")"
-            source_ref="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
-          fi
-          home="$(mktemp -d)"
-          "$RUNNER_TEMP/bloom" --home "$home" petals install "$source_url" --ref "$source_ref"
-          "$RUNNER_TEMP/bloom" --home "$home" vfs ls /petals/hyperliquid/mainnet \
-            | grep -Fq 'agent_sessions'
+          new_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/new.json.wasm'
+          action_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/[session]/cancel.json.wasm'
+          wasm-tools component wit "$new_route" | grep -Fq 'import bloom:key/derive@0.1.0;'
+          wasm-tools component wit "$new_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'
+          wasm-tools component wit "$action_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'
