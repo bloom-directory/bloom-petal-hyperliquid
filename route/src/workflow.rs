@@ -12,6 +12,12 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
+// r000021 is the session-creation route that invokes derive_key. The Machine
+// host requires the executing route to be part of the immutable derived-key
+// scope, alongside the routes that later use the session key.
+const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
+    "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
+];
 
 fn ok_write() -> DispatchResponse {
     DispatchResponse::Write
@@ -653,12 +659,10 @@ fn request_session_key(
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
         key_slot: session_key_slot(session_id),
-        allowed_routes: [
-            "r000008", "r000009", "r000010", "r000013", "r000015", "r000019",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
@@ -1687,6 +1691,16 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_key_scope_includes_derivation_and_action_routes() {
+        assert_eq!(
+            SESSION_KEY_ALLOWED_ROUTES,
+            [
+                "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
+            ]
+        );
+    }
 
     fn bounded_session() -> Session {
         Session {
