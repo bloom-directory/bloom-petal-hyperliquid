@@ -28,7 +28,11 @@ methods = ["post"]
 paths = ["/info", "/exchange"]
 
 [sign]
-allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.usd_send", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+
+[[key.derive]]
+route = "[network]/agent_sessions/[wallet]/new.json"
+operation_classes = ["hyperliquid.agent_action"]
 
 [store]
 namespaces = ["state"]

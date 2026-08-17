@@ -1,5 +1,6 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
+    spec: petal::signing_write_spec("hyperliquid.agent_action")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
             "description": "write a bounded session order.json request; it is signed by the stored agent key"
