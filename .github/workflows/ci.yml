@@ -75,7 +75,7 @@ jobs:
           "$RUNNER_TEMP/petal" package \
             --root . \
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
-            | jq -e '.routes == 63'
+            | jq -e '.routes == 64'
 
       - name: Check out exact Bloom package contract
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

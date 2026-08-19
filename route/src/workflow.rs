@@ -600,6 +600,70 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         Err(e) => e,
     }
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsdClassTransfer {
+    amount: String,
+    to_perp: bool,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<UsdClassTransfer>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid usd_class_transfer body: {e}")),
+    };
+    if let Err(e) = protocol::validate_usdc_amount(&req.amount) {
+        return invalid(e);
+    }
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "usd_class_transfer.json", body, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    if completed {
+        return ok_write();
+    }
+    let (action, payload) =
+        match protocol::usd_class_transfer_payload(n, &req.amount, req.to_perp, nonce) {
+            Ok(x) => x,
+            Err(e) => return invalid(e),
+        };
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.usd_class_transfer",
+        pending_nonce_key.as_deref(),
+        nonce,
+        "usd_class_transfer",
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            if let Err(e) = protocol::validate_exchange_response(&v) {
+                return backend(e);
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            ok_write()
+        }
+        Err(e) => e,
+    }
+}
 fn approval(kind: &str, v: &Value) -> DispatchResponse {
     denied(format!("approval required for {kind}: {}", safe_json(v)))
 }
@@ -1906,6 +1970,50 @@ mod tests {
                 body,
             )
         );
+    }
+
+    #[test]
+    fn usd_class_transfer_nonce_state_cannot_collide_with_usd_send() {
+        let wallet = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"amount":"1","to_perp":true}"#;
+        assert_ne!(
+            owner_nonce_key(Network::Mainnet, wallet, "usd_class_transfer.json", body),
+            owner_nonce_key(Network::Mainnet, wallet, "send_asset.json", body)
+        );
+        assert_ne!(
+            owner_nonce_key(Network::Mainnet, wallet, "usd_class_transfer.json", body),
+            owner_nonce_key(Network::Testnet, wallet, "usd_class_transfer.json", body)
+        );
+        assert_ne!(
+            owner_nonce_key(Network::Mainnet, wallet, "usd_class_transfer.json", body),
+            owner_nonce_key(
+                Network::Mainnet,
+                wallet,
+                "usd_class_transfer.json",
+                br#"{"amount":"1","to_perp":false}"#
+            )
+        );
+    }
+
+    #[test]
+    fn usd_class_transfer_body_requires_amount_and_direction() {
+        assert!(serde_json::from_slice::<UsdClassTransfer>(br#"{"amount":"1"}"#).is_err());
+        assert!(serde_json::from_slice::<UsdClassTransfer>(br#"{"to_perp":true}"#).is_err());
+        assert!(
+            serde_json::from_slice::<UsdClassTransfer>(br#"{"amount":"1","toPerp":true}"#).is_err()
+        );
+        assert!(
+            serde_json::from_slice::<UsdClassTransfer>(
+                br#"{"amount":"1","to_perp":true,"destination":"0x00"}"#
+            )
+            .is_err()
+        );
+        let req =
+            serde_json::from_slice::<UsdClassTransfer>(br#"{"amount":"1.5","to_perp":false}"#)
+                .unwrap();
+        assert_eq!(req.amount, "1.5");
+        assert!(!req.to_perp);
+        assert_eq!(req.nonce, None);
     }
 
     #[test]

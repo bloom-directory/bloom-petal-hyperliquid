@@ -426,6 +426,10 @@ fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData,
             "UsdSend",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"destination","type":"string"},{"name":"amount","type":"string"},{"name":"time","type":"uint64"}]),
         ),
+        "usdClassTransfer" => (
+            "UsdClassTransfer",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"amount","type":"string"},{"name":"toPerp","type":"bool"},{"name":"nonce","type":"uint64"}]),
+        ),
         _ => return Err("unsupported user action".into()),
     };
     let primary_type = format!("HyperliquidTransaction:{type_name}");
@@ -482,6 +486,39 @@ pub fn usd_send_payload(
     let payload = typed_signing_payload(&user_typed(network, "usdSend", msg)?)?;
     Ok((
         json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
+        payload,
+    ))
+}
+fn usd_class_transfer_message(network: Network, amount: &str, to_perp: bool, nonce: u64) -> Value {
+    json!({"hyperliquidChain":network.chain(),"amount":amount,"toPerp":to_perp,"nonce":nonce})
+}
+fn usd_class_transfer_action(network: Network, amount: &str, to_perp: bool, nonce: u64) -> Value {
+    json!({"type":"usdClassTransfer","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"amount":amount,"toPerp":to_perp,"nonce":nonce})
+}
+pub fn usd_class_transfer_hash(
+    network: Network,
+    amount: &str,
+    to_perp: bool,
+    nonce: u64,
+) -> Result<(Value, B256), String> {
+    let msg = usd_class_transfer_message(network, amount, to_perp, nonce);
+    let td = user_typed(network, "usdClassTransfer", msg)?;
+    let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
+    Ok((
+        usd_class_transfer_action(network, amount, to_perp, nonce),
+        hash,
+    ))
+}
+pub fn usd_class_transfer_payload(
+    network: Network,
+    amount: &str,
+    to_perp: bool,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = usd_class_transfer_message(network, amount, to_perp, nonce);
+    let payload = typed_signing_payload(&user_typed(network, "usdClassTransfer", msg)?)?;
+    Ok((
+        usd_class_transfer_action(network, amount, to_perp, nonce),
         payload,
     ))
 }
@@ -722,6 +759,105 @@ mod tests {
             format!("{hash:#x}"),
             "0x76e0a8bd20747053a2b976294b2e490756b4f22d64bb496d0161beea903ccfd3"
         );
+    }
+
+    #[test]
+    fn usd_class_transfer_wire_action_matches_official_field_order() {
+        for (to_perp, network) in [(true, Network::Mainnet), (false, Network::Testnet)] {
+            let (action, hash) = usd_class_transfer_hash(network, "12.5", to_perp, 99).unwrap();
+            assert_eq!(action["type"], "usdClassTransfer");
+            assert_eq!(action["hyperliquidChain"], network.chain());
+            assert_eq!(
+                action["signatureChainId"],
+                format!("0x{:x}", network.signature_chain_id())
+            );
+            assert_eq!(action["amount"], "12.5");
+            assert_eq!(action["toPerp"], to_perp);
+            assert_eq!(action["nonce"], 99);
+            assert!(action.get("destination").is_none());
+            assert!(action.get("time").is_none());
+
+            let td = user_typed(
+                network,
+                "usdClassTransfer",
+                usd_class_transfer_message(network, "12.5", to_perp, 99),
+            )
+            .unwrap();
+            assert_eq!(
+                td.resolver
+                    .encode_type("HyperliquidTransaction:UsdClassTransfer")
+                    .unwrap(),
+                "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)"
+            );
+            assert_eq!(td.eip712_signing_hash().unwrap(), hash);
+        }
+    }
+
+    #[test]
+    fn usd_class_transfer_directions_and_networks_produce_distinct_hashes() {
+        let (_, to_perp) = usd_class_transfer_hash(Network::Mainnet, "12.5", true, 99).unwrap();
+        let (_, to_spot) = usd_class_transfer_hash(Network::Mainnet, "12.5", false, 99).unwrap();
+        let (_, testnet) = usd_class_transfer_hash(Network::Testnet, "12.5", true, 99).unwrap();
+        let (_, other_amount) =
+            usd_class_transfer_hash(Network::Mainnet, "12.6", true, 99).unwrap();
+        let (_, other_nonce) =
+            usd_class_transfer_hash(Network::Mainnet, "12.5", true, 100).unwrap();
+        for other in [to_spot, testnet, other_amount, other_nonce] {
+            assert_ne!(to_perp, other);
+        }
+        // usdClassTransfer must never collide with a usdSend of the same amount.
+        let destination = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let (_, send) = usd_send_hash(Network::Mainnet, destination, "12.5", 99).unwrap();
+        assert_ne!(to_perp, send);
+    }
+
+    #[test]
+    fn usd_class_transfer_payload_preimage_preserves_the_signing_hash() {
+        for to_perp in [true, false] {
+            let (action, expected) =
+                usd_class_transfer_hash(Network::Testnet, "0.000001", to_perp, 7).unwrap();
+            let (payload_action, payload) =
+                usd_class_transfer_payload(Network::Testnet, "0.000001", to_perp, 7).unwrap();
+            assert_eq!(action, payload_action);
+            assert_eq!(payload.hash, expected);
+            assert_eq!(
+                B256::from_slice(&Keccak256::digest(&payload.preimage)),
+                expected
+            );
+            assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
+        }
+    }
+
+    #[test]
+    fn usd_class_transfer_amounts_reject_negatives_exponents_and_extra_precision() {
+        for bad in [
+            "-1",
+            "+1",
+            "1e6",
+            "1E6",
+            "0",
+            "0.0",
+            "1.0000001",
+            "",
+            " 1",
+            "1 ",
+            "abc",
+            "1.2.3",
+            ".5",
+            // The subaccount suffix form is intentionally unsupported by this route.
+            "1 subaccount:0x0000000000000000000000000000000000000000",
+        ] {
+            assert!(
+                validate_usdc_amount(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["1", "0.000001", "12.5", "1000000.123456"] {
+            assert!(
+                validate_usdc_amount(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
     }
 
     #[test]

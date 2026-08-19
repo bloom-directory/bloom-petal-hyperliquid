@@ -57,6 +57,10 @@ const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
         "hyperliquid.update_leverage",
     ),
     (
+        "[network]/exchange/[wallet]/usd_class_transfer.json",
+        "hyperliquid.usd_class_transfer",
+    ),
+    (
         "[network]/exchange/[wallet]/usd_send.json",
         "hyperliquid.usd_send",
     ),
