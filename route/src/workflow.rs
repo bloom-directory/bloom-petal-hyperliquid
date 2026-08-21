@@ -748,9 +748,11 @@ fn session_key_slot(session_id: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct NewSession {
     id: String,
-    wallet_id: String,
-    #[serde(default)]
-    owner_address: Option<String>,
+    /// The wallet's on-chain address. The wallet *id* is not carried here: it
+    /// is the `[wallet]` route parameter, and duplicating it in the body
+    /// allowed the two to disagree, deriving a key for one wallet while
+    /// recording state and signing under another.
+    owner_address: String,
     #[serde(default)]
     duration_ms: Option<u64>,
     #[serde(default)]
@@ -1444,14 +1446,38 @@ fn venue_leverage(state: &Value, asset_name: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
 }
+/// The single wallet identity a session is created under.
+///
+/// Derivation, pending/session storage and owner signing all use this one
+/// value, taken from the `[wallet]` route parameter. It was previously also
+/// carried in the request body, which let the two disagree: a key could be
+/// derived for one wallet while state was recorded and signing attempted under
+/// another, and nothing rejected that until a lower layer refused the signature
+/// — after the ceremony and key scope already existed.
+///
+/// Owner signing validates this as a Broker token, which must begin with a
+/// lowercase ASCII letter, so an on-chain address can never sign. Reject that
+/// here rather than several layers down as an unqualified permission error.
+fn session_wallet_id(w: &str) -> Result<String, String> {
+    let wallet_id = parse_wallet_id(w)?;
+    if !wallet_id.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(
+            "session routes are addressed by wallet id, not by address; pass the on-chain \
+             address as owner_address"
+                .into(),
+        );
+    }
+    Ok(wallet_id)
+}
+
 pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
     let req = match serde_json::from_slice::<NewSession>(body) {
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
-    let wallet_id = match parse_wallet_id(&req.wallet_id) {
+    let wallet_id = match session_wallet_id(&w) {
         Ok(wallet_id) => wallet_id,
-        Err(error) => return invalid(format!("wallet_id: {error}")),
+        Err(error) => return invalid(error),
     };
     let agent_name = match session_preflight(&req) {
         Ok(agent_name) => agent_name,
@@ -1545,19 +1571,13 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         }
         Err(response) => return response,
     };
-    let owner_address = match req
-        .owner_address
-        .as_deref()
-        .or_else(|| protocol::parse_address(&w).ok().map(|_| w.as_str()))
-    {
+    let owner_address = match Some(req.owner_address.as_str()) {
         Some(address) => match protocol::parse_address(address) {
             Ok(address) => format!("{address:#x}"),
             Err(e) => return invalid(format!("owner_address: {e}")),
         },
         None => {
-            return invalid(
-                "owner_address is required when wallet is a wallet id rather than an address",
-            );
+            return invalid("owner_address is required: session routes are addressed by wallet id");
         }
     };
     let generated_session = Session {
@@ -1805,8 +1825,7 @@ mod tests {
 
         let request = NewSession {
             id: "session".into(),
-            wallet_id: "harbor-eval-1".into(),
-            owner_address: None,
+            owner_address: "0x0000000000000000000000000000000000000001".into(),
             duration_ms: None,
             agent_name: Some("agent-name-is-far-too-long".into()),
             max_notional_usd: None,
@@ -1993,6 +2012,63 @@ mod tests {
                 br#"{"amount":"1","to_perp":false}"#
             )
         );
+    }
+
+    #[test]
+    fn session_identity_comes_only_from_the_route_and_never_from_the_body() {
+        // The body used to carry wallet_id alongside the [wallet] route
+        // parameter. Because they were independent, a request could derive a
+        // key for one wallet while recording state and signing under another,
+        // and nothing rejected it until a lower layer refused the signature —
+        // by which point a ceremony and key scope already existed for a wallet
+        // the caller was not operating on. The field is gone, so the two can no
+        // longer disagree; deny_unknown_fields keeps it from coming back.
+        let with_wallet_id = br#"{"id":"s","wallet_id":"other-wallet","owner_address":"0x0000000000000000000000000000000000000001"}"#;
+        let rejected = serde_json::from_slice::<NewSession>(with_wallet_id);
+        assert!(
+            rejected.is_err(),
+            "a body naming its own wallet must be rejected, not silently ignored"
+        );
+
+        let accepted: NewSession = serde_json::from_slice(
+            br#"{"id":"s","owner_address":"0x0000000000000000000000000000000000000001"}"#,
+        )
+        .expect("a body without a wallet id is the supported shape");
+        assert_eq!(accepted.id, "s");
+
+        // owner_address is required: the Petal holds no VFS capability, so it
+        // cannot resolve a wallet id to an on-chain address by itself.
+        assert!(
+            serde_json::from_slice::<NewSession>(br#"{"id":"s"}"#).is_err(),
+            "owner_address cannot be omitted"
+        );
+    }
+
+    #[test]
+    fn session_wallet_id_rejects_an_address_before_any_host_call() {
+        // Owner signing validates the wallet as a Broker token, which must
+        // begin with a lowercase letter, so an address can never sign. This
+        // guard runs before key derivation, so a request that could never
+        // complete does not first create a ceremony and a key scope.
+        assert_eq!(
+            session_wallet_id("bloom-eval-hyperliquid").as_deref(),
+            Ok("bloom-eval-hyperliquid")
+        );
+
+        for address in [
+            "0x2425c1bdf231f37ebdeeea462a3f00970f52f06a",
+            "0000000000000000000000000000000000000001",
+        ] {
+            let rejected = session_wallet_id(address);
+            assert!(
+                rejected.is_err(),
+                "an address-shaped wallet must be rejected: {address}"
+            );
+            assert!(
+                rejected.unwrap_err().contains("addressed by wallet id"),
+                "the error must say which identifier belongs where"
+            );
+        }
     }
 
     #[test]
