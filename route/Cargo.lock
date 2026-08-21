@@ -545,6 +545,7 @@ dependencies = [
  "alloy-primitives",
  "bloom-petal-sdk",
  "hex",
+ "k256",
  "rmp-serde",
  "serde",
  "serde_jcs",
@@ -1321,6 +1322,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]

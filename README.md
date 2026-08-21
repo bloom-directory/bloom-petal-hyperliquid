@@ -17,14 +17,18 @@ close-all, and audit. The canonical transfer route is `usd_send.json`;
 `send_asset.json` remains as a compatibility alias and does not implement
 Hyperliquid's distinct generalized `sendAsset` action.
 
-A session request requires a stable `id` and the wallet's `owner_address`. The
-wallet id is the `[wallet]` path segment and is deliberately not repeated in the
-body: session routes are addressed by wallet id, and an address-shaped segment
-is rejected, because owner signing validates it as a Broker token that must
-begin with a lowercase letter. The exact body can be retried across the
-key-derivation and owner approval ceremonies without rotating its agent key. A
-successful write means the route completed; inspect the durable response,
-status, and error files before treating an action as submitted.
+A session request requires only a stable `id`. Neither the wallet id nor the
+owner address is carried in the body. The wallet id is the `[wallet]` path
+segment, and an address-shaped segment is rejected, because owner signing
+validates it as a Broker token that must begin with a lowercase letter. The
+owner address is recovered from the owner's own `approveAgent` signature — the
+same recovery Hyperliquid performs to decide which account the agent belongs to
+— so the account the session reads for its `max_leverage`, `cancel_all` and
+`close_all` checks is always the account its orders execute on. The exact body
+can be retried across the key-derivation and owner approval ceremonies without
+rotating its agent key. A successful write means the route completed; inspect
+the durable response, status, and error files before treating an action as
+submitted.
 
 ## Build
 

@@ -748,11 +748,6 @@ fn session_key_slot(session_id: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct NewSession {
     id: String,
-    /// The wallet's on-chain address. The wallet *id* is not carried here: it
-    /// is the `[wallet]` route parameter, and duplicating it in the body
-    /// allowed the two to disagree, deriving a key for one wallet while
-    /// recording state and signing under another.
-    owner_address: String,
     #[serde(default)]
     duration_ms: Option<u64>,
     #[serde(default)]
@@ -1461,11 +1456,7 @@ fn venue_leverage(state: &Value, asset_name: &str) -> Option<u32> {
 fn session_wallet_id(w: &str) -> Result<String, String> {
     let wallet_id = parse_wallet_id(w)?;
     if !wallet_id.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err(
-            "session routes are addressed by wallet id, not by address; pass the on-chain \
-             address as owner_address"
-                .into(),
-        );
+        return Err("session routes are addressed by wallet id, not by on-chain address".into());
     }
     Ok(wallet_id)
 }
@@ -1571,15 +1562,6 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         }
         Err(response) => return response,
     };
-    let owner_address = match Some(req.owner_address.as_str()) {
-        Some(address) => match protocol::parse_address(address) {
-            Ok(address) => format!("{address:#x}"),
-            Err(e) => return invalid(format!("owner_address: {e}")),
-        },
-        None => {
-            return invalid("owner_address is required: session routes are addressed by wallet id");
-        }
-    };
     let generated_session = Session {
         schema: "bloom.hyperliquid_agent_session.v1".into(),
         network: if matches!(n, Network::Mainnet) {
@@ -1588,7 +1570,13 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             "testnet".into()
         },
         wallet: w.clone(),
-        owner_address,
+        // Filled in below by recovering the signer of the `approveAgent`
+        // payload. It is deliberately not taken from the request: the session's
+        // bounds are read from this address, so a caller-chosen value would let
+        // the agent point its own limit checks at an unrelated account. The
+        // session is only persisted after recovery succeeds, so no reader ever
+        // observes the empty value.
+        owner_address: String::new(),
         id: req.id.clone(),
         agent_address: derived.1.clone(),
         key_ref_jcs: derived.0.clone(),
@@ -1602,7 +1590,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         last_response: None,
         last_error: None,
     };
-    let (session, nonce) = match pending {
+    let (mut session, nonce) = match pending {
         Some(p) => {
             if p.session.wallet != w
                 || p.session.network
@@ -1655,10 +1643,19 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         approval_hint,
         None,
     ) {
-        Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
-            Ok(x) => x,
-            Err(e) => return invalid(e),
-        },
+        Ok(SignOutcome::Signature(raw)) => {
+            // Bind the session to whoever actually signed. The venue recovers
+            // this same address to decide which account the agent is approved
+            // for, so it is the account the session's orders will execute on.
+            match protocol::recover_signer(&payload.hash, &raw) {
+                Ok(address) => session.owner_address = address,
+                Err(e) => return backend(e),
+            }
+            match protocol::SignatureJson::from_raw(&raw) {
+                Ok(x) => x,
+                Err(e) => return invalid(e),
+            }
+        }
         Ok(SignOutcome::ApprovalPending {
             action_id,
             expires_ms,
@@ -1825,7 +1822,6 @@ mod tests {
 
         let request = NewSession {
             id: "session".into(),
-            owner_address: "0x0000000000000000000000000000000000000001".into(),
             duration_ms: None,
             agent_name: Some("agent-name-is-far-too-long".into()),
             max_notional_usd: None,
@@ -2023,25 +2019,29 @@ mod tests {
         // by which point a ceremony and key scope already existed for a wallet
         // the caller was not operating on. The field is gone, so the two can no
         // longer disagree; deny_unknown_fields keeps it from coming back.
-        let with_wallet_id = br#"{"id":"s","wallet_id":"other-wallet","owner_address":"0x0000000000000000000000000000000000000001"}"#;
+        let with_wallet_id = br#"{"id":"s","wallet_id":"other-wallet"}"#;
         let rejected = serde_json::from_slice::<NewSession>(with_wallet_id);
         assert!(
             rejected.is_err(),
             "a body naming its own wallet must be rejected, not silently ignored"
         );
 
-        let accepted: NewSession = serde_json::from_slice(
-            br#"{"id":"s","owner_address":"0x0000000000000000000000000000000000000001"}"#,
-        )
-        .expect("a body without a wallet id is the supported shape");
-        assert_eq!(accepted.id, "s");
-
-        // owner_address is required: the Petal holds no VFS capability, so it
-        // cannot resolve a wallet id to an on-chain address by itself.
+        // owner_address is gone for the same reason. It fed the venue reads
+        // behind max_leverage, cancel_all and close_all, so a caller-chosen
+        // value aimed those checks at an account the session had nothing to do
+        // with: point it at an account sitting at 1x and the leverage bound
+        // passed while the order executed on the real wallet. It is now
+        // recovered from the owner's own approveAgent signature.
+        let with_owner_address =
+            br#"{"id":"s","owner_address":"0x0000000000000000000000000000000000000001"}"#;
         assert!(
-            serde_json::from_slice::<NewSession>(br#"{"id":"s"}"#).is_err(),
-            "owner_address cannot be omitted"
+            serde_json::from_slice::<NewSession>(with_owner_address).is_err(),
+            "a body naming its own owner address must be rejected"
         );
+
+        let accepted: NewSession =
+            serde_json::from_slice(br#"{"id":"s"}"#).expect("the id alone is the supported shape");
+        assert_eq!(accepted.id, "s");
     }
 
     #[test]

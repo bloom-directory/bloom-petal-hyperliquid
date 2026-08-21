@@ -462,6 +462,21 @@ pub fn approve_agent_payload(
         payload,
     ))
 }
+/// Recovers the address that produced `raw` over `hash`.
+///
+/// This is the same recovery Hyperliquid performs to decide which account an
+/// `approveAgent` action belongs to, so the address it yields is by definition
+/// the account the session's orders will execute against. Taking the owner
+/// address from here rather than from the request body is what keeps the
+/// session's bounds (leverage, cancel-all, close-all) pointed at the account
+/// that is actually at risk.
+pub fn recover_signer(hash: &B256, raw: &[u8]) -> Result<String, String> {
+    let sig = Signature::from_raw(raw).map_err(|e| format!("invalid signature: {e}"))?;
+    let address = sig
+        .recover_address_from_prehash(hash)
+        .map_err(|e| format!("cannot recover owner address from signature: {e}"))?;
+    Ok(format!("{address:#x}"))
+}
 pub fn usd_send_hash(
     network: Network,
     destination: Address,
@@ -605,6 +620,59 @@ pub fn validate_exchange_response(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
+
+    /// The owner address must come from the signature, not from the caller.
+    ///
+    /// It feeds the venue reads behind `max_leverage`, `cancel_all` and
+    /// `close_all`. While it was a request field, an agent could name any
+    /// account: point it at one sitting at 1x and the leverage bound passed
+    /// while the order executed on the real wallet, and the two kill switches
+    /// read an account with no orders and reported success having closed
+    /// nothing.
+    #[test]
+    fn owner_address_is_recovered_from_the_signature_not_supplied_by_the_caller() {
+        let (_, payload) = approve_agent_payload(
+            Network::Mainnet,
+            Address::from([0x22; 20]),
+            "bloom-agent",
+            7,
+        )
+        .expect("payload builds");
+
+        let signing_key = SigningKey::from_bytes(&[0x11; 32].into()).expect("valid key");
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(payload.hash.as_slice())
+            .expect("signs the prehash");
+        let mut raw = [0u8; 65];
+        raw[..64].copy_from_slice(&signature.to_bytes());
+        raw[64] = recovery_id.to_byte();
+
+        let uncompressed = signing_key.verifying_key().to_encoded_point(false);
+        let expected = Address::from_slice(&Keccak256::digest(&uncompressed.as_bytes()[1..])[12..]);
+
+        assert_eq!(
+            recover_signer(&payload.hash, &raw),
+            Ok(format!("{expected:#x}")),
+            "the recovered address must be the signer's own"
+        );
+
+        // A signature over a different action must not recover to the signer:
+        // this is what stops a signature being replayed to bind some other
+        // account as the session owner.
+        let (_, other) = approve_agent_payload(
+            Network::Mainnet,
+            Address::from([0x33; 20]),
+            "bloom-agent",
+            7,
+        )
+        .expect("payload builds");
+        assert_ne!(
+            recover_signer(&other.hash, &raw),
+            Ok(format!("{expected:#x}")),
+            "a signature bound to one action must not authenticate another"
+        );
+    }
 
     fn cancel() -> ExchangeAction {
         ExchangeAction::Cancel {
