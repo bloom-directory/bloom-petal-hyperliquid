@@ -3,7 +3,27 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a bounded session update_leverage.json request; it is signed by the stored agent key"
+            "description": "write a bounded session leverage update; Bloom signs it with the stored agent key",
+            "request_schema": {
+                "action": {
+                    "type": "updateLeverage",
+                    "asset": "unsigned integer asset id",
+                    "isCross": "boolean",
+                    "leverage": "unsigned integer from 1 through the session maximum"
+                },
+                "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
+                "vaultAddress": "optional lowercase 0x address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "example": {
+                "action": {
+                    "type": "updateLeverage",
+                    "asset": 0,
+                    "isCross": true,
+                    "leverage": 1
+                }
+            },
+            "success_evidence": "after writing, require a new audit.jsonl entry whose action is updateLeverage; last_response.json alone may be stale"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

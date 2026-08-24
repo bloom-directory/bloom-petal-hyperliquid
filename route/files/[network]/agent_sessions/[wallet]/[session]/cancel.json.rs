@@ -3,7 +3,31 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a bounded session cancel.json request; it is signed by the stored agent key"
+            "description": "cancel bounded session orders by venue order id or client order id; Bloom signs the action with the stored agent key",
+            "request_schema": {
+                "action": "a cancel or cancelByCloid object matching one of the examples",
+                "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
+                "vaultAddress": "optional lowercase 0x address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "examples": {
+                "by_order_id": {
+                    "action": {
+                        "type": "cancel",
+                        "cancels": [{"a": 0, "o": 123456789}]
+                    }
+                },
+                "by_client_order_id": {
+                    "action": {
+                        "type": "cancelByCloid",
+                        "cancels": [{
+                            "asset": 0,
+                            "cloid": "0x00112233445566778899aabbccddeeff"
+                        }]
+                    }
+                }
+            },
+            "success_evidence": "after writing, require a new audit.jsonl cancel or cancelByCloid entry and confirm the order is absent from the account open_orders.json"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
