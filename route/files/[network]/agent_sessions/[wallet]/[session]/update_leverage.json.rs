@@ -23,7 +23,14 @@ petal::route_file!(
                     "leverage": 1
                 }
             },
-            "success_evidence": "after writing, require a new audit.jsonl entry whose action is updateLeverage; last_response.json alone may be stale"
+            "success_evidence": {
+                "source": "live_venue_state",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/clearinghouse.json",
+                "poll_interval_ms": 1000,
+                "timeout_ms": 30000,
+                "predicate": "assetPositions contains a BTC position whose position.leverage.type is cross and whose position.leverage.value is 1",
+                "notes": "Read owner_address from session.json. An accepted filesystem write is asynchronous; keep polling until the predicate matches or the timeout expires. Do not use last_response.json as evidence for the current action."
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

@@ -27,7 +27,14 @@ petal::route_file!(
                     }
                 }
             },
-            "success_evidence": "after writing, require a new audit.jsonl cancel or cancelByCloid entry and confirm the order is absent from the account open_orders.json"
+            "success_evidence": {
+                "source": "live_venue_state",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "poll_interval_ms": 1000,
+                "timeout_ms": 30000,
+                "predicate": "no open-order entry has the canceled oid or cloid",
+                "notes": "Read owner_address from session.json. An accepted filesystem write is asynchronous; keep polling until the predicate matches or the timeout expires. Do not use last_response.json as evidence for the current action."
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
