@@ -14,7 +14,9 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
 // r000021 is the session-creation route that invokes derive_key. The Machine
 // host requires the executing route to be part of the immutable derived-key
-// scope, alongside the routes that later use the session key.
+// scope, alongside the routes that later use the session key. Machine derives
+// one route-specific reusable Sealed Approval from this installer-verified set
+// before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
     "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
 ];

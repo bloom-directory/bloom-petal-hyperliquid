@@ -17,6 +17,13 @@ close-all, and audit. The canonical transfer route is `usd_send.json`;
 `send_asset.json` remains as a compatibility alias and does not implement
 Hyperliquid's distinct generalized `sendAsset` action.
 
+Session key provisioning remains pending through two Bloom authority steps:
+the key-derivation custody ceremony and one reusable Sealed Approval covering
+the typed session-action routes declared in the immutable key scope. Machine
+stores that approval binding with the public `KeyRef`; each typed action selects
+the same key and therefore reuses the approval without receiving an approval ID
+or requiring another owner ceremony.
+
 A session request requires only a stable `id`. Neither the wallet id nor the
 owner address is carried in the body. The wallet id is the `[wallet]` path
 segment, and an address-shaped segment is rejected, because owner signing
@@ -25,7 +32,8 @@ owner address is recovered from the owner's own `approveAgent` signature — the
 same recovery Hyperliquid performs to decide which account the agent belongs to
 — so the account the session reads for its `max_leverage`, `cancel_all` and
 `close_all` checks is always the account its orders execute on. The exact body
-can be retried across the key-derivation and owner approval ceremonies without
+can be retried across the key-derivation, reusable-action, and owner approval
+ceremonies without
 rotating its agent key. A successful write means the route completed; inspect
 the durable response, status, and error files before treating an action as
 submitted.
