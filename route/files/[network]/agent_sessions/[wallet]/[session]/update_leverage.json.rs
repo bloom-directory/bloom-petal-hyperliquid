@@ -25,10 +25,10 @@ petal::route_file!(
             },
             "success_evidence": {
                 "source": "live_venue_state",
-                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/clearinghouse.json",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/active_asset_data/BTC.json",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 30000,
-                "predicate": "assetPositions contains a BTC position whose position.leverage.type is cross and whose position.leverage.value is 1",
+                "predicate": "leverage.type is cross and leverage.value is 1",
                 "notes": "Read owner_address from session.json. An accepted filesystem write is asynchronous; keep polling until the predicate matches or the timeout expires. Do not use last_response.json as evidence for the current action."
             }
         }))

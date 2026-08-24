@@ -1401,18 +1401,22 @@ fn verify_live_session_leverage(
         .iter()
         .map(|(name, asset)| (asset.id, name.as_str()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let state = http_json(
-        n,
-        "/info",
-        json!({"type":"clearinghouseState","user":session.owner_address}),
-    )?;
     for asset in required_assets {
         let Some(name) = names.get(&asset) else {
             return Err(denied(
                 "session order references an unknown perpetual asset",
             ));
         };
-        let leverage = venue_leverage(&state, name).ok_or_else(|| {
+        let state = http_json(
+            n,
+            "/info",
+            json!({
+                "type": "activeAssetData",
+                "user": session.owner_address,
+                "coin": name
+            }),
+        )?;
+        let leverage = active_asset_leverage(&state).ok_or_else(|| {
             denied(format!(
                 "cannot verify venue leverage for {name}; set venue leverage to the session cap before submitting orders"
             ))
@@ -1424,22 +1428,11 @@ fn verify_live_session_leverage(
     Ok(())
 }
 
-fn venue_leverage(state: &Value, asset_name: &str) -> Option<u32> {
+fn active_asset_leverage(state: &Value) -> Option<u32> {
     state
-        .get("assetPositions")
-        .and_then(Value::as_array)?
-        .iter()
-        .find_map(|item| {
-            let position = item.get("position").unwrap_or(item);
-            (position.get("coin").and_then(Value::as_str) == Some(asset_name))
-                .then(|| {
-                    position
-                        .get("leverage")
-                        .and_then(|value| value.get("value"))
-                })
-                .flatten()
-                .and_then(value_string)
-        })?
+        .get("leverage")
+        .and_then(|leverage| leverage.get("value"))
+        .and_then(value_string)?
         .parse::<u32>()
         .ok()
 }
@@ -1853,20 +1846,18 @@ mod tests {
     }
 
     #[test]
-    fn venue_leverage_requires_a_valid_matching_position() {
-        let state = json!({"assetPositions": [{
-            "position": {"coin": "BTC", "leverage": {"value": "20"}}
-        }]});
-        assert_eq!(venue_leverage(&state, "BTC"), Some(20));
-        assert_eq!(venue_leverage(&state, "ETH"), None);
-        assert_eq!(venue_leverage(&json!({"assetPositions": []}), "BTC"), None);
+    fn active_asset_leverage_requires_a_valid_value() {
         assert_eq!(
-            venue_leverage(
-                &json!({"assetPositions": [{"position": {
-                    "coin": "BTC", "leverage": {"value": "cross"}
-                }}]}),
-                "BTC"
-            ),
+            active_asset_leverage(&json!({"leverage": {"type": "cross", "value": "20"}})),
+            Some(20)
+        );
+        assert_eq!(
+            active_asset_leverage(&json!({"leverage": {"type": "isolated", "value": 5}})),
+            Some(5)
+        );
+        assert_eq!(active_asset_leverage(&json!({})), None);
+        assert_eq!(
+            active_asset_leverage(&json!({"leverage": {"value": "cross"}})),
             None
         );
     }
