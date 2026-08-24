@@ -42,10 +42,10 @@ petal::route_file!(
                 "source": "live_venue_state",
                 "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
                 "poll_interval_ms": 1000,
-                "timeout_ms": 30000,
+                "timeout_ms": 120000,
                 "predicate": "an open-order entry whose cloid equals the submitted order c field exists",
                 "result": "the matching entry confirms that the order is resting and its oid is the venue order id",
-                "notes": "Read owner_address from session.json and submit a unique client order id. An accepted filesystem write is asynchronous; keep polling until the predicate matches or the timeout expires. Do not use last_response.json as evidence for the current action."
+                "notes": "Read owner_address from session.json and submit a unique client order id. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout until the predicate matches. Do not use last_response.json as evidence for the current action."
             }
         }))
     },
