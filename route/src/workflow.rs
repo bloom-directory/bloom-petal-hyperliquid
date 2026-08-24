@@ -289,17 +289,21 @@ fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchRe
     )
 }
 
+struct OwnerApproval<'a> {
+    pending_nonce_key: Option<&'a str>,
+    nonce: u64,
+    kind: &'a str,
+    effects: ClaimEffects,
+}
+
 fn owner_sign_or_approval(
     ctx: &Ctx,
     w: &str,
     payload: &protocol::SigningPayload,
     intent: &str,
-    pending_nonce_key: Option<&str>,
-    nonce: u64,
-    approval_kind: &str,
-    effects: ClaimEffects,
+    approval_ctx: OwnerApproval<'_>,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
-    let approval_hint = match pending_nonce_key {
+    let approval_hint = match approval_ctx.pending_nonce_key {
         Some(key) => load_json::<PendingNonce>(key.to_owned())?.and_then(|state| {
             (state.expires_ms > petal::sdk::now_ms())
                 .then_some(state.action_id)
@@ -307,7 +311,15 @@ fn owner_sign_or_approval(
         }),
         None => None,
     };
-    match sign_payload(ctx, w, payload, intent, approval_hint, None, effects) {
+    match sign_payload(
+        ctx,
+        w,
+        payload,
+        intent,
+        approval_hint,
+        None,
+        approval_ctx.effects,
+    ) {
         Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
@@ -316,11 +328,11 @@ fn owner_sign_or_approval(
             action_id,
             expires_ms,
         }) => {
-            if let Some(key) = pending_nonce_key
+            if let Some(key) = approval_ctx.pending_nonce_key
                 && let Err(e) = save_json(
                     key.to_owned(),
                     &PendingNonce {
-                        nonce,
+                        nonce: approval_ctx.nonce,
                         expires_ms,
                         action_id: Some(action_id.clone()),
                         completed: false,
@@ -331,7 +343,7 @@ fn owner_sign_or_approval(
                 return Err(e);
             }
             Err(approval(
-                approval_kind,
+                approval_ctx.kind,
                 &json!({"action_id":action_id,"expires_ms":expires_ms}),
             ))
         }
@@ -375,10 +387,12 @@ pub fn owner_action_write(
         &w,
         &payload,
         req.action.intent(),
-        pending_nonce_key.as_deref(),
-        nonce,
-        "exchange",
-        ClaimEffects::none(),
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "exchange",
+            effects: ClaimEffects::none(),
+        },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
@@ -607,10 +621,12 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         &w,
         &payload,
         "hyperliquid.usd_send",
-        pending_nonce_key.as_deref(),
-        nonce,
-        "usd_send",
-        ClaimEffects::usd_send(amount_micros, dest),
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "usd_send",
+            effects: ClaimEffects::usd_send(amount_micros, dest),
+        },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
@@ -672,12 +688,14 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         &w,
         &payload,
         "hyperliquid.usd_class_transfer",
-        pending_nonce_key.as_deref(),
-        nonce,
-        "usd_class_transfer",
-        // Moving USDC between engines owned by the same wallet has no external
-        // destination and no net wallet debit.
-        ClaimEffects::none(),
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "usd_class_transfer",
+            // Moving USDC between engines owned by the same wallet has no external
+            // destination and no net wallet debit.
+            effects: ClaimEffects::none(),
+        },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
