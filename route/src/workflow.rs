@@ -21,6 +21,37 @@ const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
     "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
 ];
 
+#[derive(Clone, Debug, PartialEq)]
+struct ClaimEffects {
+    declared_debits: Vec<Value>,
+    declared_destinations: Vec<Value>,
+    declared_fee: Value,
+}
+
+impl ClaimEffects {
+    fn none() -> Self {
+        Self {
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: json!({"kind": "none"}),
+        }
+    }
+
+    fn usd_send(amount_micros: u64, destination: Address) -> Self {
+        Self {
+            declared_debits: vec![json!({
+                "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                "amount": amount_micros.to_string(),
+            })],
+            declared_destinations: vec![json!({
+                "chain": "hyperliquid",
+                "destination": format!("{destination:#x}"),
+            })],
+            declared_fee: json!({"kind": "none"}),
+        }
+    }
+}
+
 fn ok_write() -> DispatchResponse {
     DispatchResponse::Write
 }
@@ -125,6 +156,7 @@ fn sign_payload(
     operation_class: &str,
     approval_hint: Option<String>,
     key_ref_jcs: Option<Vec<u8>>,
+    effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
@@ -148,9 +180,9 @@ fn sign_payload(
         "crypto_suite": "secp256k1-keccak256-recoverable",
         "payload_digest": hex::encode(payload_digest),
         "ordered_hashes": [hex::encode(payload.hash)],
-        "declared_debits": [],
-        "declared_destinations": [],
-        "declared_fee": {"kind": "none"},
+        "declared_debits": effects.declared_debits,
+        "declared_destinations": effects.declared_destinations,
+        "declared_fee": effects.declared_fee,
         "nonce": hex::encode(&nonce_digest[..16]),
         "claim_assurance": {"kind": "machine_asserted"}
     });
@@ -265,6 +297,7 @@ fn owner_sign_or_approval(
     pending_nonce_key: Option<&str>,
     nonce: u64,
     approval_kind: &str,
+    effects: ClaimEffects,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
     let approval_hint = match pending_nonce_key {
         Some(key) => load_json::<PendingNonce>(key.to_owned())?.and_then(|state| {
@@ -274,7 +307,7 @@ fn owner_sign_or_approval(
         }),
         None => None,
     };
-    match sign_payload(ctx, w, payload, intent, approval_hint, None) {
+    match sign_payload(ctx, w, payload, intent, approval_hint, None, effects) {
         Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
             Ok(x) => Ok(x),
             Err(e) => Err(invalid(e)),
@@ -345,6 +378,7 @@ pub fn owner_action_write(
         pending_nonce_key.as_deref(),
         nonce,
         "exchange",
+        ClaimEffects::none(),
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
@@ -548,9 +582,10 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid usd_send body: {e}")),
     };
-    if let Err(e) = protocol::validate_usdc_amount(&req.amount) {
-        return invalid(e);
-    }
+    let amount_micros = match protocol::usdc_amount_micros(&req.amount) {
+        Ok(amount) => amount,
+        Err(e) => return invalid(e),
+    };
     let dest = match protocol::parse_address(&req.destination) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -575,6 +610,7 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         pending_nonce_key.as_deref(),
         nonce,
         "usd_send",
+        ClaimEffects::usd_send(amount_micros, dest),
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
@@ -639,6 +675,9 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         pending_nonce_key.as_deref(),
         nonce,
         "usd_class_transfer",
+        // Moving USDC between engines owned by the same wallet has no external
+        // destination and no net wallet debit.
+        ClaimEffects::none(),
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
@@ -975,6 +1014,7 @@ fn session_submit(
         "hyperliquid.agent_action",
         None,
         Some(s.key_ref_jcs.clone()),
+        ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
@@ -1039,6 +1079,9 @@ pub fn session_action_write(
     id: &str,
     req: SignSubmit,
 ) -> DispatchResponse {
+    if let Err(error) = validate_session_target(&req) {
+        return denied(error);
+    }
     let mut s = match active_session(n, w, id) {
         Ok(session) => session,
         Err(response) => return response,
@@ -1062,6 +1105,16 @@ pub fn session_action_write(
         req.expires_after,
         req.nonce,
     )
+}
+
+fn validate_session_target(req: &SignSubmit) -> Result<(), String> {
+    if req.vault_address.is_some() {
+        return Err(
+            "delegated sessions cannot target a vault or subaccount; create a session bound to that account instead"
+                .into(),
+        );
+    }
+    Ok(())
 }
 fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), DispatchResponse> {
     let mut line = serde_json::to_vec(event).map_err(|e| backend(e.to_string()))?;
@@ -1178,9 +1231,16 @@ fn session_cancel_all(
     if let Some(items) = open.as_array() {
         for item in items {
             let Some(coin) = item.get("coin").and_then(Value::as_str) else {
+                return backend("Hyperliquid returned an open order without a coin");
+            };
+            let Some(asset) = ids.get(coin) else {
+                if s.assets.is_empty() {
+                    return denied(
+                        "cancel_all cannot safely clean an unrestricted session containing a spot or unknown asset order",
+                    );
+                }
                 continue;
             };
-            let Some(asset) = ids.get(coin) else { continue };
             if !session_allows_asset(s, *asset) {
                 continue;
             }
@@ -1188,7 +1248,7 @@ fn session_cancel_all(
                 .get("oid")
                 .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
             else {
-                continue;
+                return backend("Hyperliquid returned an open order without a valid order id");
             };
             cancels.push(json!({"a":asset,"o":oid}));
         }
@@ -1328,6 +1388,19 @@ fn session_allows_asset(session: &Session, asset: u32) -> bool {
 }
 fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     a.validate()?;
+    let is_perpetual = |asset: u32| asset < 10_000;
+    let all_perpetual = match a {
+        ExchangeAction::Order { orders, .. } => orders.iter().all(|o| is_perpetual(o.asset)),
+        ExchangeAction::Cancel { cancels, .. } => cancels.iter().all(|o| is_perpetual(o.asset)),
+        ExchangeAction::CancelByCloid { cancels, .. } => {
+            cancels.iter().all(|o| is_perpetual(o.asset))
+        }
+        ExchangeAction::UpdateLeverage { asset, .. } => is_perpetual(*asset),
+        ExchangeAction::ScheduleCancel { .. } => true,
+    };
+    if !all_perpetual {
+        return Err("delegated sessions do not support spot asset ids".into());
+    }
     if let ExchangeAction::UpdateLeverage { leverage, .. } = a
         && s.max_leverage.is_some_and(|m| *leverage > m)
     {
@@ -1517,7 +1590,11 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         let mut normalized = Vec::with_capacity(req.assets.len());
         for asset in &req.assets {
             if let Ok(id) = asset.parse::<u32>() {
-                normalized.push(id.to_string());
+                if ids.values().any(|known| *known == id) {
+                    normalized.push(id.to_string());
+                } else {
+                    return invalid(format!("unknown perpetual asset {asset}"));
+                }
             } else if let Some(id) = ids.get(asset) {
                 normalized.push(id.to_string());
             } else {
@@ -1637,6 +1714,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         "hyperliquid.approve_agent",
         approval_hint,
         None,
+        ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(raw)) => {
             // Bind the session to whoever actually signed. The venue recovers
@@ -1859,6 +1937,57 @@ mod tests {
         assert_eq!(
             active_asset_leverage(&json!({"leverage": {"value": "cross"}})),
             None
+        );
+    }
+
+    #[test]
+    fn usd_send_claim_effects_bind_amount_and_destination() {
+        let destination =
+            protocol::parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+        let effects = ClaimEffects::usd_send(1_250_000, destination);
+        assert_eq!(
+            effects.declared_debits,
+            vec![json!({
+                "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                "amount": "1250000",
+            })]
+        );
+        assert_eq!(
+            effects.declared_destinations,
+            vec![json!({
+                "chain": "hyperliquid",
+                "destination": "0x00000000000000000000000000000000000000aa",
+            })]
+        );
+        assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    #[test]
+    fn delegated_sessions_reject_vault_and_spot_targets() {
+        let request = SignSubmit {
+            action: ExchangeAction::ScheduleCancel { time: Some(123) },
+            nonce: None,
+            vault_address: Some("0x0000000000000000000000000000000000000001".into()),
+            expires_after: None,
+        };
+        assert!(
+            validate_session_target(&request)
+                .unwrap_err()
+                .contains("vault")
+        );
+
+        let mut unrestricted = bounded_session();
+        unrestricted.assets.clear();
+        let spot = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire {
+                asset: 10_000,
+                oid: 42,
+            }],
+            fast: None,
+        };
+        assert_eq!(
+            session_policy(&unrestricted, &spot),
+            Err("delegated sessions do not support spot asset ids".into())
         );
     }
 

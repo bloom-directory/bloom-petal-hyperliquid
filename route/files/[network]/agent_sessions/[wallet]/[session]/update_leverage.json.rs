@@ -12,7 +12,6 @@ petal::route_file!(
                     "leverage": "unsigned integer from 1 through the session maximum"
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
-                "vaultAddress": "optional lowercase 0x address",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
             },
             "example": {

@@ -10,7 +10,6 @@ petal::route_file!(
                     "time": "optional Unix timestamp in milliseconds; omit to clear the schedule"
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
-                "vaultAddress": "optional lowercase 0x address",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
             },
             "examples": {

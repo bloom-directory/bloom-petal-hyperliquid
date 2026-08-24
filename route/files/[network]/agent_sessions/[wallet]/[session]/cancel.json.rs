@@ -7,7 +7,6 @@ petal::route_file!(
             "request_schema": {
                 "action": "a cancel or cancelByCloid object matching one of the examples",
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
-                "vaultAddress": "optional lowercase 0x address",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
             },
             "examples": {

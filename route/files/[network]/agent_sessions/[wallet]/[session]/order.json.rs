@@ -17,10 +17,9 @@ petal::route_file!(
                         "c": "optional 16-byte 0x client order id"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
-                    "builder": "optional builder fee object"
+                    "builder": "unsupported because delegated claims cannot represent an exact builder fee"
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
-                "vaultAddress": "optional lowercase 0x address",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
             },
             "example": {
