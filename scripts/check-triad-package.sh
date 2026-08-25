@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BLOOM_CONTRACT_REV="8cac0de77da99a39b31f20faa5746b289cb662bf"
+BLOOM_CONTRACT_REV="058e2db03672adf3e02e527bdf09a726d9e4cef0"
 BLOOM_ROOT="${BLOOM_ROOT:?set BLOOM_ROOT to a checkout of bloom-directory/bloom at $BLOOM_CONTRACT_REV}"
 PACKAGE_ARCHIVE="${PACKAGE_ARCHIVE:?set PACKAGE_ARCHIVE to the exact built Hyperliquid .petal.tar.gz}"
 
