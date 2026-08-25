@@ -38,13 +38,13 @@ petal::route_file!(
                 }
             },
             "success_evidence": {
-                "source": "live_venue_state",
-                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "source": "immutable_correlated_exchange_receipt",
+                "path_from_session_root": "receipts/<submitted_cloid>/order.json",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
-                "predicate": "an open-order entry whose cloid equals the submitted order c field exists",
-                "result": "the matching entry confirms that the order is resting and its oid is the venue order id",
-                "notes": "Read owner_address from session.json and submit a unique client order id. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout until the predicate matches. Do not use last_response.json as evidence for the current action."
+                "predicate": "receipt cloid equals the submitted order c field and response.response.data.statuses contains a resting object with the same cloid",
+                "result": "the correlated resting response confirms venue acceptance and its oid is the venue order id",
+                "notes": "Submit a unique client order id. The create-only receipt is scoped by session, action, and normalized cloid, so it cannot race last_response.json or be overwritten by a later action. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling the exact receipt path for the full timeout."
             }
         }))
     },

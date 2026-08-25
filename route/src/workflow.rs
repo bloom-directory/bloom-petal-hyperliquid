@@ -12,13 +12,13 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000021 is the session-creation route that invokes derive_key. The Machine
+// r000025 is the session-creation route that invokes derive_key. The Machine
 // host requires the executing route to be part of the immutable derived-key
 // scope, alongside the routes that later use the session key. Machine derives
 // one route-specific reusable Sealed Approval from this installer-verified set
 // before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
+    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -892,6 +892,95 @@ pub fn load_session_response(
     load_json(session_key(n, w, id, "last_response.json"))
 }
 
+fn receipt_action_key(action: &str) -> Result<&'static str, DispatchResponse> {
+    match action {
+        "order" => Ok("order"),
+        "cancel" => Ok("cancel"),
+        _ => Err(invalid("receipt action must be order or cancel")),
+    }
+}
+
+fn session_receipt_key(n: Network, w: &str, id: &str, cloid: &str, action: &str) -> String {
+    session_key(
+        n,
+        w,
+        id,
+        &format!("receipts/{}/{action}.json", cloid.to_ascii_lowercase()),
+    )
+}
+
+pub fn load_session_receipt(
+    n: Network,
+    w: &str,
+    id: &str,
+    cloid: &str,
+    action: &str,
+) -> Result<Option<Value>, DispatchResponse> {
+    protocol::validate_cloid(cloid).map_err(invalid)?;
+    let action = receipt_action_key(action)?;
+    load_json(session_receipt_key(n, w, id, cloid, action))
+}
+
+fn correlated_cloids(action: &ExchangeAction) -> Vec<String> {
+    let cloids = match action {
+        ExchangeAction::Order { orders, .. } => orders
+            .iter()
+            .filter_map(|order| order.cloid.as_deref())
+            .collect::<Vec<_>>(),
+        ExchangeAction::CancelByCloid { cancels, .. } => cancels
+            .iter()
+            .map(|cancel| cancel.cloid.as_str())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    cloids.into_iter().map(str::to_ascii_lowercase).collect()
+}
+
+fn receipt_action(action: &ExchangeAction) -> Option<&'static str> {
+    match action {
+        ExchangeAction::Order { .. } => Some("order"),
+        ExchangeAction::CancelByCloid { .. } => Some("cancel"),
+        _ => None,
+    }
+}
+
+fn save_session_receipts(
+    n: Network,
+    w: &str,
+    id: &str,
+    action: &str,
+    nonce: u64,
+    cloids: &[String],
+    response: &Value,
+) -> Result<(), DispatchResponse> {
+    for cloid in cloids {
+        let receipt = json!({
+            "schema": "bloom.hyperliquid_session_action_receipt.v1",
+            "network": if matches!(n, Network::Mainnet) { "mainnet" } else { "testnet" },
+            "wallet": w,
+            "session_id": id,
+            "action": action,
+            "cloid": cloid,
+            "nonce": nonce,
+            "response": response,
+        });
+        let key = session_receipt_key(n, w, id, cloid, action);
+        match save_json_new(key.clone(), &receipt, false) {
+            Ok(()) => {}
+            Err(first_error) => match load_json::<Value>(key)? {
+                Some(existing) if existing == receipt => {}
+                Some(_) => {
+                    return Err(backend(format!(
+                        "immutable {action} receipt already exists for cloid {cloid}"
+                    )));
+                }
+                None => return Err(first_error),
+            },
+        }
+    }
+    Ok(())
+}
+
 pub fn load_session_error(
     n: Network,
     w: &str,
@@ -1050,6 +1139,8 @@ fn session_submit(
         Err(e) => return denied(format!("agent signing denied: {e}")),
     };
     let action_kind = action.kind();
+    let receipt_action = receipt_action(&action);
+    let receipt_cloids = correlated_cloids(&action);
     let payload = match protocol::exchange_payload(action, nonce, sig, vault_str, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -1059,6 +1150,12 @@ fn session_submit(
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 record_session_error(n, w, id, s, nonce, action_kind, &e);
                 return backend(e);
+            }
+            if let Some(receipt_action) = receipt_action
+                && let Err(e) =
+                    save_session_receipts(n, w, id, receipt_action, nonce, &receipt_cloids, &v)
+            {
+                return e;
             }
             s.last_response = Some(v.clone());
             s.last_error = None;
@@ -1869,7 +1966,7 @@ mod tests {
         assert_eq!(
             SESSION_KEY_ALLOWED_ROUTES,
             [
-                "r000008", "r000009", "r000010", "r000013", "r000015", "r000019", "r000021",
+                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
             ]
         );
     }
@@ -2280,5 +2377,49 @@ mod tests {
             last_response_key(Network::Testnet, "0xabc"),
             "state/exchange/testnet/0xabc/last_response.json"
         );
+    }
+
+    #[test]
+    fn correlated_receipts_are_action_and_cloid_scoped() {
+        let order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0,
+                "b": true,
+                "p": "100",
+                "s": "0.1",
+                "r": false,
+                "t": {"limit": {"tif": "Alo"}},
+                "c": "0xAABBCCDDEEFF00112233445566778899"
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(receipt_action(&order), Some("order"));
+        assert_eq!(
+            correlated_cloids(&order),
+            vec!["0xaabbccddeeff00112233445566778899"]
+        );
+        assert_eq!(
+            session_receipt_key(
+                Network::Mainnet,
+                "wallet",
+                "session",
+                "0xAABBCCDDEEFF00112233445566778899",
+                "order"
+            ),
+            "state/sessions/mainnet/wallet/session/receipts/0xaabbccddeeff00112233445566778899/order.json"
+        );
+
+        let cancel: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancelByCloid",
+            "cancels": [{
+                "asset": 0,
+                "cloid": "0xAABBCCDDEEFF00112233445566778899"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(receipt_action(&cancel), Some("cancel"));
+        assert_eq!(correlated_cloids(&cancel), correlated_cloids(&order));
     }
 }
