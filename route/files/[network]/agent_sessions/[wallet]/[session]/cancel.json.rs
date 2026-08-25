@@ -1,8 +1,39 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
+    spec: petal::signing_write_spec("hyperliquid.agent_action")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a bounded session cancel.json request; it is signed by the stored agent key"
+            "description": "cancel bounded session orders by venue order id or client order id; Bloom signs the action with the stored agent key",
+            "request_schema": {
+                "action": "a cancel or cancelByCloid object matching one of the examples",
+                "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "examples": {
+                "by_order_id": {
+                    "action": {
+                        "type": "cancel",
+                        "cancels": [{"a": 0, "o": 123456789}]
+                    }
+                },
+                "by_client_order_id": {
+                    "action": {
+                        "type": "cancelByCloid",
+                        "cancels": [{
+                            "asset": 0,
+                            "cloid": "0x00112233445566778899aabbccddeeff"
+                        }]
+                    }
+                }
+            },
+            "success_evidence": {
+                "source": "live_venue_state",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "poll_interval_ms": 1000,
+                "timeout_ms": 120000,
+                "predicate": "no open-order entry has the canceled oid or cloid",
+                "notes": "Read owner_address from session.json. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout until the predicate matches. Do not use last_response.json as evidence for the current action."
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
@@ -16,9 +47,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            crate::parse_address(value)
-                .map(|address| format!("{address:#x}"))
-                .map_err(|error| petal::error(-3, error))
+            crate::parse_wallet_id(value).map_err(|error| petal::error(-3, error))
         }) {
             Ok(wallet) => wallet,
             Err(response) => return response,
@@ -43,6 +72,6 @@ petal::route_file!(
                 ),
             );
         }
-        crate::session_action_write(network, &wallet, session, request)
+        crate::session_action_write(ctx, network, &wallet, session, request)
     }
 );

@@ -1,8 +1,51 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
+    spec: petal::signing_write_spec("hyperliquid.agent_action")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a bounded session order.json request; it is signed by the stored agent key"
+            "description": "write one or more bounded session orders; Bloom signs them with the stored agent key",
+            "request_schema": {
+                "action": {
+                    "type": "order",
+                    "orders": [{
+                        "a": "unsigned integer asset id",
+                        "b": "boolean; true buys and false sells",
+                        "p": "positive decimal price string",
+                        "s": "positive decimal size string",
+                        "r": "boolean reduce-only flag",
+                        "t": {"limit": {"tif": "Alo, Gtc, or Ioc"}},
+                        "c": "optional 16-byte 0x client order id"
+                    }],
+                    "grouping": "na, normalTpsl, or positionTpsl",
+                    "builder": "unsupported because delegated claims cannot represent an exact builder fee"
+                },
+                "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "example": {
+                "action": {
+                    "type": "order",
+                    "orders": [{
+                        "a": 0,
+                        "b": true,
+                        "p": "95000",
+                        "s": "0.00011",
+                        "r": false,
+                        "t": {"limit": {"tif": "Alo"}},
+                        "c": "0x00112233445566778899aabbccddeeff"
+                    }],
+                    "grouping": "na"
+                }
+            },
+            "success_evidence": {
+                "source": "live_venue_state",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "poll_interval_ms": 1000,
+                "timeout_ms": 120000,
+                "predicate": "an open-order entry whose cloid equals the submitted order c field exists",
+                "result": "the matching entry confirms that the order is resting and its oid is the venue order id",
+                "notes": "Read owner_address from session.json and submit a unique client order id. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout until the predicate matches. Do not use last_response.json as evidence for the current action."
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
@@ -16,9 +59,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            crate::parse_address(value)
-                .map(|address| format!("{address:#x}"))
-                .map_err(|error| petal::error(-3, error))
+            crate::parse_wallet_id(value).map_err(|error| petal::error(-3, error))
         }) {
             Ok(wallet) => wallet,
             Err(response) => return response,
@@ -40,6 +81,6 @@ petal::route_file!(
                 ),
             );
         }
-        crate::session_action_write(network, &wallet, session, request)
+        crate::session_action_write(ctx, network, &wallet, session, request)
     }
 );

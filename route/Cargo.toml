@@ -11,11 +11,17 @@ crate-type = ["rlib"]
 
 [dependencies]
 alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
-alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std"] }
+alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std", "k256"] }
 hex = "0.4"
-k256 = { version = "0.13", features = ["ecdsa"] }
-petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd" }
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2" }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_jcs = "0.1"
+sha2 = "0.10"
 sha3 = "0.10"
+
+[dev-dependencies]
+# Produces a real recoverable signature so the owner-address binding is tested
+# against actual secp256k1 output rather than a hand-rolled vector.
+k256 = { version = "0.13", features = ["ecdsa"] }

@@ -1,9 +1,14 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("hyperliquid.cancel")
+    spec: petal::signing_write_spec("hyperliquid.usd_class_transfer")
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid cancel.json request; signed actions require Bloom approval"
+            "description": "write a Hyperliquid usdClassTransfer request moving USDC between this wallet's spot and perp engines; owner signing may require Bloom approval",
+            "body": {
+                "amount": "positive USDC decimal with at most 6 decimal places",
+                "to_perp": "true moves spot USDC into perp, false moves perp USDC into spot",
+                "nonce": "optional timestamp in milliseconds"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
@@ -22,22 +27,6 @@ petal::route_file!(
             Ok(wallet) => wallet,
             Err(response) => return response,
         };
-        let request = match crate::serde_json::from_slice::<crate::SignSubmit>(body) {
-            Ok(request) => request,
-            Err(error) => return petal::error(-3, format!("invalid exchange body: {error}")),
-        };
-        if !matches!(
-            &request.action,
-            crate::ExchangeAction::Cancel { .. } | crate::ExchangeAction::CancelByCloid { .. }
-        ) {
-            return petal::error(
-                -3,
-                format!(
-                    "cancel.json cannot submit action type {}",
-                    request.action.kind()
-                ),
-            );
-        }
-        crate::owner_action_write(ctx, network, wallet, "cancel.json", body, request)
+        crate::usd_class_transfer(ctx, network, wallet, body)
     }
 );

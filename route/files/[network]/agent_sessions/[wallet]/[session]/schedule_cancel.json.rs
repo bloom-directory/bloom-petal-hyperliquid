@@ -1,8 +1,26 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store"]),
+    spec: petal::signing_write_spec("hyperliquid.agent_action")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a bounded session schedule_cancel.json request; it is signed by the stored agent key"
+            "description": "schedule or clear Hyperliquid dead-man's-switch cancellation; Bloom signs it with the stored agent key",
+            "request_schema": {
+                "action": {
+                    "type": "scheduleCancel",
+                    "time": "optional Unix timestamp in milliseconds; omit to clear the schedule"
+                },
+                "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "examples": {
+                "schedule": {
+                    "action": {"type": "scheduleCancel", "time": 1730000000000_u64}
+                },
+                "clear": {
+                    "action": {"type": "scheduleCancel"}
+                }
+            },
+            "success_evidence": "after writing, require a new audit.jsonl entry whose action is scheduleCancel; last_response.json alone may be stale"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
@@ -16,9 +34,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            crate::parse_address(value)
-                .map(|address| format!("{address:#x}"))
-                .map_err(|error| petal::error(-3, error))
+            crate::parse_wallet_id(value).map_err(|error| petal::error(-3, error))
         }) {
             Ok(wallet) => wallet,
             Err(response) => return response,
@@ -43,6 +59,6 @@ petal::route_file!(
                 ),
             );
         }
-        crate::session_action_write(network, &wallet, session, request)
+        crate::session_action_write(ctx, network, &wallet, session, request)
     }
 );

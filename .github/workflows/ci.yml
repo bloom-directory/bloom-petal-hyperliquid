@@ -48,7 +48,7 @@ jobs:
         run: cargo install wasm-tools --version 1.249.0 --locked
 
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev b9fc22d6d8211bc41304b38b1ef8b5269c8035bd --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 61938d0c127cfe03c7e3e55baed0ba1439bc5ca2 --locked bloom-petal-cli
 
       - name: Build source package
         run: scripts/build.sh
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/petal
-          ref: b9fc22d6d8211bc41304b38b1ef8b5269c8035bd
+          ref: 61938d0c127cfe03c7e3e55baed0ba1439bc5ca2
           path: .petal-tooling
           persist-credentials: false
 
@@ -75,49 +75,31 @@ jobs:
           "$RUNNER_TEMP/petal" package \
             --root . \
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
-            | jq -e '.routes == 63'
+            | jq -e '.routes == 66'
 
-      - name: Check out Bloom CLI
+      - name: Check out exact Bloom package contract
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom
-          ref: master
-          path: bloom
+          ref: 058e2db03672adf3e02e527bdf09a726d9e4cef0
+          path: .bloom-contract
           persist-credentials: false
 
-      - name: Build Bloom CLI
-        run: |
-          cargo build --release --manifest-path bloom/Cargo.toml -p bloom --bin bloom
-          cp bloom/target/release/bloom "$RUNNER_TEMP/bloom"
-          rm -rf bloom
+      - name: Validate delegated-key and signing metadata
+        env:
+          BLOOM_ROOT: ${{ github.workspace }}/.bloom-contract
+          PACKAGE_ARCHIVE: ${{ runner.temp }}/hyperliquid-ci.petal.tar.gz
+        run: scripts/check-triad-package.sh
 
-      - name: Smoke install and dispatch
+      # The current triad runtime is authenticated-daemon-only, so this job
+      # deliberately stops at immutable package validation. End-to-end install
+      # and dispatch are exercised by the linked Bloom/Harbor integration lane.
+      - name: Validate triad host contracts in built routes
         shell: bash
         run: |
           set -euo pipefail
-          home="$(mktemp -d)"
-          "$RUNNER_TEMP/bloom" --home "$home" petals install "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat /petals/hyperliquid/README.md \
-            | grep -Fq 'Hyperliquid Petal'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs ls /petals/hyperliquid/mainnet \
-            | grep -Fq 'mids.json'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat /petals/hyperliquid/testnet/status.json \
-            | jq -e '.network == "Testnet"'
-          "$RUNNER_TEMP/bloom" --home "$home" vfs cat \
-            /petals/hyperliquid/testnet/exchange/0x0000000000000000000000000000000000000000/usd_send.json \
-            | jq -e '.body.amount | contains("6 decimal")'
-
-      - name: Validate GitHub source install
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_url="https://github.com/${GITHUB_REPOSITORY}"
-          source_ref="$GITHUB_SHA"
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            source_url="$(jq -r '.pull_request.head.repo.html_url' "$GITHUB_EVENT_PATH")"
-            source_ref="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
-          fi
-          home="$(mktemp -d)"
-          "$RUNNER_TEMP/bloom" --home "$home" petals install "$source_url" --ref "$source_ref"
-          "$RUNNER_TEMP/bloom" --home "$home" vfs ls /petals/hyperliquid/mainnet \
-            | grep -Fq 'agent_sessions'
+          new_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/new.json.wasm'
+          action_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/[session]/cancel.json.wasm'
+          wasm-tools component wit "$new_route" | grep -Fq 'import bloom:key/derive@0.1.0;'
+          wasm-tools component wit "$new_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'
+          wasm-tools component wit "$action_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'

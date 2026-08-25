@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningPayload {
+    pub preimage: Vec<u8>,
+    pub hash: B256,
+}
+
+fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(td.domain().separator().as_slice());
+    preimage.extend_from_slice(td.hash_struct().map_err(|e| e.to_string())?.as_slice());
+    let hash = B256::from_slice(&Keccak256::digest(&preimage));
+    Ok(SigningPayload { preimage, hash })
+}
+
 pub const MAINNET_URL: &str = "https://api.hyperliquid.xyz";
 pub const TESTNET_URL: &str = "https://api.hyperliquid-testnet.xyz";
 
@@ -39,10 +54,10 @@ impl Network {
         }
     }
     pub fn signature_chain_id(self) -> u64 {
-        match self {
-            Self::Mainnet => 0xa4b1,
-            Self::Testnet => 0x66eee,
-        }
+        // Hyperliquid's official SDK signs user actions on this fixed EIP-712
+        // chain for both environments; `hyperliquidChain` provides the
+        // Mainnet/Testnet replay separation.
+        0x66eee
     }
 }
 
@@ -158,6 +173,10 @@ impl ExchangeAction {
                     if builder.address != builder.address.to_ascii_lowercase() {
                         return Err("builder address must be lowercase".into());
                     }
+                    return Err(
+                        "builder fees are unsupported until they can be represented exactly in the authorization claim"
+                            .into(),
+                    );
                 }
             }
             Self::Cancel { cancels, fast } => {
@@ -389,6 +408,18 @@ pub fn l1_signing_hash(
     let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
     Ok(hash)
 }
+pub fn l1_signing_payload(
+    network: Network,
+    action: &ExchangeAction,
+    nonce: u64,
+    vault: Option<Address>,
+    expires: Option<u64>,
+) -> Result<SigningPayload, String> {
+    typed_signing_payload(&typed_agent(
+        network,
+        action_hash(action, nonce, vault, expires)?,
+    )?)
+}
 fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData, String> {
     let (type_name, type_fields) = match kind {
         "approveAgent" => (
@@ -398,6 +429,10 @@ fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData,
         "usdSend" => (
             "UsdSend",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"destination","type":"string"},{"name":"amount","type":"string"},{"name":"time","type":"uint64"}]),
+        ),
+        "usdClassTransfer" => (
+            "UsdClassTransfer",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"amount","type":"string"},{"name":"toPerp","type":"bool"},{"name":"nonce","type":"uint64"}]),
         ),
         _ => return Err("unsupported user action".into()),
     };
@@ -418,6 +453,34 @@ pub fn approve_agent_hash(
         hash,
     ))
 }
+pub fn approve_agent_payload(
+    network: Network,
+    agent: Address,
+    name: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = json!({"hyperliquidChain":network.chain(),"agentAddress":format!("{agent:#x}"),"agentName":name,"nonce":nonce});
+    let payload = typed_signing_payload(&user_typed(network, "approveAgent", msg)?)?;
+    Ok((
+        json!({"type":"approveAgent","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"agentAddress":format!("{agent:#x}"),"agentName":name,"nonce":nonce}),
+        payload,
+    ))
+}
+/// Recovers the address that produced `raw` over `hash`.
+///
+/// This is the same recovery Hyperliquid performs to decide which account an
+/// `approveAgent` action belongs to, so the address it yields is by definition
+/// the account the session's orders will execute against. Taking the owner
+/// address from here rather than from the request body is what keeps the
+/// session's bounds (leverage, cancel-all, close-all) pointed at the account
+/// that is actually at risk.
+pub fn recover_signer(hash: &B256, raw: &[u8]) -> Result<String, String> {
+    let sig = Signature::from_raw(raw).map_err(|e| format!("invalid signature: {e}"))?;
+    let address = sig
+        .recover_address_from_prehash(hash)
+        .map_err(|e| format!("cannot recover owner address from signature: {e}"))?;
+    Ok(format!("{address:#x}"))
+}
 pub fn usd_send_hash(
     network: Network,
     destination: Address,
@@ -430,6 +493,52 @@ pub fn usd_send_hash(
     Ok((
         json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
         hash,
+    ))
+}
+pub fn usd_send_payload(
+    network: Network,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = json!({"hyperliquidChain":network.chain(),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce});
+    let payload = typed_signing_payload(&user_typed(network, "usdSend", msg)?)?;
+    Ok((
+        json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
+        payload,
+    ))
+}
+fn usd_class_transfer_message(network: Network, amount: &str, to_perp: bool, nonce: u64) -> Value {
+    json!({"hyperliquidChain":network.chain(),"amount":amount,"toPerp":to_perp,"nonce":nonce})
+}
+fn usd_class_transfer_action(network: Network, amount: &str, to_perp: bool, nonce: u64) -> Value {
+    json!({"type":"usdClassTransfer","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"amount":amount,"toPerp":to_perp,"nonce":nonce})
+}
+pub fn usd_class_transfer_hash(
+    network: Network,
+    amount: &str,
+    to_perp: bool,
+    nonce: u64,
+) -> Result<(Value, B256), String> {
+    let msg = usd_class_transfer_message(network, amount, to_perp, nonce);
+    let td = user_typed(network, "usdClassTransfer", msg)?;
+    let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
+    Ok((
+        usd_class_transfer_action(network, amount, to_perp, nonce),
+        hash,
+    ))
+}
+pub fn usd_class_transfer_payload(
+    network: Network,
+    amount: &str,
+    to_perp: bool,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = usd_class_transfer_message(network, amount, to_perp, nonce);
+    let payload = typed_signing_payload(&user_typed(network, "usdClassTransfer", msg)?)?;
+    Ok((
+        usd_class_transfer_action(network, amount, to_perp, nonce),
+        payload,
     ))
 }
 pub fn user_payload(action: Value, nonce: u64, sig: SignatureJson) -> Value {
@@ -456,7 +565,7 @@ pub fn exchange_payload(
     Ok(v)
 }
 
-pub fn validate_usdc_amount(raw: &str) -> Result<(), String> {
+pub fn usdc_amount_micros(raw: &str) -> Result<u64, String> {
     if raw.is_empty()
         || raw.len() > 40
         || raw.starts_with('-')
@@ -492,7 +601,11 @@ pub fn validate_usdc_amount(raw: &str) -> Result<(), String> {
     if micros == 0 {
         return Err("amount must be greater than zero".into());
     }
-    Ok(())
+    Ok(micros)
+}
+
+pub fn validate_usdc_amount(raw: &str) -> Result<(), String> {
+    usdc_amount_micros(raw).map(|_| ())
 }
 
 pub fn validate_exchange_response(value: &Value) -> Result<(), String> {
@@ -515,6 +628,59 @@ pub fn validate_exchange_response(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
+
+    /// The owner address must come from the signature, not from the caller.
+    ///
+    /// It feeds the venue reads behind `max_leverage`, `cancel_all` and
+    /// `close_all`. While it was a request field, an agent could name any
+    /// account: point it at one sitting at 1x and the leverage bound passed
+    /// while the order executed on the real wallet, and the two kill switches
+    /// read an account with no orders and reported success having closed
+    /// nothing.
+    #[test]
+    fn owner_address_is_recovered_from_the_signature_not_supplied_by_the_caller() {
+        let (_, payload) = approve_agent_payload(
+            Network::Mainnet,
+            Address::from([0x22; 20]),
+            "bloom-agent",
+            7,
+        )
+        .expect("payload builds");
+
+        let signing_key = SigningKey::from_bytes(&[0x11; 32].into()).expect("valid key");
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(payload.hash.as_slice())
+            .expect("signs the prehash");
+        let mut raw = [0u8; 65];
+        raw[..64].copy_from_slice(&signature.to_bytes());
+        raw[64] = recovery_id.to_byte();
+
+        let uncompressed = signing_key.verifying_key().to_encoded_point(false);
+        let expected = Address::from_slice(&Keccak256::digest(&uncompressed.as_bytes()[1..])[12..]);
+
+        assert_eq!(
+            recover_signer(&payload.hash, &raw),
+            Ok(format!("{expected:#x}")),
+            "the recovered address must be the signer's own"
+        );
+
+        // A signature over a different action must not recover to the signer:
+        // this is what stops a signature being replayed to bind some other
+        // account as the session owner.
+        let (_, other) = approve_agent_payload(
+            Network::Mainnet,
+            Address::from([0x33; 20]),
+            "bloom-agent",
+            7,
+        )
+        .expect("payload builds");
+        assert_ne!(
+            recover_signer(&other.hash, &raw),
+            Ok(format!("{expected:#x}")),
+            "a signature bound to one action must not authenticate another"
+        );
+    }
 
     fn cancel() -> ExchangeAction {
         ExchangeAction::Cancel {
@@ -657,6 +823,26 @@ mod tests {
             action.validate(),
             Err("order type must contain exactly one of limit or trigger".into())
         );
+
+        let builder_action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na",
+            "builder": {
+                "b": "0x0000000000000000000000000000000000000001",
+                "f": 10
+            }
+        }))
+        .unwrap();
+        assert!(
+            builder_action
+                .validate()
+                .unwrap_err()
+                .contains("builder fees are unsupported")
+        );
     }
 
     #[test]
@@ -672,6 +858,113 @@ mod tests {
     }
 
     #[test]
+    fn usd_class_transfer_wire_action_matches_official_field_order() {
+        for (to_perp, network) in [(true, Network::Mainnet), (false, Network::Testnet)] {
+            let (action, hash) = usd_class_transfer_hash(network, "12.5", to_perp, 99).unwrap();
+            assert_eq!(action["type"], "usdClassTransfer");
+            assert_eq!(action["hyperliquidChain"], network.chain());
+            assert_eq!(
+                action["signatureChainId"],
+                format!("0x{:x}", network.signature_chain_id())
+            );
+            assert_eq!(action["amount"], "12.5");
+            assert_eq!(action["toPerp"], to_perp);
+            assert_eq!(action["nonce"], 99);
+            assert!(action.get("destination").is_none());
+            assert!(action.get("time").is_none());
+
+            let td = user_typed(
+                network,
+                "usdClassTransfer",
+                usd_class_transfer_message(network, "12.5", to_perp, 99),
+            )
+            .unwrap();
+            assert_eq!(
+                td.resolver
+                    .encode_type("HyperliquidTransaction:UsdClassTransfer")
+                    .unwrap(),
+                "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)"
+            );
+            assert_eq!(td.eip712_signing_hash().unwrap(), hash);
+            if to_perp && matches!(network, Network::Mainnet) {
+                assert_eq!(
+                    format!("{hash:#x}"),
+                    "0x29fa4bdb0a00d2029c823eaa2ec8bee390b0b98e3bb0544085bfc98c47e6b29c",
+                    "fixed vector generated independently with hyperliquid-python-sdk 0.24.0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn usd_class_transfer_directions_and_networks_produce_distinct_hashes() {
+        let (_, to_perp) = usd_class_transfer_hash(Network::Mainnet, "12.5", true, 99).unwrap();
+        let (_, to_spot) = usd_class_transfer_hash(Network::Mainnet, "12.5", false, 99).unwrap();
+        let (_, testnet) = usd_class_transfer_hash(Network::Testnet, "12.5", true, 99).unwrap();
+        let (_, other_amount) =
+            usd_class_transfer_hash(Network::Mainnet, "12.6", true, 99).unwrap();
+        let (_, other_nonce) =
+            usd_class_transfer_hash(Network::Mainnet, "12.5", true, 100).unwrap();
+        for other in [to_spot, testnet, other_amount, other_nonce] {
+            assert_ne!(to_perp, other);
+        }
+        // usdClassTransfer must never collide with a usdSend of the same amount.
+        let destination = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let (_, send) = usd_send_hash(Network::Mainnet, destination, "12.5", 99).unwrap();
+        assert_ne!(to_perp, send);
+    }
+
+    #[test]
+    fn usd_class_transfer_payload_preimage_preserves_the_signing_hash() {
+        for to_perp in [true, false] {
+            let (action, expected) =
+                usd_class_transfer_hash(Network::Testnet, "0.000001", to_perp, 7).unwrap();
+            let (payload_action, payload) =
+                usd_class_transfer_payload(Network::Testnet, "0.000001", to_perp, 7).unwrap();
+            assert_eq!(action, payload_action);
+            assert_eq!(payload.hash, expected);
+            assert_eq!(
+                B256::from_slice(&Keccak256::digest(&payload.preimage)),
+                expected
+            );
+            assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
+        }
+    }
+
+    #[test]
+    fn usd_class_transfer_amounts_reject_negatives_exponents_and_extra_precision() {
+        for bad in [
+            "-1",
+            "+1",
+            "1e6",
+            "1E6",
+            "0",
+            "0.0",
+            "1.0000001",
+            "",
+            " 1",
+            "1 ",
+            "abc",
+            "1.2.3",
+            ".5",
+            // The subaccount suffix form is intentionally unsupported by this route.
+            "1 subaccount:0x0000000000000000000000000000000000000000",
+        ] {
+            assert!(
+                validate_usdc_amount(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["1", "0.000001", "12.5", "1000000.123456"] {
+            assert!(
+                validate_usdc_amount(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+        assert_eq!(usdc_amount_micros("12.5"), Ok(12_500_000));
+    }
+
+    #[test]
     fn approve_agent_hash_matches_official_sdk_vector() {
         let agent = parse_address("0x0000000000000000000000000000000000000002").unwrap();
         let (action, hash) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
@@ -679,6 +972,28 @@ mod tests {
         assert_eq!(
             format!("{hash:#x}"),
             "0x83174cd6237cd6f87b18b95f027955cdf8f19ed616da0843224f9ceb64f1b2ff"
+        );
+    }
+
+    #[test]
+    fn payload_preimages_preserve_official_signing_hashes() {
+        let agent = parse_address("0x0000000000000000000000000000000000000002").unwrap();
+        let (_, expected) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        let (_, payload) =
+            approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        assert_eq!(payload.hash, expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
+        );
+
+        let action = cancel();
+        let expected = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
+        let payload = l1_signing_payload(Network::Mainnet, &action, 123, None, None).unwrap();
+        assert_eq!(payload.hash, expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
         );
     }
 

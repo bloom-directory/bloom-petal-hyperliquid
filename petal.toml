@@ -13,7 +13,7 @@ outputs = ["petal/hyperliquid"]
 summary = "Read Hyperliquid market and account data, submit bounded signed HyperCore actions, and manage agent sessions through Bloom approval."
 
 [caps]
-allowed = ["bloom:http", "bloom:store", "bloom:sign"]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:key.derive"]
 
 [[net.allow]]
 binding = "mainnet"
@@ -28,8 +28,12 @@ methods = ["post"]
 paths = ["/info", "/exchange"]
 
 [sign]
-allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.usd_send", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+
+[[key.derive]]
+route = "[network]/agent_sessions/[wallet]/new.json"
+operation_classes = ["hyperliquid.agent_action"]
 
 [store]
 namespaces = ["state"]
-secret_namespaces = ["secrets"]
+secret_namespaces = ["secrets"] # approval reconciliation only; never key material

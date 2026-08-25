@@ -5,7 +5,10 @@ account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
-`raw_signed.json`, and `usd_send.json`. `send_asset.json` is a deprecated alias
+`raw_signed.json`, `usd_send.json`, and `usd_class_transfer.json`.
+`usd_class_transfer.json` moves USDC between the wallet's own spot and perp
+engines and is owner-only; it is deliberately absent from the delegated agent
+session surface. `send_asset.json` is a deprecated alias
 for `usd_send.json`; it does not implement Hyperliquid's generalized
 `sendAsset` action. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions

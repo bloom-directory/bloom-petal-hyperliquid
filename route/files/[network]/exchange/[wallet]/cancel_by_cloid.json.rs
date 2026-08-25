@@ -1,5 +1,6 @@
 petal::route_file!(
-    spec: petal::write_spec().caps(&["bloom:http", "bloom:store", "bloom:sign"]),
+    spec: petal::signing_write_spec("hyperliquid.cancel_by_cloid")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
             "description": "write a Hyperliquid cancel_by_cloid.json request; signed actions require Bloom approval"
@@ -16,9 +17,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            crate::parse_address(value)
-                .map(|address| format!("{address:#x}"))
-                .map_err(|error| petal::error(-3, error))
+            crate::parse_wallet_id(value).map_err(|error| petal::error(-3, error))
         }) {
             Ok(wallet) => wallet,
             Err(response) => return response,
@@ -40,6 +39,7 @@ petal::route_file!(
             );
         }
         crate::owner_action_write(
+            ctx,
             network,
             wallet,
             "cancel_by_cloid.json",

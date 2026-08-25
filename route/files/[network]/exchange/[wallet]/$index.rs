@@ -8,6 +8,7 @@ petal::route_file!(
         ("update_leverage.json", false, true),
         ("raw_signed.json", false, true),
         ("usd_send.json", false, true),
+        ("usd_class_transfer.json", false, true),
         ("send_asset.json", false, true),
         ("last_response.json", false, false),
     ])
