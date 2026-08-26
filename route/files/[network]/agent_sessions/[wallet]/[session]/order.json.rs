@@ -42,9 +42,9 @@ petal::route_file!(
                 "path_from_session_root": "receipts/<submitted_cloid>/order.json",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
-                "predicate": "receipt cloid equals the submitted order c field and response.response.data.statuses contains a resting object with the same cloid",
+                "predicate": "receipt cloid equals the submitted order c field, request equals that submitted order item, and response.response.data.statuses[0].resting.oid exists",
                 "result": "the correlated resting response confirms venue acceptance and its oid is the venue order id",
-                "notes": "Submit a unique client order id. The create-only receipt is scoped by session, action, and normalized cloid, so it cannot race last_response.json or be overwritten by a later action. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling the exact receipt path for the full timeout."
+                "notes": "Submit a unique client order id. The create-only receipt records the original batch item and item_index, and its response statuses array contains only that item's positional venue status. It is scoped by session, action, and normalized cloid, so it cannot race last_response.json or be overwritten by a later action. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling the exact receipt path for the full timeout."
             }
         }))
     },

@@ -921,19 +921,47 @@ pub fn load_session_receipt(
     load_json(session_receipt_key(n, w, id, cloid, action))
 }
 
-fn correlated_cloids(action: &ExchangeAction) -> Vec<String> {
-    let cloids = match action {
-        ExchangeAction::Order { orders, .. } => orders
-            .iter()
-            .filter_map(|order| order.cloid.as_deref())
-            .collect::<Vec<_>>(),
-        ExchangeAction::CancelByCloid { cancels, .. } => cancels
-            .iter()
-            .map(|cancel| cancel.cloid.as_str())
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    cloids.into_iter().map(str::to_ascii_lowercase).collect()
+#[derive(Debug, PartialEq)]
+struct ReceiptTarget {
+    item_index: usize,
+    cloid: String,
+    request: Value,
+}
+
+fn receipt_targets(action: &ExchangeAction) -> Result<Vec<ReceiptTarget>, DispatchResponse> {
+    let mut targets = Vec::new();
+    match action {
+        ExchangeAction::Order { orders, .. } => {
+            for (item_index, order) in orders.iter().enumerate() {
+                if let Some(cloid) = order.cloid.as_deref() {
+                    targets.push(ReceiptTarget {
+                        item_index,
+                        cloid: cloid.to_ascii_lowercase(),
+                        request: serde_json::to_value(order).map_err(|e| backend(e.to_string()))?,
+                    });
+                }
+            }
+        }
+        ExchangeAction::CancelByCloid { cancels, .. } => {
+            for (item_index, cancel) in cancels.iter().enumerate() {
+                targets.push(ReceiptTarget {
+                    item_index,
+                    cloid: cancel.cloid.to_ascii_lowercase(),
+                    request: serde_json::to_value(cancel).map_err(|e| backend(e.to_string()))?,
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(targets)
+}
+
+fn receipt_item_count(action: &ExchangeAction) -> usize {
+    match action {
+        ExchangeAction::Order { orders, .. } => orders.len(),
+        ExchangeAction::CancelByCloid { cancels, .. } => cancels.len(),
+        _ => 0,
+    }
 }
 
 fn receipt_action(action: &ExchangeAction) -> Option<&'static str> {
@@ -944,34 +972,61 @@ fn receipt_action(action: &ExchangeAction) -> Option<&'static str> {
     }
 }
 
+struct ReceiptBatch<'a> {
+    action: &'a str,
+    item_count: usize,
+    targets: &'a [ReceiptTarget],
+}
+
 fn save_session_receipts(
     n: Network,
     w: &str,
     id: &str,
-    action: &str,
     nonce: u64,
-    cloids: &[String],
+    batch: &ReceiptBatch<'_>,
     response: &Value,
 ) -> Result<(), DispatchResponse> {
-    for cloid in cloids {
+    if batch.targets.is_empty() {
+        return Ok(());
+    }
+    let statuses = response
+        .pointer("/response/data/statuses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| backend("successful receipt-producing response is missing statuses"))?;
+    if statuses.len() != batch.item_count {
+        return Err(backend(format!(
+            "receipt-producing response has {} statuses for {} action items",
+            statuses.len(),
+            batch.item_count
+        )));
+    }
+    for target in batch.targets {
+        let mut correlated_response = response.clone();
+        let correlated_statuses = correlated_response
+            .pointer_mut("/response/data/statuses")
+            .expect("statuses path was validated above");
+        *correlated_statuses = Value::Array(vec![statuses[target.item_index].clone()]);
         let receipt = json!({
             "schema": "bloom.hyperliquid_session_action_receipt.v1",
             "network": if matches!(n, Network::Mainnet) { "mainnet" } else { "testnet" },
             "wallet": w,
             "session_id": id,
-            "action": action,
-            "cloid": cloid,
+            "action": batch.action,
+            "cloid": target.cloid,
             "nonce": nonce,
-            "response": response,
+            "item_index": target.item_index,
+            "request": target.request,
+            "response": correlated_response,
         });
-        let key = session_receipt_key(n, w, id, cloid, action);
+        let key = session_receipt_key(n, w, id, &target.cloid, batch.action);
         match save_json_new(key.clone(), &receipt, false) {
             Ok(()) => {}
             Err(first_error) => match load_json::<Value>(key)? {
                 Some(existing) if existing == receipt => {}
                 Some(_) => {
                     return Err(backend(format!(
-                        "immutable {action} receipt already exists for cloid {cloid}"
+                        "immutable {} receipt already exists for cloid {}",
+                        batch.action, target.cloid
                     )));
                 }
                 None => return Err(first_error),
@@ -1140,7 +1195,11 @@ fn session_submit(
     };
     let action_kind = action.kind();
     let receipt_action = receipt_action(&action);
-    let receipt_cloids = correlated_cloids(&action);
+    let receipt_item_count = receipt_item_count(&action);
+    let receipt_targets = match receipt_targets(&action) {
+        Ok(targets) => targets,
+        Err(e) => return e,
+    };
     let payload = match protocol::exchange_payload(action, nonce, sig, vault_str, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -1152,8 +1211,18 @@ fn session_submit(
                 return backend(e);
             }
             if let Some(receipt_action) = receipt_action
-                && let Err(e) =
-                    save_session_receipts(n, w, id, receipt_action, nonce, &receipt_cloids, &v)
+                && let Err(e) = save_session_receipts(
+                    n,
+                    w,
+                    id,
+                    nonce,
+                    &ReceiptBatch {
+                        action: receipt_action,
+                        item_count: receipt_item_count,
+                        targets: &receipt_targets,
+                    },
+                    &v,
+                )
             {
                 return e;
             }
@@ -2383,22 +2452,37 @@ mod tests {
     fn correlated_receipts_are_action_and_cloid_scoped() {
         let order: ExchangeAction = serde_json::from_value(json!({
             "type": "order",
-            "orders": [{
-                "a": 0,
-                "b": true,
-                "p": "100",
-                "s": "0.1",
-                "r": false,
-                "t": {"limit": {"tif": "Alo"}},
-                "c": "0xAABBCCDDEEFF00112233445566778899"
-            }],
+            "orders": [
+                {
+                    "a": 0,
+                    "b": false,
+                    "p": "101",
+                    "s": "0.1",
+                    "r": false,
+                    "t": {"limit": {"tif": "Ioc"}}
+                },
+                {
+                    "a": 0,
+                    "b": true,
+                    "p": "100",
+                    "s": "0.1",
+                    "r": false,
+                    "t": {"limit": {"tif": "Alo"}},
+                    "c": "0xAABBCCDDEEFF00112233445566778899"
+                }
+            ],
             "grouping": "na"
         }))
         .unwrap();
         assert_eq!(receipt_action(&order), Some("order"));
+        assert_eq!(receipt_item_count(&order), 2);
+        let targets = receipt_targets(&order).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].item_index, 1);
+        assert_eq!(targets[0].cloid, "0xaabbccddeeff00112233445566778899");
         assert_eq!(
-            correlated_cloids(&order),
-            vec!["0xaabbccddeeff00112233445566778899"]
+            targets[0].request["c"],
+            "0xAABBCCDDEEFF00112233445566778899"
         );
         assert_eq!(
             session_receipt_key(
@@ -2420,6 +2504,41 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(receipt_action(&cancel), Some("cancel"));
-        assert_eq!(correlated_cloids(&cancel), correlated_cloids(&order));
+        assert_eq!(receipt_item_count(&cancel), 1);
+        let cancel_targets = receipt_targets(&cancel).unwrap();
+        assert_eq!(cancel_targets[0].item_index, 0);
+        assert_eq!(cancel_targets[0].cloid, targets[0].cloid);
+    }
+
+    #[test]
+    fn correlated_response_contains_only_the_target_items_status() {
+        let response = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"filled": {"oid": 11, "totalSz": "0.1", "avgPx": "101"}},
+                        {"resting": {"oid": 22}}
+                    ]
+                }
+            }
+        });
+        let targets = [ReceiptTarget {
+            item_index: 1,
+            cloid: "0xaabbccddeeff00112233445566778899".into(),
+            request: json!({"c": "0xAABBCCDDEEFF00112233445566778899"}),
+        }];
+        let statuses = response
+            .pointer("/response/data/statuses")
+            .and_then(Value::as_array)
+            .unwrap();
+        let mut correlated = response.clone();
+        *correlated.pointer_mut("/response/data/statuses").unwrap() =
+            Value::Array(vec![statuses[targets[0].item_index].clone()]);
+        assert_eq!(
+            correlated.pointer("/response/data/statuses"),
+            Some(&json!([{"resting": {"oid": 22}}]))
+        );
     }
 }
