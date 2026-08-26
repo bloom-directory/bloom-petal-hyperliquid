@@ -978,6 +978,162 @@ struct ReceiptBatch<'a> {
     targets: &'a [ReceiptTarget],
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ReceiptReservation {
+    schema: String,
+    action: String,
+    cloid: String,
+    nonce: u64,
+    item_index: usize,
+    request: Value,
+    operation_digest: String,
+}
+
+fn session_receipt_reservation_key(
+    n: Network,
+    w: &str,
+    id: &str,
+    cloid: &str,
+    action: &str,
+) -> String {
+    session_key(
+        n,
+        w,
+        id,
+        &format!(
+            "receipt_reservations/{}/{action}.json",
+            cloid.to_ascii_lowercase()
+        ),
+    )
+}
+
+fn session_receipt_submission_key(
+    n: Network,
+    w: &str,
+    id: &str,
+    cloid: &str,
+    action: &str,
+) -> String {
+    session_key(
+        n,
+        w,
+        id,
+        &format!(
+            "receipt_reservations/{}/{action}.submitted.json",
+            cloid.to_ascii_lowercase()
+        ),
+    )
+}
+
+fn receipt_reservations(
+    nonce: u64,
+    operation_digest: &str,
+    batch: &ReceiptBatch<'_>,
+) -> Vec<ReceiptReservation> {
+    batch
+        .targets
+        .iter()
+        .map(|target| ReceiptReservation {
+            schema: "bloom.hyperliquid_session_action_receipt_reservation.v1".into(),
+            action: batch.action.into(),
+            cloid: target.cloid.clone(),
+            nonce,
+            item_index: target.item_index,
+            request: target.request.clone(),
+            operation_digest: operation_digest.into(),
+        })
+        .collect()
+}
+
+fn receipt_matches_reservation(receipt: &Value, reservation: &ReceiptReservation) -> bool {
+    receipt.get("action") == Some(&Value::String(reservation.action.clone()))
+        && receipt.get("cloid") == Some(&Value::String(reservation.cloid.clone()))
+        && receipt.get("nonce") == Some(&Value::from(reservation.nonce))
+        && receipt.get("item_index") == Some(&Value::from(reservation.item_index))
+        && receipt.get("request") == Some(&reservation.request)
+}
+
+fn reserve_session_receipts(
+    n: Network,
+    w: &str,
+    id: &str,
+    reservations: &[ReceiptReservation],
+) -> Result<bool, DispatchResponse> {
+    if reservations.is_empty() {
+        return Ok(false);
+    }
+
+    let mut finalized = 0;
+    for reservation in reservations {
+        let receipt_key = session_receipt_key(n, w, id, &reservation.cloid, &reservation.action);
+        if let Some(receipt) = load_json::<Value>(receipt_key)? {
+            let reservation_key =
+                session_receipt_reservation_key(n, w, id, &reservation.cloid, &reservation.action);
+            let stored_reservation = load_json::<ReceiptReservation>(reservation_key)?;
+            if stored_reservation.as_ref() != Some(reservation)
+                || !receipt_matches_reservation(&receipt, reservation)
+            {
+                return Err(backend(format!(
+                    "immutable {} receipt already exists for cloid {}",
+                    reservation.action, reservation.cloid
+                )));
+            }
+            finalized += 1;
+        }
+    }
+    if finalized == reservations.len() {
+        return Ok(true);
+    }
+    if finalized != 0 {
+        return Err(backend(
+            "receipt batch is only partially finalized; refusing to resubmit",
+        ));
+    }
+
+    for reservation in reservations {
+        let key =
+            session_receipt_reservation_key(n, w, id, &reservation.cloid, &reservation.action);
+        match save_json_new(key.clone(), reservation, false) {
+            Ok(()) => {}
+            Err(first_error) => match load_json::<ReceiptReservation>(key)? {
+                Some(existing) if existing == *reservation => {}
+                Some(_) => {
+                    return Err(backend(format!(
+                        "{} receipt cloid {} is reserved by a different action",
+                        reservation.action, reservation.cloid
+                    )));
+                }
+                None => return Err(first_error),
+            },
+        }
+    }
+    Ok(false)
+}
+
+fn mark_session_receipt_submission(
+    n: Network,
+    w: &str,
+    id: &str,
+    reservations: &[ReceiptReservation],
+) -> Result<(), DispatchResponse> {
+    for reservation in reservations {
+        let key = session_receipt_submission_key(n, w, id, &reservation.cloid, &reservation.action);
+        match save_json_new(key.clone(), reservation, false) {
+            Ok(()) => {}
+            Err(first_error) => match load_json::<ReceiptReservation>(key)? {
+                Some(_) => {
+                    return Err(backend(format!(
+                        "{} receipt submission was already attempted for cloid {}; refusing a possible duplicate",
+                        reservation.action, reservation.cloid
+                    )));
+                }
+                None => return Err(first_error),
+            },
+        }
+    }
+    Ok(())
+}
+
 fn save_session_receipts(
     n: Network,
     w: &str,
@@ -1165,6 +1321,37 @@ fn session_submit(
     if completed {
         return ok_write();
     }
+    let action_kind = action.kind();
+    let receipt_action = receipt_action(&action);
+    let receipt_item_count = receipt_item_count(&action);
+    let receipt_targets = match receipt_targets(&action) {
+        Ok(targets) => targets,
+        Err(e) => return e,
+    };
+    let receipt_batch = receipt_action.map(|action| ReceiptBatch {
+        action,
+        item_count: receipt_item_count,
+        targets: &receipt_targets,
+    });
+    let operation_digest = match session_operation_digest(&action, vault_str.as_deref(), expires) {
+        Ok(digest) => digest,
+        Err(e) => return e,
+    };
+    let receipt_reservations = receipt_batch.as_ref().map_or_else(Vec::new, |batch| {
+        receipt_reservations(nonce, &operation_digest, batch)
+    });
+    match reserve_session_receipts(n, w, id, &receipt_reservations) {
+        Ok(true) => {
+            if let Some(key) = operation_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            return ok_write();
+        }
+        Ok(false) => {}
+        Err(e) => return e,
+    }
     let signing_payload = match protocol::l1_signing_payload(n, &action, nonce, vault, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -1193,36 +1380,21 @@ fn session_submit(
         }
         Err(e) => return denied(format!("agent signing denied: {e}")),
     };
-    let action_kind = action.kind();
-    let receipt_action = receipt_action(&action);
-    let receipt_item_count = receipt_item_count(&action);
-    let receipt_targets = match receipt_targets(&action) {
-        Ok(targets) => targets,
-        Err(e) => return e,
-    };
     let payload = match protocol::exchange_payload(action, nonce, sig, vault_str, expires) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
+    if let Err(e) = mark_session_receipt_submission(n, w, id, &receipt_reservations) {
+        return e;
+    }
     match http_json(n, "/exchange", payload) {
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 record_session_error(n, w, id, s, nonce, action_kind, &e);
                 return backend(e);
             }
-            if let Some(receipt_action) = receipt_action
-                && let Err(e) = save_session_receipts(
-                    n,
-                    w,
-                    id,
-                    nonce,
-                    &ReceiptBatch {
-                        action: receipt_action,
-                        item_count: receipt_item_count,
-                        targets: &receipt_targets,
-                    },
-                    &v,
-                )
+            if let Some(receipt_batch) = receipt_batch
+                && let Err(e) = save_session_receipts(n, w, id, nonce, &receipt_batch, &v)
             {
                 return e;
             }
@@ -2539,6 +2711,54 @@ mod tests {
         assert_eq!(
             correlated.pointer("/response/data/statuses"),
             Some(&json!([{"resting": {"oid": 22}}]))
+        );
+    }
+
+    #[test]
+    fn receipt_reservations_bind_the_full_operation_and_match_final_receipts() {
+        let targets = [ReceiptTarget {
+            item_index: 1,
+            cloid: "0xaabbccddeeff00112233445566778899".into(),
+            request: json!({"c": "0xAABBCCDDEEFF00112233445566778899"}),
+        }];
+        let batch = ReceiptBatch {
+            action: "order",
+            item_count: 2,
+            targets: &targets,
+        };
+        let reservations = receipt_reservations(123, "operation-digest", &batch);
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].operation_digest, "operation-digest");
+        assert!(receipt_matches_reservation(
+            &json!({
+                "action": "order",
+                "cloid": "0xaabbccddeeff00112233445566778899",
+                "nonce": 123,
+                "item_index": 1,
+                "request": {"c": "0xAABBCCDDEEFF00112233445566778899"},
+                "response": {"status": "ok"}
+            }),
+            &reservations[0]
+        ));
+        assert!(!receipt_matches_reservation(
+            &json!({
+                "action": "order",
+                "cloid": "0xaabbccddeeff00112233445566778899",
+                "nonce": 124,
+                "item_index": 1,
+                "request": {"c": "0xAABBCCDDEEFF00112233445566778899"}
+            }),
+            &reservations[0]
+        ));
+        assert_eq!(
+            session_receipt_reservation_key(
+                Network::Mainnet,
+                "wallet",
+                "session",
+                "0xAABBCCDDEEFF00112233445566778899",
+                "order"
+            ),
+            "state/sessions/mainnet/wallet/session/receipt_reservations/0xaabbccddeeff00112233445566778899/order.json"
         );
     }
 }
