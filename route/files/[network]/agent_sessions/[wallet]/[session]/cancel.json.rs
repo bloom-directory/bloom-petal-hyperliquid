@@ -29,10 +29,11 @@ petal::route_file!(
             "success_evidence": {
                 "source": "live_venue_state",
                 "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "correlated_receipt_path_from_session_root": "receipts/<canceled_cloid>/cancel.json (cancelByCloid only)",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
                 "predicate": "no open-order entry has the canceled oid or cloid",
-                "notes": "Read owner_address from session.json. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout until the predicate matches. Do not use last_response.json as evidence for the current action."
+                "notes": "Read owner_address from session.json. For cancelByCloid, first correlate venue acceptance through the immutable cancel receipt, then confirm absence in live open orders. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout."
             }
         }))
     },

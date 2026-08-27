@@ -48,7 +48,7 @@ jobs:
         run: cargo install wasm-tools --version 1.249.0 --locked
 
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev 61938d0c127cfe03c7e3e55baed0ba1439bc5ca2 --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 864a80b407387871bae06aabe77b91865e55f7bc --locked bloom-petal-cli
 
       - name: Build source package
         run: scripts/build.sh
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/petal
-          ref: 61938d0c127cfe03c7e3e55baed0ba1439bc5ca2
+          ref: 864a80b407387871bae06aabe77b91865e55f7bc
           path: .petal-tooling
           persist-credentials: false
 
@@ -75,13 +75,13 @@ jobs:
           "$RUNNER_TEMP/petal" package \
             --root . \
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
-            | jq -e '.routes == 66'
+            | jq -e '.routes == 70'
 
       - name: Check out exact Bloom package contract
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom
-          ref: 058e2db03672adf3e02e527bdf09a726d9e4cef0
+          ref: eb0e3733224b872a1cf4eebd461bd09a20bda745
           path: .bloom-contract
           persist-credentials: false
 

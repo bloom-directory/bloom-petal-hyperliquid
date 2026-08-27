@@ -195,7 +195,7 @@ impl ExchangeAction {
                     return Err("omit f when false".into());
                 };
                 for c in cancels {
-                    cloid(&c.cloid)?;
+                    validate_cloid(&c.cloid)?;
                 }
             }
             Self::ScheduleCancel { .. } => {}
@@ -231,7 +231,7 @@ impl OrderWire {
         decimal("price", &self.price)?;
         decimal("size", &self.size)?;
         if let Some(c) = &self.cloid {
-            cloid(c)?;
+            validate_cloid(c)?;
         }
         match (&self.order_type.limit, &self.order_type.trigger) {
             (Some(_), None) => {}
@@ -340,7 +340,7 @@ pub fn parse_address(raw: &str) -> Result<Address, String> {
     };
     raw.parse().map_err(|e| format!("address: {e}"))
 }
-fn cloid(raw: &str) -> Result<(), String> {
+pub fn validate_cloid(raw: &str) -> Result<(), String> {
     if raw.len() != 34 || !raw.starts_with("0x") || !raw[2..].chars().all(|c| c.is_ascii_hexdigit())
     {
         Err("cloid must be a 34-character 0x hex string".into())
