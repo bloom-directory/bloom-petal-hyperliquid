@@ -33,7 +33,7 @@ petal::route_file!(
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
                 "predicate": "no open-order entry has the canceled oid or cloid",
-                "notes": "Read owner_address from session.json. For cancelByCloid, first correlate venue acceptance through the immutable cancel receipt, then confirm absence in live open orders. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds; keep polling for the full timeout."
+                "notes": "Read owner_address from session.json. For cancelByCloid, first correlate venue acceptance through the immutable cancel receipt, then confirm absence in live open orders. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds. The correlated receipt path normally returns not-found until dispatch completes; treat that as pending, wait poll_interval_ms, and retry the same exact path until it exists or timeout_ms expires."
             }
         }))
     },
