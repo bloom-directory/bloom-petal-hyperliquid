@@ -4,33 +4,15 @@ use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
-const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
-    (
-        "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-        "r000008",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-        "r000009",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/close_all",
-        "r000010",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/order.json",
-        "r000013",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-        "r000019",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
-        "r000023",
-    ),
+const SESSION_ACTION_ROUTES: &[&str] = &[
+    "[network]/agent_sessions/[wallet]/[session]/cancel.json",
+    "[network]/agent_sessions/[wallet]/[session]/cancel_all",
+    "[network]/agent_sessions/[wallet]/[session]/close_all",
+    "[network]/agent_sessions/[wallet]/[session]/order.json",
+    "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
+    "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000025");
+const DERIVATION_ROUTE: &str = "[network]/agent_sessions/[wallet]/new.json";
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/cancel.json",
@@ -101,9 +83,8 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let routes = routes_by_pattern(&package);
 
     let derivation = routes
-        .get(DERIVATION_ROUTE.0)
+        .get(DERIVATION_ROUTE)
         .expect("agent-session derivation route");
-    assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
     assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
@@ -118,6 +99,20 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
             "bloom:store",
         ]
     );
+    let mut expected_scope = SESSION_ACTION_ROUTES
+        .iter()
+        .map(|pattern| routes[*pattern].route_id.as_str())
+        .chain(std::iter::once(derivation.route_id.as_str()))
+        .collect::<Vec<_>>();
+    expected_scope.sort_unstable();
+    assert_eq!(
+        derivation
+            .key_derive_allowed_routes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected_scope
+    );
 
     let delegated_routes = package
         .route_index
@@ -126,13 +121,12 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .filter(|route| !route.key_derive_operation_classes.is_empty())
         .map(|route| route.pattern.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(delegated_routes, [DERIVATION_ROUTE.0]);
+    assert_eq!(delegated_routes, [DERIVATION_ROUTE]);
 
-    for (pattern, route_id) in SESSION_ACTION_ROUTES {
+    for pattern in SESSION_ACTION_ROUTES {
         let route = routes
             .get(pattern)
             .unwrap_or_else(|| panic!("missing {pattern}"));
-        assert_eq!(&route.route_id, route_id, "{pattern}");
         assert_eq!(
             route.install_metadata.sign_intent.as_deref(),
             Some(AGENT_ACTION_INTENT),
@@ -153,7 +147,7 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         agent_action_routes,
         SESSION_ACTION_ROUTES
             .iter()
-            .map(|(pattern, _)| *pattern)
+            .copied()
             .collect::<Vec<_>>()
     );
 
