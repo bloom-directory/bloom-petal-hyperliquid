@@ -41,6 +41,8 @@ allowed_routes = [
   "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
   "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
 ]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 86400000
 
 [store]
 namespaces = ["state"]

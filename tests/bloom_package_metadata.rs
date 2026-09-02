@@ -113,6 +113,15 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
             .collect::<Vec<_>>(),
         expected_scope
     );
+    assert!(derivation.key_derive_scope_declared);
+    assert_eq!(
+        derivation.key_derive_allowed_crypto_suites,
+        ["secp256k1-keccak256-recoverable"]
+    );
+    assert_eq!(
+        derivation.key_derive_maximum_lifetime_ms,
+        Some(86_400_000)
+    );
 
     let delegated_routes = package
         .route_index
