@@ -20,6 +20,12 @@ order or cancel-by-CLOID response without racing the session's mutable
 `send_asset.json` remains as a compatibility alias and does not implement
 Hyperliquid's distinct generalized `sendAsset` action.
 
+Session actions that accept structured request bodies use JSON leaves, including
+`order.json`, `cancel.json`, and `update_leverage.json`. Lifecycle cleanup uses
+extensionless command leaves: `cancel_all`, `close_all`, and `stop`. Read each
+leaf before writing and use its exact path; do not append `.json` to a command
+leaf.
+
 Session key provisioning remains pending through two Bloom authority steps:
 the key-derivation custody ceremony and one reusable Sealed Approval covering
 the typed session-action routes declared in the immutable key scope. Machine
