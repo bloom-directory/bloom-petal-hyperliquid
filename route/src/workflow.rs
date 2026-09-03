@@ -5,6 +5,7 @@ use sha2::Sha256;
 use sha3::Digest;
 
 use crate::protocol::{self, ExchangeAction, Network, SignSubmit};
+use crate::settings;
 use petal::{
     Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
     SignSelector,
@@ -50,6 +51,62 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+
+    /// An order that carries a per-order builder fee pays it to a third-party
+    /// address the caller chose, so it is a real economic effect the owner's
+    /// approval ceremony must see rather than `{"kind":"none"}`. Broker's
+    /// `DeclaredFee` is a closed schema (`{"kind":"none"}` or
+    /// `{"kind":"fee","chain","asset","amount"}`, `amount` a plain integer
+    /// string) with no field for the fee's recipient, so the builder address
+    /// itself cannot be carried here — only what will be charged.
+    fn builder_order_fee(fee_micros: u64) -> Self {
+        Self {
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": fee_micros.to_string(),
+            }),
+        }
+    }
+}
+
+/// Computes the claim effect for an owner- or session-signed order action,
+/// naming the builder's fee exactly when the order carries one so it is never
+/// signed under `ClaimEffects::none()`. The declared amount is a conservative
+/// (rounded up) estimate of `notional * fee_tenths_bps`, using the same `f64`
+/// notional computation already used for the session `max_notional_usd`
+/// check, since Broker's claim only needs an owner-facing estimate — the
+/// venue itself computes and deducts the exact fee from the fill.
+fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(ClaimEffects::none());
+    };
+    protocol::parse_address(&builder.address)?;
+    let notional: f64 = orders
+        .iter()
+        .filter(|o| !o.reduce_only)
+        .map(|o| {
+            let price = o.price.parse::<f64>().unwrap_or(f64::INFINITY);
+            let size = o.size.parse::<f64>().unwrap_or(f64::INFINITY);
+            price * size
+        })
+        .sum();
+    let fee_micros = if notional.is_finite() && notional > 0.0 {
+        (notional * 1_000_000.0 * f64::from(builder.fee_tenths_bps) / 100_000.0)
+            .ceil()
+            .clamp(0.0, u64::MAX as f64) as u64
+    } else {
+        0
+    };
+    Ok(ClaimEffects::builder_order_fee(fee_micros))
 }
 
 fn ok_write() -> DispatchResponse {
@@ -382,6 +439,10 @@ pub fn owner_action_write(
             Ok(h) => h,
             Err(e) => return invalid(e),
         };
+    let effects = match order_claim_effects(&req.action) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
     let sig = match owner_sign_or_approval(
         ctx,
         &w,
@@ -391,7 +452,7 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            effects: ClaimEffects::none(),
+            effects,
         },
     ) {
         Ok(sig) => sig,
@@ -723,6 +784,164 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+fn builder_address_override_key() -> String {
+    state_key(&["settings", "builder-address"])
+}
+
+/// Reads the operator-set builder-address override, if any. Stored as plain
+/// UTF-8 bytes, not JSON, in the "state" namespace — a builder address is
+/// public data, not a credential, so it does not belong in the secret store.
+fn builder_address_override() -> Result<Option<String>, DispatchResponse> {
+    let bytes = load_bytes(&builder_address_override_key())?;
+    Ok(bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Reports which builder address `approve_builder_fee.json` would use as its
+/// default today, and why, for `settings/status.json`.
+pub fn builder_address_status() -> Result<settings::BuilderAddressStatus, DispatchResponse> {
+    let store_override = builder_address_override()?;
+    Ok(settings::default_builder_address_status(
+        store_override.as_deref(),
+    ))
+}
+
+/// Sets or clears the operator-set builder-address override for
+/// `settings/builder-address`. An empty body clears the override, reverting
+/// to this release's embedded default, if any.
+pub fn set_builder_address_override(body: &[u8]) -> DispatchResponse {
+    let text = match std::str::from_utf8(body) {
+        Ok(x) => x.trim(),
+        Err(_) => return invalid("builder address must be UTF-8"),
+    };
+    let key = builder_address_override_key();
+    if text.is_empty() {
+        return match petal::sdk::store_del(&key) {
+            Ok(()) => ok_write(),
+            Err(e) => backend(e.message()),
+        };
+    }
+    if let Err(e) = protocol::parse_address(text) {
+        return invalid(e);
+    }
+    // Required lowercase for the same reason as the per-order and approval
+    // builder fields: a stored override must match what orders will send
+    // byte-for-byte, never silently normalized.
+    if text != text.to_ascii_lowercase() {
+        return invalid("builder address must be lowercase");
+    }
+    match petal::sdk::store_put(&key, text.as_bytes(), false) {
+        Ok(()) => ok_write(),
+        Err(e) => backend(e.message()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveBuilderFee {
+    #[serde(default)]
+    builder: Option<String>,
+    max_fee_tenths_bps: u32,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+/// Approves a maximum builder fee for a builder address. Hyperliquid requires
+/// this to be signed by the main wallet, so — like `usd_class_transfer` — it
+/// is deliberately absent from the delegated agent session surface: it is
+/// reached only through `owner_sign_or_approval`, never through a session's
+/// Signer-owned key.
+pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<ApproveBuilderFee>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid approve_builder_fee body: {e}")),
+    };
+    let store_override = match builder_address_override() {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let resolved_builder = match settings::resolve_default_builder_address(
+        req.builder.as_deref(),
+        store_override.as_deref(),
+    ) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let builder = match protocol::parse_address(&resolved_builder) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    // The per-order builder field is required lowercase so it matches this
+    // approval byte-for-byte; require the approval's address the same way
+    // rather than silently normalizing it, so the two can never drift.
+    if resolved_builder != resolved_builder.to_ascii_lowercase() {
+        return invalid("builder address must be lowercase");
+    }
+    if req.max_fee_tenths_bps == 0
+        || req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS
+    {
+        return invalid(format!(
+            "max_fee_tenths_bps must be 1..={}",
+            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS
+        ));
+    }
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "approve_builder_fee.json", body, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    if completed {
+        return ok_write();
+    }
+    let max_fee_rate = protocol::builder_fee_max_rate_string(req.max_fee_tenths_bps);
+    let (action, payload) =
+        match protocol::approve_builder_fee_payload(n, builder, &max_fee_rate, nonce) {
+            Ok(x) => x,
+            Err(e) => return invalid(e),
+        };
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.approve_builder_fee",
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "approve_builder_fee",
+            // Approving a cap charges nothing by itself — only a later order
+            // that actually carries a builder fee has an effect to declare —
+            // and Broker's DeclaredFee schema has no field for a bare ceiling
+            // in any case (only `{"kind":"fee",...}` or `{"kind":"none"}`).
+            effects: ClaimEffects::none(),
+        },
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            if let Err(e) = protocol::validate_exchange_response(&v) {
+                return backend(e);
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            ok_write()
+        }
+        Err(e) => e,
+    }
+}
 fn approval(kind: &str, v: &Value) -> DispatchResponse {
     denied(format!("approval required for {kind}: {}", safe_json(v)))
 }
@@ -756,6 +975,8 @@ pub struct Session {
     pub max_notional_usd: Option<String>,
     pub max_leverage: Option<u32>,
     pub assets: Vec<String>,
+    pub builder_address: Option<String>,
+    pub max_builder_fee_tenths_bps: Option<u32>,
     pub stopped: bool,
     pub last_response: Option<Value>,
     pub last_error: Option<String>,
@@ -818,6 +1039,10 @@ struct NewSession {
     #[serde(default)]
     assets: Vec<String>,
     #[serde(default)]
+    builder_address: Option<String>,
+    #[serde(default)]
+    max_builder_fee_tenths_bps: Option<u32>,
+    #[serde(default)]
     nonce: Option<u64>,
 }
 
@@ -844,6 +1069,29 @@ fn session_preflight(req: &NewSession) -> Result<String, String> {
         .is_some_and(|value| !(1..=50).contains(&value))
     {
         return Err("max_leverage must be 1..=50".into());
+    }
+    match (&req.builder_address, req.max_builder_fee_tenths_bps) {
+        (Some(address), Some(fee)) => {
+            protocol::parse_address(address)?;
+            if address != &address.to_ascii_lowercase() {
+                return Err("builder_address must be lowercase".into());
+            }
+            // Delegated sessions never submit spot orders (session_policy
+            // rejects spot asset ids unconditionally), so the session-level
+            // bound is capped at the perp venue ceiling.
+            if fee == 0 || fee > protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS {
+                return Err(format!(
+                    "max_builder_fee_tenths_bps must be 1..={}",
+                    protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "builder_address and max_builder_fee_tenths_bps must be set together".into(),
+            );
+        }
     }
     valid_session_id(&req.id)?;
     let agent_name = req
@@ -1356,6 +1604,10 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
+    let effects = match order_claim_effects(&action) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
     let sig = match sign_payload(
         ctx,
         w,
@@ -1363,7 +1615,7 @@ fn session_submit(
         "hyperliquid.agent_action",
         None,
         Some(s.key_ref_jcs.clone()),
-        ClaimEffects::none(),
+        effects,
     ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
@@ -1744,7 +1996,7 @@ fn session_allows_asset(session: &Session, asset: u32) -> bool {
 }
 fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     a.validate()?;
-    let is_perpetual = |asset: u32| asset < 10_000;
+    let is_perpetual = |asset: u32| asset < protocol::SPOT_ASSET_ID_OFFSET;
     let all_perpetual = match a {
         ExchangeAction::Order { orders, .. } => orders.iter().all(|o| is_perpetual(o.asset)),
         ExchangeAction::Cancel { cancels, .. } => cancels.iter().all(|o| is_perpetual(o.asset)),
@@ -1797,6 +2049,23 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         };
         if !all_allowed {
             return Err("asset is outside the session allow-list".into());
+        }
+    }
+    // A per-order builder fee routes venue fee revenue to a third-party address
+    // the agent chooses, so it is bounded like notional, leverage, and assets
+    // are: an agent may only ever use the single builder and fee ceiling the
+    // owner approved when the session was created.
+    if let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = a
+    {
+        match (&s.builder_address, s.max_builder_fee_tenths_bps) {
+            (Some(allowed), Some(cap))
+                if *allowed == builder.address && builder.fee_tenths_bps <= cap => {}
+            _ => {
+                return Err("builder fee is outside the session's approved builder bound".into());
+            }
         }
     }
     Ok(())
@@ -2014,6 +2283,8 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         max_notional_usd: req.max_notional_usd,
         max_leverage: req.max_leverage,
         assets: session_assets,
+        builder_address: req.builder_address,
+        max_builder_fee_tenths_bps: req.max_builder_fee_tenths_bps,
         stopped: false,
         last_response: None,
         last_error: None,
@@ -2227,6 +2498,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: Some(3),
             assets: vec!["0".into()],
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             stopped: false,
             last_response: None,
             last_error: None,
@@ -2256,6 +2529,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: None,
             assets: Vec::new(),
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             nonce: None,
         };
         assert_eq!(
@@ -2316,6 +2591,78 @@ mod tests {
             })]
         );
         assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    fn order_action_with_builder(address: &str, fee_tenths_bps: u32) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na",
+            "builder": {"b": address, "f": fee_tenths_bps}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn order_claim_effects_name_the_builder_and_fee_only_when_present() {
+        let cancel = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+            fast: None,
+        };
+        assert_eq!(order_claim_effects(&cancel).unwrap(), ClaimEffects::none());
+
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(
+            order_claim_effects(&plain_order).unwrap(),
+            ClaimEffects::none()
+        );
+
+        // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
+        let builder_order =
+            order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+        let effects = order_claim_effects(&builder_order).unwrap();
+        assert!(effects.declared_debits.is_empty());
+        assert!(effects.declared_destinations.is_empty());
+        assert_eq!(
+            effects.declared_fee,
+            json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": "100",
+            })
+        );
+    }
+
+    #[test]
+    fn order_claim_effects_fee_excludes_reduce_only_orders_from_notional() {
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 0, "b": true, "p": "100", "s": "0.01", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+                {"a": 0, "b": false, "p": "1000000", "s": "1000000", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+            ],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        // Only the non-reduce-only leg counts, matching the same exclusion
+        // session_policy's max_notional_usd check already applies.
+        assert_eq!(
+            order_claim_effects(&action).unwrap().declared_fee,
+            json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "100"})
+        );
     }
 
     #[test]
@@ -2419,6 +2766,123 @@ mod tests {
         assert_eq!(
             session_policy(&bounded_session(), &excessive_leverage),
             Err("requested leverage exceeds session bound".into())
+        );
+    }
+
+    #[test]
+    fn session_policy_enforces_the_session_builder_bound() {
+        let mut session = bounded_session();
+        let order = order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+
+        // no builder bound configured on the session: rejected outright
+        assert_eq!(
+            session_policy(&session, &order),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        session.builder_address = Some("0x0000000000000000000000000000000000000001".into());
+        session.max_builder_fee_tenths_bps = Some(10);
+        // matching address, fee at the session cap: accepted
+        assert_eq!(session_policy(&session, &order), Ok(()));
+
+        // fee above the session's cap (but within the venue cap): rejected
+        let over_cap = order_action_with_builder("0x0000000000000000000000000000000000000001", 11);
+        assert_eq!(
+            session_policy(&session, &over_cap),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // a different builder address: rejected even though the fee is in range
+        let other_builder =
+            order_action_with_builder("0x0000000000000000000000000000000000000002", 5);
+        assert_eq!(
+            session_policy(&session, &other_builder),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // an order without a builder is unaffected by the bound
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_policy(&session, &plain_order), Ok(()));
+    }
+
+    #[test]
+    fn session_preflight_enforces_builder_bound_pairing_case_and_cap() {
+        fn request(
+            builder_address: Option<&str>,
+            max_builder_fee_tenths_bps: Option<u32>,
+        ) -> NewSession {
+            NewSession {
+                id: "session".into(),
+                duration_ms: None,
+                agent_name: None,
+                max_notional_usd: None,
+                max_leverage: None,
+                assets: Vec::new(),
+                builder_address: builder_address.map(str::to_owned),
+                max_builder_fee_tenths_bps,
+                nonce: None,
+            }
+        }
+
+        // neither field set: fine, no builder bound
+        assert!(session_preflight(&request(None, None)).is_ok());
+
+        // set together, within the perp venue cap: fine
+        assert!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(100)
+            ))
+            .is_ok()
+        );
+
+        // only one of the pair set: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                None
+            )),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+        assert_eq!(
+            session_preflight(&request(None, Some(10))),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+
+        // uppercase address: rejected (the "0x" prefix must stay intact)
+        let checksummed = format!(
+            "0x{}",
+            "000000000000000000000000000000000000000a".to_ascii_uppercase()
+        );
+        assert_eq!(
+            session_preflight(&request(Some(checksummed.as_str()), Some(10))),
+            Err("builder_address must be lowercase".into())
+        );
+
+        // above the perp venue cap (sessions never submit spot orders): rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(101)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
+        );
+
+        // zero: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(0)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
         );
     }
 

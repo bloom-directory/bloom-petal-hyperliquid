@@ -173,10 +173,19 @@ impl ExchangeAction {
                     if builder.address != builder.address.to_ascii_lowercase() {
                         return Err("builder address must be lowercase".into());
                     }
-                    return Err(
-                        "builder fees are unsupported until they can be represented exactly in the authorization claim"
-                            .into(),
-                    );
+                    if builder.fee_tenths_bps == 0 {
+                        return Err("builder fee must be greater than zero".into());
+                    }
+                    let cap = if orders.iter().all(|o| o.asset < SPOT_ASSET_ID_OFFSET) {
+                        MAX_PERP_BUILDER_FEE_TENTHS_BPS
+                    } else {
+                        MAX_SPOT_BUILDER_FEE_TENTHS_BPS
+                    };
+                    if builder.fee_tenths_bps > cap {
+                        return Err(format!(
+                            "builder fee exceeds the venue cap of {cap} tenths of a basis point for this order's asset type"
+                        ));
+                    }
                 }
             }
             Self::Cancel { cancels, fast } => {
@@ -250,6 +259,15 @@ pub enum Grouping {
     #[serde(rename = "positionTpsl")]
     PositionTpsl,
 }
+/// Perpetual asset ids are below this offset; spot asset ids are at or above it.
+pub const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
+/// Hyperliquid's venue-enforced builder fee ceiling for perpetual orders
+/// (0.1%), expressed in tenths of a basis point, the unit of `BuilderFee::f`.
+pub const MAX_PERP_BUILDER_FEE_TENTHS_BPS: u32 = 100;
+/// Hyperliquid's venue-enforced builder fee ceiling for spot orders (1%),
+/// expressed in tenths of a basis point, the unit of `BuilderFee::f`.
+pub const MAX_SPOT_BUILDER_FEE_TENTHS_BPS: u32 = 1_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuilderFee {
@@ -373,6 +391,25 @@ fn decimal(name: &str, raw: &str) -> Result<(), String> {
     }
 }
 
+/// Renders a builder fee expressed in tenths of a basis point (the `f` unit
+/// used everywhere else in this Petal) as the percent string Hyperliquid's
+/// `approveBuilderFee` action expects for `maxFeeRate` (e.g. `f = 1` is the
+/// official SDK's `"0.001%"`). Pure integer math keeps this exact: `f` tenths
+/// of a bp is `f / 1000` percent.
+pub fn builder_fee_max_rate_string(fee_tenths_bps: u32) -> String {
+    let whole = fee_tenths_bps / 1_000;
+    let frac = fee_tenths_bps % 1_000;
+    if frac == 0 {
+        format!("{whole}%")
+    } else {
+        let mut frac_digits = format!("{frac:03}");
+        while frac_digits.ends_with('0') {
+            frac_digits.pop();
+        }
+        format!("{whole}.{frac_digits}%")
+    }
+}
+
 pub fn action_hash(
     action: &ExchangeAction,
     nonce: u64,
@@ -433,6 +470,10 @@ fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData,
         "usdClassTransfer" => (
             "UsdClassTransfer",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"amount","type":"string"},{"name":"toPerp","type":"bool"},{"name":"nonce","type":"uint64"}]),
+        ),
+        "approveBuilderFee" => (
+            "ApproveBuilderFee",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"maxFeeRate","type":"string"},{"name":"builder","type":"address"},{"name":"nonce","type":"uint64"}]),
         ),
         _ => return Err("unsupported user action".into()),
     };
@@ -538,6 +579,49 @@ pub fn usd_class_transfer_payload(
     let payload = typed_signing_payload(&user_typed(network, "usdClassTransfer", msg)?)?;
     Ok((
         usd_class_transfer_action(network, amount, to_perp, nonce),
+        payload,
+    ))
+}
+fn approve_builder_fee_message(
+    network: Network,
+    builder: Address,
+    max_fee_rate: &str,
+    nonce: u64,
+) -> Value {
+    json!({"hyperliquidChain":network.chain(),"maxFeeRate":max_fee_rate,"builder":format!("{builder:#x}"),"nonce":nonce})
+}
+fn approve_builder_fee_action(
+    network: Network,
+    builder: Address,
+    max_fee_rate: &str,
+    nonce: u64,
+) -> Value {
+    json!({"type":"approveBuilderFee","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"maxFeeRate":max_fee_rate,"builder":format!("{builder:#x}"),"nonce":nonce})
+}
+pub fn approve_builder_fee_hash(
+    network: Network,
+    builder: Address,
+    max_fee_rate: &str,
+    nonce: u64,
+) -> Result<(Value, B256), String> {
+    let msg = approve_builder_fee_message(network, builder, max_fee_rate, nonce);
+    let td = user_typed(network, "approveBuilderFee", msg)?;
+    let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
+    Ok((
+        approve_builder_fee_action(network, builder, max_fee_rate, nonce),
+        hash,
+    ))
+}
+pub fn approve_builder_fee_payload(
+    network: Network,
+    builder: Address,
+    max_fee_rate: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = approve_builder_fee_message(network, builder, max_fee_rate, nonce);
+    let payload = typed_signing_payload(&user_typed(network, "approveBuilderFee", msg)?)?;
+    Ok((
+        approve_builder_fee_action(network, builder, max_fee_rate, nonce),
         payload,
     ))
 }
@@ -837,12 +921,142 @@ mod tests {
             }
         }))
         .unwrap();
+        assert_eq!(builder_action.validate(), Ok(()));
+    }
+
+    fn order_with_builder(asset: u32, address: &str, fee_tenths_bps: u32) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": asset, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na",
+            "builder": {"b": address, "f": fee_tenths_bps}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn builder_fees_are_bounded_by_venue_caps_and_a_lowercase_address() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        // at the perp cap: accepted
+        assert_eq!(order_with_builder(0, addr, 100).validate(), Ok(()));
+        // over the perp cap: rejected
         assert!(
-            builder_action
+            order_with_builder(0, addr, 101)
                 .validate()
                 .unwrap_err()
-                .contains("builder fees are unsupported")
+                .contains("venue cap of 100")
         );
+        // at the spot cap (asset id >= SPOT_ASSET_ID_OFFSET): accepted
+        assert_eq!(
+            order_with_builder(SPOT_ASSET_ID_OFFSET, addr, 1_000).validate(),
+            Ok(())
+        );
+        // over the spot cap: rejected
+        assert!(
+            order_with_builder(SPOT_ASSET_ID_OFFSET, addr, 1_001)
+                .validate()
+                .unwrap_err()
+                .contains("venue cap of 1000")
+        );
+        // zero fee is rejected outright
+        assert!(
+            order_with_builder(0, addr, 0)
+                .validate()
+                .unwrap_err()
+                .contains("greater than zero")
+        );
+        // uppercase address is rejected (the "0x" prefix must stay intact)
+        let checksummed = format!(
+            "0x{}",
+            "000000000000000000000000000000000000000a".to_ascii_uppercase()
+        );
+        assert!(
+            order_with_builder(0, &checksummed, 10)
+                .validate()
+                .unwrap_err()
+                .contains("lowercase")
+        );
+    }
+
+    #[test]
+    fn builder_fee_max_rate_string_is_an_exact_percent_conversion() {
+        // matches the official Python SDK example: f=1 approves as "0.001%"
+        assert_eq!(builder_fee_max_rate_string(1), "0.001%");
+        assert_eq!(builder_fee_max_rate_string(10), "0.01%");
+        assert_eq!(builder_fee_max_rate_string(100), "0.1%");
+        assert_eq!(builder_fee_max_rate_string(1_000), "1%");
+        assert_eq!(builder_fee_max_rate_string(1_234), "1.234%");
+        assert_eq!(builder_fee_max_rate_string(0), "0%");
+    }
+
+    #[test]
+    fn approve_builder_fee_wire_action_matches_official_field_order() {
+        let builder = parse_address("0x8c967e73e7b15087c42a10d344cff4c96d877f1d").unwrap();
+        let (action, hash) =
+            approve_builder_fee_hash(Network::Testnet, builder, "0.001%", 99).unwrap();
+        assert_eq!(action["type"], "approveBuilderFee");
+        assert_eq!(action["hyperliquidChain"], Network::Testnet.chain());
+        assert_eq!(
+            action["signatureChainId"],
+            format!("0x{:x}", Network::Testnet.signature_chain_id())
+        );
+        assert_eq!(action["maxFeeRate"], "0.001%");
+        assert_eq!(
+            action["builder"],
+            "0x8c967e73e7b15087c42a10d344cff4c96d877f1d"
+        );
+        assert_eq!(action["nonce"], 99);
+
+        let td = user_typed(
+            Network::Testnet,
+            "approveBuilderFee",
+            approve_builder_fee_message(Network::Testnet, builder, "0.001%", 99),
+        )
+        .unwrap();
+        assert_eq!(
+            td.resolver
+                .encode_type("HyperliquidTransaction:ApproveBuilderFee")
+                .unwrap(),
+            "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)"
+        );
+        assert_eq!(td.eip712_signing_hash().unwrap(), hash);
+    }
+
+    #[test]
+    fn approve_builder_fee_payload_preimage_preserves_the_signing_hash() {
+        let builder = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let (action, expected) =
+            approve_builder_fee_hash(Network::Testnet, builder, "0.01%", 7).unwrap();
+        let (payload_action, payload) =
+            approve_builder_fee_payload(Network::Testnet, builder, "0.01%", 7).unwrap();
+        assert_eq!(action, payload_action);
+        assert_eq!(payload.hash, expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
+        );
+        assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
+    }
+
+    #[test]
+    fn approve_builder_fee_hashes_are_distinct_across_builder_rate_nonce_and_network() {
+        let builder = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let other_builder = parse_address("0x0000000000000000000000000000000000000002").unwrap();
+        let (_, base) = approve_builder_fee_hash(Network::Mainnet, builder, "0.01%", 99).unwrap();
+        let (_, other_builder_hash) =
+            approve_builder_fee_hash(Network::Mainnet, other_builder, "0.01%", 99).unwrap();
+        let (_, other_rate) =
+            approve_builder_fee_hash(Network::Mainnet, builder, "0.02%", 99).unwrap();
+        let (_, other_nonce) =
+            approve_builder_fee_hash(Network::Mainnet, builder, "0.01%", 100).unwrap();
+        let (_, testnet) =
+            approve_builder_fee_hash(Network::Testnet, builder, "0.01%", 99).unwrap();
+        for other in [other_builder_hash, other_rate, other_nonce, testnet] {
+            assert_ne!(base, other);
+        }
     }
 
     #[test]
