@@ -12,15 +12,6 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000025 is the session-creation route that invokes derive_key. The Machine
-// host requires the executing route to be part of the immutable derived-key
-// scope, alongside the routes that later use the session key. Machine derives
-// one route-specific reusable Sealed Approval from this installer-verified set
-// before it reports the key ready; action routes reuse it by KeyRef.
-const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-];
-
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
     declared_debits: Vec<Value>,
@@ -71,13 +62,10 @@ fn network(ctx: &Ctx) -> Result<Network, DispatchResponse> {
     Network::parse(p(ctx, "network")?).map_err(invalid)
 }
 fn wallet(ctx: &Ctx) -> Result<String, DispatchResponse> {
-    parse_wallet_id(p(ctx, "wallet")?).map_err(invalid)
+    petal::wallet_param(ctx).map(str::to_owned)
 }
 pub fn parse_wallet_id(raw: &str) -> Result<String, String> {
-    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '/') {
-        return Err("wallet id must be 1-128 characters without '/' or control characters".into());
-    }
-    Ok(raw.to_owned())
+    petal::validate_wallet_id(raw).map(str::to_owned)
 }
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
@@ -782,10 +770,9 @@ fn request_session_key(
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
         key_slot: session_key_slot(session_id),
-        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        // Bloom replaces this legacy field with the package-authenticated
+        // canonical route scope declared in [[key.derive]].
+        allowed_routes: Vec::new(),
         allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
@@ -1878,11 +1865,7 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
 /// lowercase ASCII letter, so an on-chain address can never sign. Reject that
 /// here rather than several layers down as an unqualified permission error.
 fn session_wallet_id(w: &str) -> Result<String, String> {
-    let wallet_id = parse_wallet_id(w)?;
-    if !wallet_id.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err("session routes are addressed by wallet id, not by on-chain address".into());
-    }
-    Ok(wallet_id)
+    parse_wallet_id(w)
 }
 
 pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
@@ -2201,16 +2184,6 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_key_scope_includes_derivation_and_action_routes() {
-        assert_eq!(
-            SESSION_KEY_ALLOWED_ROUTES,
-            [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-            ]
-        );
-    }
 
     fn bounded_session() -> Session {
         Session {
@@ -2543,7 +2516,7 @@ mod tests {
                 "an address-shaped wallet must be rejected: {address}"
             );
             assert!(
-                rejected.unwrap_err().contains("addressed by wallet id"),
+                rejected.unwrap_err().contains("Bloom wallet id"),
                 "the error must say which identifier belongs where"
             );
         }
