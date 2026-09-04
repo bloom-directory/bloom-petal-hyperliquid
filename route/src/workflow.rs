@@ -878,11 +878,9 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
     if resolved_builder != resolved_builder.to_ascii_lowercase() {
         return invalid("builder address must be lowercase");
     }
-    if req.max_fee_tenths_bps == 0
-        || req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS
-    {
+    if req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS {
         return invalid(format!(
-            "max_fee_tenths_bps must be 1..={}",
+            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval",
             protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS
         ));
     }

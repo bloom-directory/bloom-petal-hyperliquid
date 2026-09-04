@@ -176,7 +176,7 @@ impl ExchangeAction {
                     if builder.fee_tenths_bps == 0 {
                         return Err("builder fee must be greater than zero".into());
                     }
-                    let cap = if orders.iter().all(|o| o.asset < SPOT_ASSET_ID_OFFSET) {
+                    let cap = if orders.iter().any(|o| o.asset < SPOT_ASSET_ID_OFFSET) {
                         MAX_PERP_BUILDER_FEE_TENTHS_BPS
                     } else {
                         MAX_SPOT_BUILDER_FEE_TENTHS_BPS
@@ -982,6 +982,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_perp_and_spot_orders_use_the_stricter_perp_cap() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        let mixed_batch = |fee_tenths_bps: u32| -> ExchangeAction {
+            serde_json::from_value(json!({
+                "type": "order",
+                "orders": [
+                    {"a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                     "t": {"limit": {"tif": "Gtc"}}},
+                    {"a": SPOT_ASSET_ID_OFFSET, "b": true, "p": "100", "s": "0.01", "r": false,
+                     "t": {"limit": {"tif": "Gtc"}}}
+                ],
+                "grouping": "na",
+                "builder": {"b": addr, "f": fee_tenths_bps}
+            }))
+            .unwrap()
+        };
+        // at the perp cap even though a spot leg is also present: accepted
+        assert_eq!(mixed_batch(100).validate(), Ok(()));
+        // over the perp cap: rejected, even though it is within the spot cap
+        assert!(
+            mixed_batch(101)
+                .validate()
+                .unwrap_err()
+                .contains("venue cap of 100")
+        );
+    }
+
+    #[test]
     fn builder_fee_max_rate_string_is_an_exact_percent_conversion() {
         // matches the official Python SDK example: f=1 approves as "0.001%"
         assert_eq!(builder_fee_max_rate_string(1), "0.001%");
@@ -1022,6 +1050,27 @@ mod tests {
                 .unwrap(),
             "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)"
         );
+        assert_eq!(td.eip712_signing_hash().unwrap(), hash);
+    }
+
+    #[test]
+    fn approve_builder_fee_accepts_a_zero_rate_as_a_revocation() {
+        // Hyperliquid represents revoking a previously granted builder
+        // approval as an approveBuilderFee action with maxFeeRate "0%";
+        // this must sign and encode cleanly like any other rate.
+        let builder = parse_address("0x8c967e73e7b15087c42a10d344cff4c96d877f1d").unwrap();
+        let max_fee_rate = builder_fee_max_rate_string(0);
+        assert_eq!(max_fee_rate, "0%");
+        let (action, hash) =
+            approve_builder_fee_hash(Network::Testnet, builder, &max_fee_rate, 1).unwrap();
+        assert_eq!(action["maxFeeRate"], "0%");
+
+        let td = user_typed(
+            Network::Testnet,
+            "approveBuilderFee",
+            approve_builder_fee_message(Network::Testnet, builder, &max_fee_rate, 1),
+        )
+        .unwrap();
         assert_eq!(td.eip712_signing_hash().unwrap(), hash);
     }
 
