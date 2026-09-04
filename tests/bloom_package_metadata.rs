@@ -33,6 +33,10 @@ const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
 const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000025");
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
+        "[network]/exchange/[wallet]/approve_builder_fee.json",
+        "hyperliquid.approve_builder_fee",
+    ),
+    (
         "[network]/exchange/[wallet]/cancel.json",
         "hyperliquid.cancel",
     ),
