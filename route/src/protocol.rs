@@ -522,6 +522,22 @@ pub fn recover_signer(hash: &B256, raw: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("cannot recover owner address from signature: {e}"))?;
     Ok(format!("{address:#x}"))
 }
+/// Recovers the signer from a `SignatureJson` already produced for
+/// submission, so callers that only hold the r/s/v form (the shape returned
+/// once signing completes) don't need the raw 65-byte signature kept alive
+/// separately just to answer "whose account did this actually sign for?".
+pub fn recover_signer_from_json(hash: &B256, sig: &SignatureJson) -> Result<String, String> {
+    let r = hex::decode(sig.r.trim_start_matches("0x")).map_err(|e| e.to_string())?;
+    let s = hex::decode(sig.s.trim_start_matches("0x")).map_err(|e| e.to_string())?;
+    if r.len() != 32 || s.len() != 32 {
+        return Err("signature r/s must each be 32 bytes".into());
+    }
+    let mut raw = [0u8; 65];
+    raw[..32].copy_from_slice(&r);
+    raw[32..64].copy_from_slice(&s);
+    raw[64] = sig.v.saturating_sub(27);
+    recover_signer(hash, &raw)
+}
 pub fn usd_send_hash(
     network: Network,
     destination: Address,
@@ -763,6 +779,32 @@ mod tests {
             recover_signer(&other.hash, &raw),
             Ok(format!("{expected:#x}")),
             "a signature bound to one action must not authenticate another"
+        );
+    }
+
+    #[test]
+    fn recover_signer_from_json_matches_recovery_from_the_raw_signature() {
+        let (_, payload) = approve_agent_payload(
+            Network::Mainnet,
+            Address::from([0x22; 20]),
+            "bloom-agent",
+            7,
+        )
+        .expect("payload builds");
+        let signing_key = SigningKey::from_bytes(&[0x11; 32].into()).expect("valid key");
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(payload.hash.as_slice())
+            .expect("signs the prehash");
+        let mut raw = [0u8; 65];
+        raw[..64].copy_from_slice(&signature.to_bytes());
+        raw[64] = recovery_id.to_byte();
+
+        let expected = recover_signer(&payload.hash, &raw).expect("recovers from raw bytes");
+        let json = SignatureJson::from_raw(&raw).expect("converts to r/s/v form");
+        assert_eq!(
+            recover_signer_from_json(&payload.hash, &json),
+            Ok(expected),
+            "recovery from the r/s/v form must agree with recovery from the raw signature"
         );
     }
 

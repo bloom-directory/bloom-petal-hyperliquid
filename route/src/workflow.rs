@@ -458,6 +458,21 @@ pub fn owner_action_write(
         Ok(sig) => sig,
         Err(response) => return response,
     };
+    if matches!(
+        &req.action,
+        protocol::ExchangeAction::Order {
+            builder: Some(_),
+            ..
+        }
+    ) {
+        let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+            Ok(address) => address,
+            Err(e) => return backend(e),
+        };
+        if let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action) {
+            return e;
+        }
+    }
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
     {
@@ -1549,6 +1564,9 @@ fn session_submit(
     if let Err(e) = session_policy(s, &action) {
         return denied(e);
     }
+    if let Err(e) = ensure_builder_fee_is_approved(n, &s.owner_address, &action) {
+        return e;
+    }
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
         return e;
     }
@@ -2131,6 +2149,40 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
         .and_then(value_string)?
         .parse::<u32>()
         .ok()
+}
+
+/// Hyperliquid silently rejects a builder-fee order unless the account has
+/// already signed a separate `approveBuilderFee` action authorizing at least
+/// the requested rate for that builder. Checking this ourselves turns that
+/// into a clear, actionable error instead of a venue-side rejection the
+/// caller has no way to interpret.
+fn ensure_builder_fee_is_approved(
+    n: Network,
+    account: &str,
+    action: &ExchangeAction,
+) -> Result<(), DispatchResponse> {
+    let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    let response = http_json(
+        n,
+        "/info",
+        json!({"type": "maxBuilderFee", "user": account, "builder": builder.address}),
+    )?;
+    let approved = response
+        .as_u64()
+        .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))?;
+    if approved < u64::from(builder.fee_tenths_bps) {
+        return Err(invalid(format!(
+            "builder {} is not yet approved for a fee of {} tenths of a basis point (currently approved up to {approved}); call approve_builder_fee.json for this builder before placing this order",
+            builder.address, builder.fee_tenths_bps
+        )));
+    }
+    Ok(())
 }
 /// The single wallet identity a session is created under.
 ///
