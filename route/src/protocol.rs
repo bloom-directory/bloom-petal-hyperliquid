@@ -527,16 +527,19 @@ pub fn recover_signer(hash: &B256, raw: &[u8]) -> Result<String, String> {
 /// once signing completes) don't need the raw 65-byte signature kept alive
 /// separately just to answer "whose account did this actually sign for?".
 pub fn recover_signer_from_json(hash: &B256, sig: &SignatureJson) -> Result<String, String> {
-    let r = hex::decode(sig.r.trim_start_matches("0x")).map_err(|e| e.to_string())?;
-    let s = hex::decode(sig.s.trim_start_matches("0x")).map_err(|e| e.to_string())?;
-    if r.len() != 32 || s.len() != 32 {
-        return Err("signature r/s must each be 32 bytes".into());
-    }
-    let mut raw = [0u8; 65];
-    raw[..32].copy_from_slice(&r);
-    raw[32..64].copy_from_slice(&s);
-    raw[64] = sig.v.saturating_sub(27);
-    recover_signer(hash, &raw)
+    let r: B256 = sig
+        .r
+        .parse()
+        .map_err(|e| format!("invalid signature r: {e}"))?;
+    let s: B256 = sig
+        .s
+        .parse()
+        .map_err(|e| format!("invalid signature s: {e}"))?;
+    let signature = Signature::from_scalars_and_parity(r, s, sig.v != 27);
+    let address = signature
+        .recover_address_from_prehash(hash)
+        .map_err(|e| format!("cannot recover owner address from signature: {e}"))?;
+    Ok(format!("{address:#x}"))
 }
 pub fn usd_send_hash(
     network: Network,
@@ -752,9 +755,8 @@ mod tests {
         let (signature, recovery_id) = signing_key
             .sign_prehash_recoverable(payload.hash.as_slice())
             .expect("signs the prehash");
-        let mut raw = [0u8; 65];
-        raw[..64].copy_from_slice(&signature.to_bytes());
-        raw[64] = recovery_id.to_byte();
+        let raw =
+            Signature::from_signature_and_parity(signature, recovery_id.to_byte() != 0).as_bytes();
 
         let uncompressed = signing_key.verifying_key().to_encoded_point(false);
         let expected = Address::from_slice(&Keccak256::digest(&uncompressed.as_bytes()[1..])[12..]);
@@ -795,9 +797,8 @@ mod tests {
         let (signature, recovery_id) = signing_key
             .sign_prehash_recoverable(payload.hash.as_slice())
             .expect("signs the prehash");
-        let mut raw = [0u8; 65];
-        raw[..64].copy_from_slice(&signature.to_bytes());
-        raw[64] = recovery_id.to_byte();
+        let raw =
+            Signature::from_signature_and_parity(signature, recovery_id.to_byte() != 0).as_bytes();
 
         let expected = recover_signer(&payload.hash, &raw).expect("recovers from raw bytes");
         let json = SignatureJson::from_raw(&raw).expect("converts to r/s/v form");
