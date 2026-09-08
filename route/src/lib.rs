@@ -1,4 +1,5 @@
 mod protocol;
+mod settings;
 mod workflow;
 
 pub use protocol::*;
