@@ -47,6 +47,11 @@ rotating its agent key. A successful write means the route completed; inspect
 the durable response, status, and error files before treating an action as
 submitted.
 
+The session key's usable routes are declared by canonical patterns in
+`petal.toml`. Bloom resolves them to package-local route IDs while packaging;
+route code does not hardcode generated IDs, so adding or reordering routes
+cannot silently change the key scope.
+
 ## Build
 
 ```sh
