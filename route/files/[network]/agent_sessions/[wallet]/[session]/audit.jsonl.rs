@@ -15,7 +15,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(session) => session,
         Err(response) => return response,
     };
-    match crate::read_audit(network, &wallet, session) {
+    match crate::read_audit(ctx, network, &wallet, session) {
         Ok(bytes) => petal::DispatchResponse::Read(bytes),
         Err(error) => petal::error(-4, error),
     }
