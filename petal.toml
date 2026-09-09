@@ -9,6 +9,9 @@ repository = "bloom-directory/bloom-petal-hyperliquid"
 command = "scripts/build.sh"
 outputs = ["petal/hyperliquid"]
 
+[account]
+aware = true
+
 [consent]
 summary = "Read Hyperliquid market and account data, submit bounded signed HyperCore actions, and manage agent sessions through Bloom approval."
 
