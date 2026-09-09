@@ -12,14 +12,6 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000025 is the session-creation route that invokes derive_key. The Machine
-// host requires the executing route to be part of the immutable derived-key
-// scope, alongside the routes that later use the session key. Machine derives
-// one route-specific reusable Sealed Approval from this installer-verified set
-// before it reports the key ready; action routes reuse it by KeyRef.
-const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-];
 
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
@@ -775,17 +767,16 @@ struct Pending {
 }
 
 fn request_session_key(
+    n: Network,
     wallet: &str,
     session_id: &str,
     lifetime_ms: u64,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
-        key_slot: session_key_slot(session_id),
-        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        key_slot: session_key_slot(n, session_id),
+        // The host replaces this legacy field with the package-authenticated [[key.derive]] scope.
+        allowed_routes: Vec::new(),
         allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
@@ -793,10 +784,16 @@ fn request_session_key(
     .map_err(|error| backend(error.message()))
 }
 
-fn session_key_slot(session_id: &str) -> String {
+fn session_key_slot(n: Network, session_id: &str) -> String {
+    let network = match n {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+    };
     let digest = Sha256::digest(
         [
             b"bloom-hyperliquid-session-key/v1\0".as_slice(),
+            network.as_bytes(),
+            b"\0",
             session_id.as_bytes(),
         ]
         .concat(),
@@ -1960,7 +1957,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(&wallet_id, &req.id, lifetime_ms) {
+    let derived = match request_session_key(n, &wallet_id, &req.id, lifetime_ms) {
         Ok(petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
@@ -2202,16 +2199,6 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_key_scope_includes_derivation_and_action_routes() {
-        assert_eq!(
-            SESSION_KEY_ALLOWED_ROUTES,
-            [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-            ]
-        );
-    }
-
     fn bounded_session() -> Session {
         Session {
             schema: "bloom.hyperliquid_agent_session.v1".into(),
@@ -2266,8 +2253,14 @@ mod tests {
 
     #[test]
     fn session_key_slots_are_lowercase_broker_tokens_for_timestamped_ids() {
-        let first = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef");
-        let second = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef");
+        let first = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let second = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814t150000z-0123456789abcdef",
+        );
 
         assert_eq!(first.len(), 64);
         assert!(first.starts_with("hyperliquid-"));
@@ -2277,6 +2270,20 @@ mod tests {
                 .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' })
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_key_slots_differ_across_networks_for_the_same_id() {
+        let mainnet = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let testnet = session_key_slot(
+            Network::Testnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+
+        assert_ne!(mainnet, testnet);
     }
 
     #[test]
