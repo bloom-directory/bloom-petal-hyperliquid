@@ -11,5 +11,13 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(wallet) => wallet,
         Err(response) => return response,
     };
-    crate::withdraw_status(network, &wallet)
+    let nonce = match petal::param(ctx, "nonce").and_then(|value| {
+        value
+            .parse::<u64>()
+            .map_err(|_| petal::error(-3, "withdrawal nonce must be a plain decimal number"))
+    }) {
+        Ok(nonce) => nonce,
+        Err(response) => return response,
+    };
+    crate::withdraw_record(network, &wallet, nonce)
 });

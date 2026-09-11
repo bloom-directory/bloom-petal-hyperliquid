@@ -9,7 +9,7 @@ petal::route_file!(
                 "amount": "positive USDC decimal with at most 6 decimal places that exceeds the venue withdrawal fee",
                 "nonce": "optional timestamp in milliseconds; retries of the same body reuse the recorded operation"
             },
-            "status": "read withdraw_status.json for the recorded outcome of the most recent withdrawal"
+            "records": "withdrawals/ lists every recorded withdrawal; withdrawals/<nonce>.json is the durable operation record (action, nonce, status approval_pending/submitted/accepted/rejected, venue response). status accepted means venue acceptance, never settlement proof"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

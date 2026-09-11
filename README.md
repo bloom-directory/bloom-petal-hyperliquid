@@ -28,15 +28,17 @@ account's withdrawable USDC, and settles on Arbitrum after the venue's
 finalization window. Hyperliquid deducts a flat venue fee from the withdrawn
 amount, so the destination receives the amount minus the fee; the route help,
 approval advisory, and the recorded operation state the fee and expected net
-without double-counting them into the debit. The most recent withdrawal's
+without double-counting them into the debit. Every withdrawal's
 durable operation record — action identity, nonce, status
 (`approval_pending`, `submitted`, `accepted`, `rejected`), and venue response —
-is readable at `withdraw_status.json`. Venue acceptance is not settlement
-proof; confirm the withdrawal ledger entry and the Arbitrum transaction before
-treating funds as arrived. An uncertain submission must be reconciled through
-`withdraw_status.json` and venue reads: retrying the exact same body never
-creates a second withdrawal nonce. Withdrawals are owner-only and are excluded
-from delegated agent-session key scopes.
+is listed at `withdrawals/` and readable at `withdrawals/<nonce>.json`. Venue
+acceptance is not settlement proof; confirm the withdrawal ledger entry and
+the Arbitrum transaction before treating funds as arrived. An uncertain
+submission must be reconciled through its `withdrawals/<nonce>.json` record
+and venue reads: retrying the exact same body never creates a second
+withdrawal nonce, and a nonce is never reused for a different
+destination/amount. Withdrawals are owner-only and are excluded from delegated
+agent-session key scopes.
 
 Session actions that accept structured request bodies use JSON leaves, including
 `order.json`, `cancel.json`, and `update_leverage.json`. Lifecycle cleanup uses

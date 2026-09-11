@@ -14,9 +14,11 @@ for `usd_send.json`; it does not implement Hyperliquid's generalized
 `sendAsset` action. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
-settlement proof. Its recorded operation status is readable at
-`withdraw_status.json`; while a submission is `submitted` (outcome
-uncertain), never resubmit — reconcile through the record and venue reads. Owner-signed actions may return an approval-required error;
+settlement proof. Operation records are listed at `withdrawals/` and readable
+at `withdrawals/<nonce>.json`; while a record is `submitted` (outcome
+uncertain), never resubmit — reconcile through the record and venue reads. A
+nonce is bound to its exact action: reusing it for a different body is
+rejected, not treated as a retry. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
 are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
 must be inspected through their `status.json`, `last_response.json`, and

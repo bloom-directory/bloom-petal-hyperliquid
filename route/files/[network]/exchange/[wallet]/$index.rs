@@ -11,7 +11,7 @@ petal::route_file!(
         ("usd_class_transfer.json", false, true),
         ("send_asset.json", false, true),
         ("withdraw.json", false, true),
-        ("withdraw_status.json", false, false),
+        ("withdrawals", true, false),
         ("last_response.json", false, false),
     ])
 );
