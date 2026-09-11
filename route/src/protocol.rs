@@ -434,6 +434,10 @@ fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData,
             "UsdClassTransfer",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"amount","type":"string"},{"name":"toPerp","type":"bool"},{"name":"nonce","type":"uint64"}]),
         ),
+        "withdraw3" => (
+            "Withdraw",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"destination","type":"string"},{"name":"amount","type":"string"},{"name":"time","type":"uint64"}]),
+        ),
         _ => return Err("unsupported user action".into()),
     };
     let primary_type = format!("HyperliquidTransaction:{type_name}");
@@ -507,6 +511,41 @@ pub fn usd_send_payload(
         json!({"type":"usdSend","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":nonce}),
         payload,
     ))
+}
+/// Builds the `withdraw3` user action and its EIP-712 signing payload for an
+/// owner-approved withdrawal from Hyperliquid to an external chain.
+///
+/// Field order and the `HyperliquidTransaction:Withdraw` primary type follow
+/// hyperliquid-python-sdk `WITHDRAW_SIGN_TYPES`/`sign_withdraw_from_bridge_action`
+/// (revision 2fdb18f9517675ea03695a0962bd19eece9c83f0); the outer envelope nonce
+/// must equal `time`, mirroring the SDK. `destination` is an external chain
+/// address and is normalized to lowercase, matching the SDK's wire action.
+pub fn withdraw_message(network: Network, destination: Address, amount: &str, time: u64) -> Value {
+    json!({"hyperliquidChain":network.chain(),"destination":format!("{destination:#x}"),"amount":amount,"time":time})
+}
+pub fn withdraw_action(network: Network, destination: Address, amount: &str, time: u64) -> Value {
+    json!({"type":"withdraw3","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"destination":format!("{destination:#x}"),"amount":amount,"time":time})
+}
+pub fn withdraw_hash(
+    network: Network,
+    destination: Address,
+    amount: &str,
+    time: u64,
+) -> Result<(Value, B256), String> {
+    let msg = withdraw_message(network, destination, amount, time);
+    let td = user_typed(network, "withdraw3", msg)?;
+    let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
+    Ok((withdraw_action(network, destination, amount, time), hash))
+}
+pub fn withdraw_payload(
+    network: Network,
+    destination: Address,
+    amount: &str,
+    time: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = withdraw_message(network, destination, amount, time);
+    let payload = typed_signing_payload(&user_typed(network, "withdraw3", msg)?)?;
+    Ok((withdraw_action(network, destination, amount, time), payload))
 }
 fn usd_class_transfer_message(network: Network, amount: &str, to_perp: bool, nonce: u64) -> Value {
     json!({"hyperliquidChain":network.chain(),"amount":amount,"toPerp":to_perp,"nonce":nonce})
@@ -855,6 +894,123 @@ mod tests {
             format!("{hash:#x}"),
             "0x76e0a8bd20747053a2b976294b2e490756b4f22d64bb496d0161beea903ccfd3"
         );
+    }
+
+    #[test]
+    fn withdraw_hash_matches_official_sdk_vectors() {
+        let destination = parse_address("0x0000000000000000000000000000000000000abc").unwrap();
+        // Independently generated with hyperliquid-python-sdk 0.24.0
+        // (2fdb18f9517675ea03695a0962bd19eece9c83f0) and eth_account 0.13.7.
+        let (action, hash) =
+            withdraw_hash(Network::Mainnet, destination, "5", 1_700_000_000_123).unwrap();
+        assert_eq!(action["type"], "withdraw3");
+        assert_eq!(action["hyperliquidChain"], "Mainnet");
+        assert_eq!(action["signatureChainId"], "0x66eee");
+        assert_eq!(action["amount"], "5");
+        assert_eq!(action["time"], json!(1_700_000_000_123u64));
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0xfdc0510ba2b5bbb4c74ee38922d6200b9b6f23c7387d8e6ed439a37b8c166b68"
+        );
+
+        let testnet = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let (_, testnet_hash) = withdraw_hash(Network::Testnet, testnet, "1.25", 99).unwrap();
+        assert_eq!(
+            format!("{testnet_hash:#x}"),
+            "0x95e81c402d7369c6e6b700970d9ce469b991a25f5b4487403e6974fb3a9b79d2"
+        );
+
+        let (_, micro_hash) = withdraw_hash(Network::Mainnet, destination, "0.000001", 7).unwrap();
+        assert_eq!(
+            format!("{micro_hash:#x}"),
+            "0x5a0784e606cb0b7765df1eb4d03452fb2ce30c37a475e9b90669213a1485778b"
+        );
+    }
+
+    #[test]
+    fn changing_any_withdrawal_field_changes_the_signed_payload() {
+        let destination = parse_address("0x0000000000000000000000000000000000000abc").unwrap();
+        let other = parse_address("0x0000000000000000000000000000000000000abd").unwrap();
+        let (_, base) = withdraw_hash(Network::Mainnet, destination, "5", 123).unwrap();
+        for changed in [
+            withdraw_hash(Network::Mainnet, other, "5", 123),
+            withdraw_hash(Network::Mainnet, destination, "6", 123),
+            withdraw_hash(Network::Mainnet, destination, "5", 124),
+            withdraw_hash(Network::Testnet, destination, "5", 123),
+        ] {
+            assert_ne!(base, changed.unwrap().1);
+        }
+    }
+
+    #[test]
+    fn withdraw3_is_never_encoded_as_usd_send() {
+        let destination = parse_address("0x0000000000000000000000000000000000000abc").unwrap();
+        let time = 1_700_000_000_123;
+        let (_, withdraw) = withdraw_hash(Network::Mainnet, destination, "5", time).unwrap();
+        let (usd_action, usd_send) =
+            usd_send_hash(Network::Mainnet, destination, "5", time).unwrap();
+        // Independent usdSend vector for the same logical fields, generated
+        // with the same SDK revision: the two primary types must not collide.
+        assert_eq!(
+            format!("{usd_send:#x}"),
+            "0x021efb1fbaf03e9ce707057dabb484ede6ed402abc5a642dd13864fe19e14551"
+        );
+        assert_ne!(withdraw, usd_send);
+        assert_eq!(usd_action["type"], "usdSend");
+        let td = user_typed(
+            Network::Mainnet,
+            "withdraw3",
+            withdraw_message(Network::Mainnet, destination, "5", time),
+        )
+        .unwrap();
+        assert_eq!(
+            td.resolver
+                .encode_type("HyperliquidTransaction:Withdraw")
+                .unwrap(),
+            "HyperliquidTransaction:Withdraw(string hyperliquidChain,string destination,string amount,uint64 time)"
+        );
+    }
+
+    #[test]
+    fn withdraw_signature_recovers_official_sdk_signer() {
+        // Signature produced by hyperliquid-python-sdk 0.24.0 + eth_account
+        // 0.13.7 over the mainnet "5" fixture above; recovery here uses the
+        // same primitive Hyperliquid applies to decide which account debits.
+        let destination = parse_address("0x0000000000000000000000000000000000000abc").unwrap();
+        let (action, hash) =
+            withdraw_hash(Network::Mainnet, destination, "5", 1_700_000_000_123).unwrap();
+        let raw = [
+            hex::decode("40d1bdae7aefbbdab1f2b7bad15563e775f09401c4bc871ba2845194500bb5ba")
+                .unwrap(),
+            hex::decode("5458f107c3f2e7b7c5a5793fdb50ed029f08c7136272ef2b3a7552cc3716a90d")
+                .unwrap(),
+            vec![27],
+        ]
+        .concat();
+        assert_eq!(
+            recover_signer(&hash, &raw),
+            Ok("0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a".into())
+        );
+        assert_eq!(
+            action["destination"],
+            "0x0000000000000000000000000000000000000abc"
+        );
+    }
+
+    #[test]
+    fn withdraw_payload_preimage_preserves_the_signing_hash() {
+        let destination = parse_address("0x0000000000000000000000000000000000000abc").unwrap();
+        let (action, expected) =
+            withdraw_hash(Network::Testnet, destination, "0.000001", 7).unwrap();
+        let (payload_action, payload) =
+            withdraw_payload(Network::Testnet, destination, "0.000001", 7).unwrap();
+        assert_eq!(action, payload_action);
+        assert_eq!(payload.hash, expected);
+        assert_eq!(
+            B256::from_slice(&Keccak256::digest(&payload.preimage)),
+            expected
+        );
+        assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
     }
 
     #[test]

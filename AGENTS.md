@@ -5,12 +5,20 @@ account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
-`raw_signed.json`, `usd_send.json`, and `usd_class_transfer.json`.
+`raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`, and
+`withdraw.json`.
 `usd_class_transfer.json` moves USDC between the wallet's own spot and perp
 engines and is owner-only; it is deliberately absent from the delegated agent
 session surface. `send_asset.json` is a deprecated alias
 for `usd_send.json`; it does not implement Hyperliquid's generalized
-`sendAsset` action. Owner-signed actions may return an approval-required error;
+`sendAsset` action. `withdraw.json` submits Hyperliquid's `withdraw3`
+action: it debits the gross amount from the account's withdrawable USDC and
+settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
+settlement proof. Operation records are listed at `withdrawals/` and readable
+at `withdrawals/<nonce>.json`; while a record is `submitted` (outcome
+uncertain), never resubmit — reconcile through the record and venue reads. A
+nonce is bound to its exact action: reusing it for a different body is
+rejected, not treated as a retry. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
 are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
 must be inspected through their `status.json`, `last_response.json`, and

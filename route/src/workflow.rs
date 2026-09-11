@@ -50,6 +50,24 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+    /// A withdrawal debits the gross amount from the Hyperliquid account and
+    /// settles on the destination chain (Arbitrum). The Broker catalogues petal
+    /// operation classes with a `none` fee asset, so the claim itself cannot
+    /// carry the venue fee; the exact fee and expected net proceeds travel in
+    /// the operation record and the signing advisory instead.
+    fn withdraw(amount_micros: u64, destination: Address) -> Self {
+        Self {
+            declared_debits: vec![json!({
+                "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                "amount": amount_micros.to_string(),
+            })],
+            declared_destinations: vec![json!({
+                "chain": "arbitrum",
+                "destination": format!("{destination:#x}"),
+            })],
+            declared_fee: json!({"kind": "none"}),
+        }
+    }
 }
 
 fn ok_write() -> DispatchResponse {
@@ -149,6 +167,7 @@ fn route_id(ctx: &Ctx) -> Result<&str, String> {
         .find_map(|(name, value)| (name == "bloom.route_id").then_some(value.as_str()))
         .ok_or_else(|| "trusted Petal route id is unavailable".into())
 }
+#[allow(clippy::too_many_arguments)]
 fn sign_payload(
     ctx: &Ctx,
     wallet: &str,
@@ -156,6 +175,7 @@ fn sign_payload(
     operation_class: &str,
     approval_hint: Option<String>,
     key_ref_jcs: Option<Vec<u8>>,
+    advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
@@ -196,7 +216,7 @@ fn sign_payload(
         claim_assurance_evidence: None,
         approval_hint,
         action: None,
-        advisory: None,
+        advisory,
         selector: if key_ref_jcs.is_some() {
             SignSelector::Reusable
         } else {
@@ -293,6 +313,7 @@ struct OwnerApproval<'a> {
     pending_nonce_key: Option<&'a str>,
     nonce: u64,
     kind: &'a str,
+    advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 }
 
@@ -318,6 +339,7 @@ fn owner_sign_or_approval(
         intent,
         approval_hint,
         None,
+        approval_ctx.advisory,
         approval_ctx.effects,
     ) {
         Ok(SignOutcome::Signature(s)) => match protocol::SignatureJson::from_raw(&s) {
@@ -391,6 +413,7 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
+            advisory: None,
             effects: ClaimEffects::none(),
         },
     ) {
@@ -625,6 +648,7 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "usd_send",
+            advisory: None,
             effects: ClaimEffects::usd_send(amount_micros, dest),
         },
     ) {
@@ -692,6 +716,7 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "usd_class_transfer",
+            advisory: None,
             // Moving USDC between engines owned by the same wallet has no external
             // destination and no net wallet debit.
             effects: ClaimEffects::none(),
@@ -723,6 +748,408 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+/// Venue-reported flat withdrawal fee at implementation time (Hyperliquid
+/// exchange docs, 2026-09). Hyperliquid deducts it from the withdrawn amount,
+/// so the destination receives the amount minus this fee; the venue may change
+/// it, which is why a funded run must re-verify it rather than trust this
+/// constant.
+pub const WITHDRAWAL_FEE_MICROS: u64 = 1_000_000;
+
+fn micros_decimal(micros: u64) -> String {
+    let whole = micros / 1_000_000;
+    let fraction = micros % 1_000_000;
+    if fraction == 0 {
+        format!("{whole}")
+    } else {
+        let mut frac = format!("{fraction:06}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("{whole}.{frac}")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Withdraw {
+    destination: String,
+    amount: String,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+
+fn validate_withdraw_request(req: &Withdraw) -> Result<(u64, Address), DispatchResponse> {
+    let amount_micros = match protocol::usdc_amount_micros(&req.amount) {
+        Ok(x) => x,
+        Err(e) => return Err(invalid(e)),
+    };
+    let destination = match protocol::parse_address(&req.destination) {
+        Ok(x) => x,
+        Err(e) => return Err(invalid(e)),
+    };
+    if destination == Address::ZERO {
+        return Err(invalid(
+            "destination must be a non-zero external chain address",
+        ));
+    }
+    if amount_micros <= WITHDRAWAL_FEE_MICROS {
+        return Err(invalid(format!(
+            "amount must exceed the venue withdrawal fee ({} USDC); the venue deducts the fee from the withdrawn amount",
+            micros_decimal(WITHDRAWAL_FEE_MICROS)
+        )));
+    }
+    Ok((amount_micros, destination))
+}
+
+fn withdraw_record_prefix(n: Network, w: &str) -> String {
+    state_key(&[
+        "exchange",
+        if matches!(n, Network::Mainnet) {
+            "mainnet"
+        } else {
+            "testnet"
+        },
+        w,
+        "withdraw",
+    ])
+}
+
+fn withdraw_operation_key(n: Network, w: &str, nonce: u64) -> String {
+    format!("{}/{}.json", withdraw_record_prefix(n, w), nonce)
+}
+
+fn withdraw_submitted_key(n: Network, w: &str, nonce: u64) -> String {
+    format!("{}/{}.submitted.json", withdraw_record_prefix(n, w), nonce)
+}
+
+/// The durable per-withdrawal operation record. `status` distinguishes what is
+/// known about the venue submission; `status: "accepted"` is venue acceptance
+/// only and is never settlement proof on the destination chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct WithdrawOperation {
+    schema: String,
+    network: String,
+    wallet: String,
+    destination: String,
+    amount: String,
+    amount_micros: String,
+    fee_micros: String,
+    nonce: u64,
+    action: Value,
+    payload_hash: String,
+    status: String,
+    #[serde(default)]
+    response: Option<Value>,
+    updated_ms: u64,
+}
+
+fn withdraw_advisory(amount_micros: u64, destination: Address) -> Vec<u8> {
+    let net = amount_micros.saturating_sub(WITHDRAWAL_FEE_MICROS);
+    [
+        format!(
+            "Withdraws {} USDC from this account's Hyperliquid balance (withdraw3).",
+            micros_decimal(amount_micros)
+        ),
+        format!(
+            "Destination: {destination:#x} on Arbitrum; the venue reports roughly five minutes to finalize."
+        ),
+        format!(
+            "Venue fee: {} USDC deducted by Hyperliquid from the withdrawn amount (venue-reported; verify before relying on it).",
+            micros_decimal(WITHDRAWAL_FEE_MICROS)
+        ),
+        format!(
+            "Expected net receipt: {} USDC. Venue acceptance is not settlement proof.",
+            micros_decimal(net)
+        ),
+    ]
+    .join("\n")
+    .into_bytes()
+}
+
+/// What a retry of an exact withdrawal body may do, decided purely from the
+/// durable state (stored record + submission marker) against the canonical
+/// intent of the incoming request.
+#[derive(Debug, PartialEq)]
+enum WithdrawResume {
+    /// The recorded accepted outcome is for this exact action: done.
+    Completed,
+    /// Continue the flow; `stale_marker` marks a submission marker left by an
+    /// attempt that died before its POST and must be released first.
+    Proceed {
+        stale_marker: bool,
+        record: Option<Box<WithdrawOperation>>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+enum WithdrawRefusal {
+    IdentityMismatch,
+    Uncertain,
+    Unrecognized(String),
+}
+
+/// The submission marker plus record statuses form a small state machine with
+/// one invariant: the record is durably marked `submitted` before any POST, so
+/// a marker without a `submitted`/`accepted` record can only come from an
+/// attempt that died (or failed to persist) before network I/O. That is what
+/// makes `stale_marker` safe to release.
+fn withdraw_resume(
+    intent: &WithdrawOperation,
+    stored: Option<WithdrawOperation>,
+    marker_exists: bool,
+) -> Result<WithdrawResume, WithdrawRefusal> {
+    let Some(existing) = stored else {
+        return Ok(WithdrawResume::Proceed {
+            stale_marker: marker_exists,
+            record: None,
+        });
+    };
+    // The nonce is only a retry of the same operation if the recorded action
+    // and payload hash are identical to this request's. Anything else is
+    // nonce reuse across different withdrawals and must be rejected before
+    // signing, submitting, or reporting a borrowed success.
+    if existing.action != intent.action || existing.payload_hash != intent.payload_hash {
+        return Err(WithdrawRefusal::IdentityMismatch);
+    }
+    match existing.status.as_str() {
+        "accepted" => Ok(WithdrawResume::Completed),
+        "submitted" => Err(WithdrawRefusal::Uncertain),
+        "approval_pending" | "rejected" => Ok(WithdrawResume::Proceed {
+            stale_marker: marker_exists,
+            record: Some(Box::new(existing)),
+        }),
+        other => Err(WithdrawRefusal::Unrecognized(other.into())),
+    }
+}
+
+fn withdraw_refusal(refusal: WithdrawRefusal, nonce: u64) -> DispatchResponse {
+    match refusal {
+        WithdrawRefusal::IdentityMismatch => invalid(format!(
+            "withdrawal nonce {nonce} is already bound to a different withdrawal; retries must repeat the exact body that created it"
+        )),
+        WithdrawRefusal::Uncertain => backend(format!(
+            "withdrawal nonce {nonce} was submitted but its outcome is uncertain; read withdrawals/{nonce}.json and the venue ledger instead of resubmitting"
+        )),
+        WithdrawRefusal::Unrecognized(status) => backend(format!(
+            "withdrawal record has unrecognized status {status}; refusing to act"
+        )),
+    }
+}
+
+pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<Withdraw>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid withdraw body: {e}")),
+    };
+    let (amount_micros, dest) = match validate_withdraw_request(&req) {
+        Ok(x) => x,
+        Err(response) => return response,
+    };
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "withdraw.json", body, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    let op_key = withdraw_operation_key(n, &w, nonce);
+    let marker_key = withdraw_submitted_key(n, &w, nonce);
+    let (action, payload) = match protocol::withdraw_payload(n, dest, &req.amount, nonce) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    // Build the canonical identity for THIS request before interpreting any
+    // stored state, so a reused nonce can never borrow another operation's
+    // outcome and a changed request can never be signed under an old record.
+    let intent = WithdrawOperation {
+        schema: "bloom.hyperliquid_withdraw.v1".into(),
+        network: if matches!(n, Network::Mainnet) {
+            "mainnet".into()
+        } else {
+            "testnet".into()
+        },
+        wallet: w.clone(),
+        destination: format!("{dest:#x}"),
+        amount: req.amount.clone(),
+        amount_micros: amount_micros.to_string(),
+        fee_micros: WITHDRAWAL_FEE_MICROS.to_string(),
+        nonce,
+        action: action.clone(),
+        payload_hash: hex::encode(payload.hash),
+        status: "approval_pending".into(),
+        response: None,
+        updated_ms: petal::sdk::now_ms(),
+    };
+    let stored = match load_json::<WithdrawOperation>(op_key.clone()) {
+        Ok(x) => x,
+        Err(response) => return response,
+    };
+    let marker_exists = match load_bytes(&marker_key) {
+        Ok(bytes) => bytes.is_some(),
+        Err(response) => return response,
+    };
+    let mut record = match withdraw_resume(&intent, stored, marker_exists) {
+        Ok(resume) => match resume {
+            WithdrawResume::Completed => return ok_write(),
+            WithdrawResume::Proceed {
+                stale_marker,
+                record,
+            } => {
+                if stale_marker && let Err(e) = petal::sdk::store_del(&marker_key) {
+                    return backend(e.message());
+                }
+                record
+            }
+        },
+        Err(refusal) => return withdraw_refusal(refusal, nonce),
+    };
+    if completed {
+        return ok_write();
+    }
+    match save_json_new(op_key.clone(), &intent, false) {
+        Ok(()) => {}
+        Err(first_error) => {
+            // A concurrent replay may have created the record first; it must
+            // describe this exact operation before it can be trusted.
+            match load_json::<WithdrawOperation>(op_key.clone()) {
+                Ok(Some(existing)) => {
+                    if existing.action != intent.action
+                        || existing.payload_hash != intent.payload_hash
+                    {
+                        return withdraw_refusal(WithdrawRefusal::IdentityMismatch, nonce);
+                    }
+                    record = Some(Box::new(existing));
+                }
+                Ok(None) => return first_error,
+                Err(response) => return response,
+            }
+        }
+    }
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.withdraw",
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "withdrawal",
+            advisory: Some(withdraw_advisory(amount_micros, dest)),
+            effects: ClaimEffects::withdraw(amount_micros, dest),
+        },
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    // Claim the single submission slot before any network call: two replays of
+    // the same body can never both reach POST.
+    match save_json_new(marker_key.clone(), &action, false) {
+        Ok(()) => {}
+        Err(first_error) => match load_bytes(&marker_key) {
+            Ok(Some(_)) => {
+                return backend(format!(
+                    "withdrawal nonce {nonce} already has a submission attempt; read withdrawals/{nonce}.json instead of resubmitting"
+                ));
+            }
+            Ok(None) => return first_error,
+            Err(response) => return response,
+        },
+    }
+    // Durably mark the operation submitted BEFORE the POST. From this point on
+    // the visible record must always allow for the possibility that the venue
+    // processed the withdrawal, so a persistence failure here aborts the
+    // submission instead of proceeding.
+    let mut op = match record.take() {
+        Some(record) => *record,
+        None => intent,
+    };
+    op.status = "submitted".into();
+    op.updated_ms = petal::sdk::now_ms();
+    if let Err(e) = save_json(op_key.clone(), &op.clone(), false) {
+        return backend(format!(
+            "could not persist the submission state for withdrawal nonce {nonce}; refusing to submit: {e:?}"
+        ));
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            let (status, outcome) = match protocol::validate_exchange_response(&v) {
+                Err(e) => ("rejected", backend(e)),
+                Ok(()) => ("accepted", ok_write()),
+            };
+            op.status = status.into();
+            op.response = Some(v.clone());
+            op.updated_ms = petal::sdk::now_ms();
+            if let Err(e) = save_json(op_key, &op, false) {
+                return e;
+            }
+            if status == "rejected" {
+                // Record the exact rejection, then release the submission slot
+                // so an explicit retry of this body replays the identical
+                // action instead of being stranded.
+                let _ = petal::sdk::store_del(&marker_key);
+                return outcome;
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            outcome
+        }
+        Err(e) => {
+            // Network or HTTP failure: the record already durably says
+            // "submitted", so the next attempt reconciles this operation
+            // instead of creating or resubmitting anything.
+            e
+        }
+    }
+}
+
+/// One withdrawal operation by its stable identity (the wallet-scoped nonce),
+/// including the uncertain ones a latest-only view cannot surface.
+pub fn withdraw_record(n: Network, w: &str, nonce: u64) -> DispatchResponse {
+    match load_bytes(&withdraw_operation_key(n, w, nonce)) {
+        Ok(Some(bytes)) => DispatchResponse::Read(bytes),
+        Ok(None) => invalid(format!("no withdrawal record exists for nonce {nonce}")),
+        Err(response) => response,
+    }
+}
+
+/// Operation-record child names under the withdraw store prefix: numeric
+/// `<nonce>.json` entries only, sorted. Submission markers are never listed.
+fn withdraw_record_names(prefix: &str, keys: &[String]) -> Vec<String> {
+    let mut names: Vec<(u64, String)> = keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.strip_prefix(prefix)?;
+            let name = name.strip_prefix('/')?;
+            let nonce = name.strip_suffix(".json")?;
+            let nonce = nonce.parse::<u64>().ok()?;
+            Some((nonce, format!("{nonce}.json")))
+        })
+        .collect();
+    names.sort_unstable_by_key(|(nonce, _)| *nonce);
+    names.into_iter().map(|(_, name)| name).collect()
+}
+
+pub fn withdraw_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
+    let n = network(ctx)?;
+    let w = wallet(ctx)?;
+    let prefix = withdraw_record_prefix(n, &w);
+    let keys =
+        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+    Ok(withdraw_record_names(&prefix, &keys)
+        .into_iter()
+        .map(petal::file)
+        .collect())
+}
+
 fn approval(kind: &str, v: &Value) -> DispatchResponse {
     denied(format!("approval required for {kind}: {}", safe_json(v)))
 }
@@ -1363,6 +1790,7 @@ fn session_submit(
         "hyperliquid.agent_action",
         None,
         Some(s.key_ref_jcs.clone()),
+        None,
         ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
@@ -2070,6 +2498,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         "hyperliquid.approve_agent",
         approval_hint,
         None,
+        None,
         ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(raw)) => {
@@ -2316,6 +2745,267 @@ mod tests {
             })]
         );
         assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    #[test]
+    fn withdrawal_claim_effects_bind_gross_debit_and_arbitrum_destination() {
+        let destination =
+            protocol::parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+        let effects = ClaimEffects::withdraw(5_000_000, destination);
+        assert_eq!(
+            effects.declared_debits,
+            vec![json!({
+                "asset": {"chain": "hyperliquid", "asset": "usdc"},
+                "amount": "5000000",
+            })]
+        );
+        assert_eq!(
+            effects.declared_destinations,
+            vec![json!({
+                "chain": "arbitrum",
+                "destination": "0x00000000000000000000000000000000000000aa",
+            })]
+        );
+        // The Broker catalogues petal operation classes with a none fee asset,
+        // so the claim must not declare a fee; the venue fee is disclosed in
+        // the advisory and the operation record instead.
+        assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    #[test]
+    fn withdraw_request_rejects_zero_destination_and_fee_consumed_amounts() {
+        let ok = Withdraw {
+            destination: "0x00000000000000000000000000000000000000aa".into(),
+            amount: "5".into(),
+            nonce: None,
+        };
+        assert_eq!(validate_withdraw_request(&ok).unwrap().0, 5_000_000);
+
+        let zero = Withdraw {
+            destination: "0x0000000000000000000000000000000000000000".into(),
+            amount: "5".into(),
+            nonce: None,
+        };
+        assert_eq!(
+            validate_withdraw_request(&zero).unwrap_err(),
+            invalid("destination must be a non-zero external chain address")
+        );
+
+        for amount in ["1", "0.5", "1.000000"] {
+            let consumed = Withdraw {
+                destination: "0x00000000000000000000000000000000000000aa".into(),
+                amount: amount.into(),
+                nonce: None,
+            };
+            let error = validate_withdraw_request(&consumed).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("exceed the venue withdrawal fee"),
+                "{amount} must be rejected as fee-consumed"
+            );
+        }
+    }
+
+    #[test]
+    fn withdraw_body_rejects_unknown_fields_and_malformed_shapes() {
+        // A vault or session selector is not part of an owner withdrawal.
+        assert!(serde_json::from_slice::<Withdraw>(
+            br#"{"destination":"0x00000000000000000000000000000000000000aa","amount":"5","vault_address":"0x0000000000000000000000000000000000000001"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<Withdraw>(
+            br#"{"destination":"0x00000000000000000000000000000000000000aa","amount":"5","key_ref":{}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<Withdraw>(br#"{"amount":"5"}"#).is_err());
+        assert!(
+            serde_json::from_slice::<Withdraw>(
+                br#"{"destination":"0x00000000000000000000000000000000000000aa","amount":"0","nonce":null}"#
+            )
+            .is_err()
+                || validate_withdraw_request(&serde_json::from_slice::<Withdraw>(
+                    br#"{"destination":"0x00000000000000000000000000000000000000aa","amount":"0","nonce":null}"#
+                )
+                .unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn micros_decimal_formats_canonically() {
+        assert_eq!(micros_decimal(1_000_000), "1");
+        assert_eq!(micros_decimal(4_000_000), "4");
+        assert_eq!(micros_decimal(1_250_000), "1.25");
+        assert_eq!(micros_decimal(1), "0.000001");
+    }
+
+    #[test]
+    fn withdraw_advisory_discloses_fee_net_and_non_settlement() {
+        let destination =
+            protocol::parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+        let advisory = String::from_utf8(withdraw_advisory(5_000_000, destination)).unwrap();
+        assert!(advisory.contains("Withdraws 5 USDC"));
+        assert!(advisory.contains("0x00000000000000000000000000000000000000aa"));
+        assert!(advisory.contains("Arbitrum"));
+        assert!(advisory.contains("Venue fee: 1 USDC"));
+        assert!(advisory.contains("Expected net receipt: 4 USDC"));
+        assert!(advisory.contains("not settlement proof"));
+    }
+
+    #[test]
+    fn withdrawal_is_outside_the_delegated_session_scope() {
+        // The withdrawal route leaves sort after every session route, so its
+        // ids must never appear in the derived-key scope; if a route file is
+        // ever inserted ahead of them, this pins the authority boundary.
+        assert!(
+            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000045"),
+            "session scope must stay below the withdrawal routes"
+        );
+        let expected = [
+            "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+        ];
+        assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
+    }
+
+    #[test]
+    fn withdraw_nonce_and_record_keys_are_isolated() {
+        let wallet = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"destination":"0x00000000000000000000000000000000000000aa","amount":"5"}"#;
+        assert_ne!(
+            owner_nonce_key(Network::Mainnet, wallet, "withdraw.json", body),
+            owner_nonce_key(Network::Mainnet, wallet, "send_asset.json", body)
+        );
+        assert_ne!(
+            owner_nonce_key(Network::Mainnet, wallet, "withdraw.json", body),
+            owner_nonce_key(Network::Testnet, wallet, "withdraw.json", body)
+        );
+        assert_eq!(
+            withdraw_operation_key(Network::Mainnet, wallet, 42),
+            "state/exchange/mainnet/0x0000000000000000000000000000000000000001/withdraw/42.json"
+        );
+        assert_eq!(
+            withdraw_submitted_key(Network::Testnet, wallet, 42),
+            "state/exchange/testnet/0x0000000000000000000000000000000000000001/withdraw/42.submitted.json"
+        );
+    }
+
+    fn withdraw_intent(destination: &str, amount: &str, nonce: u64) -> WithdrawOperation {
+        let dest = protocol::parse_address(destination).unwrap();
+        let (action, payload) =
+            protocol::withdraw_payload(Network::Mainnet, dest, amount, nonce).unwrap();
+        WithdrawOperation {
+            schema: "bloom.hyperliquid_withdraw.v1".into(),
+            network: "mainnet".into(),
+            wallet: "wallet".into(),
+            destination: format!("{dest:#x}"),
+            amount: amount.into(),
+            amount_micros: "5000000".into(),
+            fee_micros: "1000000".into(),
+            nonce,
+            action,
+            payload_hash: hex::encode(payload.hash),
+            status: "approval_pending".into(),
+            response: None,
+            updated_ms: 1,
+        }
+    }
+
+    fn stored_like(intent: &WithdrawOperation, status: &str) -> WithdrawOperation {
+        let mut stored = intent.clone();
+        stored.status = status.into();
+        stored
+    }
+
+    #[test]
+    fn withdraw_resume_decision_table_covers_marker_and_status_combinations() {
+        let intent = withdraw_intent("0x00000000000000000000000000000000000000aa", "5", 42);
+        for marker in [false, true] {
+            // No record: proceed (a marker without a submitted/accepted record
+            // can only come from an attempt that died before its POST).
+            assert_eq!(
+                withdraw_resume(&intent, None, marker),
+                Ok(WithdrawResume::Proceed {
+                    stale_marker: marker,
+                    record: None,
+                })
+            );
+            // Terminal and uncertain states are decided regardless of marker.
+            assert_eq!(
+                withdraw_resume(&intent, Some(stored_like(&intent, "accepted")), marker),
+                Ok(WithdrawResume::Completed)
+            );
+            assert_eq!(
+                withdraw_resume(&intent, Some(stored_like(&intent, "submitted")), marker),
+                Err(WithdrawRefusal::Uncertain)
+            );
+            // Pre-submission states proceed; the marker is stale exactly when
+            // it exists.
+            for status in ["approval_pending", "rejected"] {
+                assert_eq!(
+                    withdraw_resume(&intent, Some(stored_like(&intent, status)), marker),
+                    Ok(WithdrawResume::Proceed {
+                        stale_marker: marker,
+                        record: Some(Box::new(stored_like(&intent, status))),
+                    })
+                );
+            }
+            // A corrupted status refuses instead of guessing.
+            assert!(matches!(
+                withdraw_resume(&intent, Some(stored_like(&intent, "weird")), marker),
+                Err(WithdrawRefusal::Unrecognized(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn withdraw_resume_rejects_nonce_reuse_across_different_intents() {
+        // A stored record for destination ..aa must never answer, sign, or
+        // complete a request for destination ..bb at the same nonce — no
+        // matter which status the old record carries.
+        let intent = withdraw_intent("0x00000000000000000000000000000000000000bb", "5", 42);
+        for status in ["approval_pending", "submitted", "accepted", "rejected"] {
+            let stored = withdraw_intent("0x00000000000000000000000000000000000000aa", "5", 42);
+            let mut stored = stored_like(&stored, status);
+            // Exercise both identity fields independently.
+            if status == "accepted" {
+                stored.payload_hash = "0".repeat(64);
+            }
+            assert_eq!(
+                withdraw_resume(&intent, Some(stored), false),
+                Err(WithdrawRefusal::IdentityMismatch)
+            );
+        }
+        // Same intent is never a mismatch (covered by the table test) — and a
+        // changed amount is a different intent, not a retry.
+        let other_amount = withdraw_intent("0x00000000000000000000000000000000000000bb", "6", 42);
+        let stored = stored_like(&other_amount, "accepted");
+        let intent = withdraw_intent("0x00000000000000000000000000000000000000bb", "5", 42);
+        assert_eq!(
+            withdraw_resume(&intent, Some(stored), true),
+            Err(WithdrawRefusal::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn withdraw_record_names_filter_markers_and_sort_numerically() {
+        let prefix = "state/exchange/mainnet/w/withdraw";
+        let keys = [
+            format!("{prefix}/42.json"),
+            format!("{prefix}/7.submitted.json"),
+            format!("{prefix}/7.json"),
+            format!("{prefix}/100.json"),
+            format!("{prefix}/junk.json"),
+            format!("{prefix}/nested/9.json"),
+            format!("{prefix}/1042.json"),
+        ];
+        assert_eq!(
+            withdraw_record_names(prefix, &keys),
+            vec![
+                "7.json".to_string(),
+                "42.json".to_string(),
+                "100.json".to_string(),
+                "1042.json".to_string(),
+            ]
+        );
     }
 
     #[test]
