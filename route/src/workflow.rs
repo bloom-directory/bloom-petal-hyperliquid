@@ -324,20 +324,12 @@ fn owner_sign_or_approval(
     intent: &str,
     approval_ctx: OwnerApproval<'_>,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
-    let approval_hint = match approval_ctx.pending_nonce_key {
-        Some(key) => load_json::<PendingNonce>(key.to_owned())?.and_then(|state| {
-            (state.expires_ms > petal::sdk::now_ms())
-                .then_some(state.action_id)
-                .flatten()
-        }),
-        None => None,
-    };
     match sign_payload(
         ctx,
         w,
         payload,
         intent,
-        approval_hint,
+        None,
         None,
         approval_ctx.advisory,
         approval_ctx.effects,
