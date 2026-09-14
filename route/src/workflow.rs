@@ -12,13 +12,13 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000025 is the session-creation route that invokes derive_key. The Machine
+// r000029 is the session-creation route that invokes derive_key. The Machine
 // host requires the executing route to be part of the immutable derived-key
 // scope, alongside the routes that later use the session key. Machine derives
 // one route-specific reusable Sealed Approval from this installer-verified set
 // before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+    "r000008", "r000009", "r000010", "r000013", "r000023", "r000027", "r000029",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -921,6 +921,138 @@ pub fn load_session_receipt(
     load_json(session_receipt_key(n, w, id, cloid, action))
 }
 
+fn rejection_key(n: Network, w: &str, id: &str, cloid: &str, action: &str) -> String {
+    session_key(
+        n,
+        w,
+        id,
+        &format!(
+            "outcomes/{}/{action}.rejected.json",
+            cloid.to_ascii_lowercase()
+        ),
+    )
+}
+
+fn action_outcome(
+    action: &str,
+    cloid: &str,
+    request: &Value,
+    item_index: usize,
+    state: &str,
+    attempted: Option<bool>,
+    error: Option<Value>,
+) -> Value {
+    json!({"schema":"bloom.hyperliquid_session_action_outcome.v1", "action":action,
+        "cloid":cloid.to_ascii_lowercase(), "request":request, "item_index":item_index,
+        "state":state, "venue_request_attempted":attempted, "error":error})
+}
+
+/// Project immutable evidence in descending certainty order. A later invalid
+/// write can never hide an earlier venue response or submission fence.
+pub fn load_session_outcome(
+    n: Network,
+    w: &str,
+    id: &str,
+    cloid: &str,
+    action: &str,
+) -> Result<Option<Value>, DispatchResponse> {
+    load_session_outcome_with(n, w, id, cloid, action, load_json::<Value>)
+}
+
+fn load_session_outcome_with(
+    n: Network,
+    w: &str,
+    id: &str,
+    cloid: &str,
+    action: &str,
+    mut read: impl FnMut(String) -> Result<Option<Value>, DispatchResponse>,
+) -> Result<Option<Value>, DispatchResponse> {
+    protocol::validate_cloid(cloid).map_err(invalid)?;
+    let action = receipt_action_key(action)?;
+    if let Some(receipt) = read(session_receipt_key(n, w, id, cloid, action))? {
+        return Ok(Some(action_outcome(
+            action,
+            cloid,
+            &receipt["request"],
+            receipt["item_index"].as_u64().unwrap_or(0) as usize,
+            "submitted",
+            Some(true),
+            None,
+        )));
+    }
+    if let Some(reservation) = read(session_receipt_submission_key(n, w, id, cloid, action))? {
+        let reservation: ReceiptReservation = serde_json::from_value(reservation)
+            .map_err(|e| backend(format!("invalid submission fence: {e}")))?;
+        return Ok(Some(action_outcome(
+            action,
+            cloid,
+            &reservation.request,
+            reservation.item_index,
+            "submission_unknown",
+            None,
+            Some(json!({
+                "code":"submission_unresolved", "field":null,
+                "message":"Submission fence exists but no receipt; reconcile venue state. Do not resubmit."})),
+        )));
+    }
+    read(rejection_key(n, w, id, cloid, action))
+}
+
+fn record_action_rejection(
+    n: Network,
+    w: &str,
+    id: &str,
+    action: &ExchangeAction,
+    code: &str,
+    message: &str,
+) -> Result<(), DispatchResponse> {
+    record_action_rejection_with(n, w, id, action, code, message, |key, outcome| {
+        if let Err(error) = save_json_new(key.clone(), outcome, false)
+            && load_json::<Value>(key)?.is_none()
+        {
+            return Err(error);
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_action_rejection_with(
+    n: Network,
+    w: &str,
+    id: &str,
+    action: &ExchangeAction,
+    code: &str,
+    message: &str,
+    mut persist: impl FnMut(String, &Value) -> Result<(), DispatchResponse>,
+) -> Result<(), DispatchResponse> {
+    let Some(kind) = receipt_action(action) else {
+        return Ok(());
+    };
+    let field = ["price", "size", "triggerPx"]
+        .into_iter()
+        .find(|field| message.starts_with(field));
+    for target in receipt_targets(action)? {
+        // A malformed CLOID has no safe correlated path.
+        if protocol::validate_cloid(&target.cloid).is_err() {
+            continue;
+        }
+        let outcome = action_outcome(
+            kind,
+            &target.cloid,
+            &target.request,
+            target.item_index,
+            "rejected_before_submission",
+            Some(false),
+            Some(json!({
+                "code":code, "field":field, "scope":"action_batch", "message":message})),
+        );
+        let key = rejection_key(n, w, id, &target.cloid, kind);
+        persist(key, &outcome)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 struct ReceiptTarget {
     item_index: usize,
@@ -1091,6 +1223,19 @@ fn reserve_session_receipts(
     }
 
     for reservation in reservations {
+        if load_json::<Value>(rejection_key(
+            n,
+            w,
+            id,
+            &reservation.cloid,
+            &reservation.action,
+        ))?
+        .is_some()
+        {
+            return Err(invalid(
+                "client order id already has a rejected outcome; do not reuse it",
+            ));
+        }
         let key =
             session_receipt_reservation_key(n, w, id, &reservation.cloid, &reservation.action);
         match save_json_new(key.clone(), reservation, false) {
@@ -1298,9 +1443,17 @@ fn session_submit(
     explicit_nonce: Option<u64>,
 ) -> DispatchResponse {
     if let Err(e) = action.validate() {
+        if let Err(storage_error) = record_action_rejection(n, w, id, &action, "invalid_action", &e)
+        {
+            return storage_error;
+        }
         return invalid(e);
     }
     if let Err(e) = session_policy(s, &action) {
+        if let Err(storage_error) = record_action_rejection(n, w, id, &action, "policy_denied", &e)
+        {
+            return storage_error;
+        }
         return denied(e);
     }
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
@@ -2203,11 +2356,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_decimal_records_correlated_rejection_and_propagates_storage_failure() {
+        let action: ExchangeAction = serde_json::from_value(json!({"type":"order", "orders":[{
+            "a":0,"b":true,"p":"74907.0","s":"0.00011","r":false,
+            "t":{"limit":{"tif":"Alo"}},"c":"0x00112233445566778899aabbccddeeff"
+        }],"grouping":"na"}))
+        .unwrap();
+        let message = action.validate().unwrap_err();
+        let mut records = Vec::new();
+        record_action_rejection_with(
+            Network::Mainnet,
+            "wallet",
+            "session",
+            &action,
+            "invalid_action",
+            &message,
+            |key, outcome| {
+                records.push((key, outcome.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1["request"]["p"], "74907.0");
+        assert_eq!(records[0].1["state"], "rejected_before_submission");
+        assert_eq!(records[0].1["venue_request_attempted"], false);
+        assert_eq!(records[0].1["error"]["field"], "price");
+        assert_eq!(records[0].1["error"]["scope"], "action_batch");
+        assert!(
+            record_action_rejection_with(
+                Network::Mainnet,
+                "wallet",
+                "session",
+                &action,
+                "invalid_action",
+                &message,
+                |_, _| Err(backend("storage unavailable"))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn outcome_evidence_survives_delays_and_cannot_be_downgraded_by_rejection() {
+        let n = Network::Mainnet;
+        let cloid = "0x00112233445566778899aabbccddeeff";
+        let rejected = json!({"state":"rejected_before_submission", "request":{"p":"74907.0"}});
+        let mut storage = std::collections::HashMap::new();
+        let read = |storage: &std::collections::HashMap<String, Value>| {
+            load_session_outcome_with(n, "wallet", "session", cloid, "order", |key| {
+                Ok(storage.get(&key).cloned())
+            })
+            .unwrap()
+        };
+        assert_eq!(read(&storage), None); // delayed dispatch
+        storage.insert(
+            rejection_key(n, "wallet", "session", cloid, "order"),
+            rejected.clone(),
+        );
+        assert_eq!(read(&storage), Some(rejected));
+        storage.insert(session_receipt_submission_key(n, "wallet", "session", cloid, "order"), json!({
+            "schema":"bloom.hyperliquid_session_action_receipt_reservation.v1", "action":"order",
+            "cloid":cloid, "nonce":123, "item_index":0, "request":{"p":"74907"}, "operation_digest":"digest"
+        }));
+        let unknown = read(&storage).unwrap();
+        assert_eq!(unknown["state"], "submission_unknown");
+        assert_eq!(unknown["venue_request_attempted"], Value::Null);
+        assert_eq!(unknown["request"]["p"], "74907");
+        // Lost HTTP response / failed receipt persistence retains the fence.
+        assert_eq!(read(&storage), Some(unknown));
+        storage.insert(
+            session_receipt_key(n, "wallet", "session", cloid, "order"),
+            json!({"request":{"p":"74907"}, "item_index":0}),
+        );
+        let submitted = read(&storage).unwrap();
+        assert_eq!(submitted["state"], "submitted");
+        assert_eq!(submitted["venue_request_attempted"], true);
+        assert_eq!(submitted["request"]["p"], "74907");
+        assert!(
+            load_session_outcome_with(n, "wallet", "session", cloid, "order", |_| Err(backend(
+                "storage unavailable"
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            load_session_outcome_with(n, "wallet", "session", cloid, "cancel", |key| Ok(storage
+                .get(&key)
+                .cloned()))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn session_key_scope_includes_derivation_and_action_routes() {
         assert_eq!(
             SESSION_KEY_ALLOWED_ROUTES,
             [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+                "r000008", "r000009", "r000010", "r000013", "r000023", "r000027", "r000029",
             ]
         );
     }

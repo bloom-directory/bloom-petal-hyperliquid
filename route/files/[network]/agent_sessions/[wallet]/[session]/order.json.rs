@@ -10,8 +10,8 @@ petal::route_file!(
                     "orders": [{
                         "a": "unsigned integer asset id",
                         "b": "boolean; true buys and false sells",
-                        "p": "positive decimal price string",
-                        "s": "positive decimal size string",
+                        "p": "canonical positive decimal price string; e.g. 74907, not 74907.0",
+                        "s": "canonical positive decimal size string; e.g. 0.00011, not 0.000110",
                         "r": "boolean reduce-only flag",
                         "t": {"limit": {"tif": "Alo, Gtc, or Ioc"}},
                         "c": "optional 16-byte 0x client order id"
@@ -21,6 +21,11 @@ petal::route_file!(
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "decimal_format": "After rounding to venue precision, format without trailing fractional zeros or a trailing decimal point. No exponent notation, leading + or -, or omitted integer part. Rounding alone does not produce canonical strings.",
+            "failure_evidence": {
+                "path_from_session_root": "outcomes/<submitted_cloid>/order.json",
+                "notes": "Poll alongside the receipt for 120000 ms; ENOENT is pending. Match cloid and request to the submitted item. rejected_before_submission is a local validation/policy rejection; stop and report its structured error. submission_unknown requires venue reconciliation, never resubmission. submitted is not fill evidence; inspect the immutable receipt. Each CLOID is single-use, including rejected requests. Malformed JSON, invalid CLOIDs, and failures before session dispatch may have no outcome."
             },
             "example": {
                 "action": {
