@@ -64,6 +64,10 @@ const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
         "[network]/exchange/[wallet]/usd_send.json",
         "hyperliquid.usd_send",
     ),
+    (
+        "[network]/exchange/[wallet]/withdraw.json",
+        "hyperliquid.withdraw",
+    ),
 ];
 
 fn routes_by_pattern(package: &PreparedPetalPackage) -> BTreeMap<&str, &RouteIndexRecord> {
