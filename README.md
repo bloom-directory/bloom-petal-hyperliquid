@@ -17,7 +17,25 @@ Signer-owned agent-key actions, stop, cancel-all, close-all, audit, and
 immutable action receipts keyed by client order ID under
 `receipts/<cloid>/{order,cancel}.json`. These receipts correlate a specific
 order or cancel-by-CLOID response without racing the session's mutable
-`last_response.json`. The canonical transfer route is `usd_send.json`;
+`last_response.json`. Poll `outcomes/<cloid>/{order,cancel}.json` alongside
+receipts for correlated local validation/policy rejections. Outcomes project
+durable evidence in priority order: a receipt means `submitted`; a submission
+fence without a receipt means `submission_unknown`; otherwise a stored local
+rejection means `rejected_before_submission`. Unknown submission requires venue
+reconciliation and never authorizes a retry. Its `venue_request_attempted` is
+null because the process may have stopped between fencing and sending. Rejected
+outcomes have structured error details and `venue_request_attempted: false`;
+they never overwrite receipts or submission fences. Match the original request
+item and CLOID; rejected CLOIDs cannot be reused. Requests without a valid CLOID,
+malformed JSON, or failures before session dispatch may have no outcome. A
+missing outcome/receipt during the documented polling window is pending.
+
+Order price and size must be canonical positive decimal strings: `74907` and
+`0.00011` are valid, while `74907.0`, `0.000110`, exponent notation, and signs
+are rejected. Round to venue precision, then remove trailing fractional zeros
+and the decimal point if the fraction is empty.
+
+The canonical transfer route is `usd_send.json`;
 `send_asset.json` remains as a compatibility alias and does not implement
 Hyperliquid's distinct generalized `sendAsset` action.
 

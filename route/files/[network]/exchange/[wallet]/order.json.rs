@@ -3,7 +3,8 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid order.json request; signed actions require Bloom approval"
+            "description": "write a Hyperliquid order.json request; signed actions require Bloom approval",
+            "decimal_format": "Price p and size s must be canonical positive decimal strings: use 74907, not 74907.0; use 0.00011, not 0.000110. After rounding, remove trailing fractional zeros and any trailing decimal point. No exponent notation, sign, or omitted integer part."
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

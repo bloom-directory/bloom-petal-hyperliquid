@@ -26,6 +26,10 @@ petal::route_file!(
                     }
                 }
             },
+            "failure_evidence": {
+                "path_from_session_root": "outcomes/<canceled_cloid>/cancel.json (cancelByCloid only)",
+                "notes": "Match request and CLOID. Poll alongside receipts for the full timeout; ENOENT is pending. rejected_before_submission means local validation/policy rejection. submission_unknown requires reconciliation and prohibits resubmission. submitted still requires receipt and live-state verification."
+            },
             "success_evidence": {
                 "source": "live_venue_state",
                 "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
