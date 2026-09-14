@@ -89,55 +89,68 @@ fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
 }
 
-/// Where a session's records live and its key slot derives from. A dispatch
-/// under `wallets/<w>/<n>/petals/` scopes records and slots to the mounted
-/// account's owner fingerprint (`k/<fingerprint>/…`), so the same session id
-/// on two accounts yields two slots and two keys; account 0 falls back to
-/// the legacy wallet-scoped records it may already have. The flat
-/// `/petals/…` mount keeps the wallet-scoped records unchanged.
-#[derive(Clone, Debug)]
+/// Which account a session belongs to: where its records live and which key
+/// slot it derives. The flat `/petals/…` mount and `wallets/<w>/0/petals/…`
+/// are the same owner and share the wallet-scoped records and slots. A
+/// numbered account `n > 0` keeps its own record tree and hashes `n` into its
+/// slot, so one session id on two accounts is two sessions with two keys.
+///
+/// The scope is the account number because Bloom injects `bloom.account` on
+/// every account-mounted route, whereas `bloom.owner_key_fingerprint` is
+/// omitted from routes that derive no key when the account holds more than
+/// one key family.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionOwner {
     wallet: String,
-    account: Option<(u32, String)>,
-}
-
-/// Construct the session owner scope for a route dispatch: the mounted
-/// account's owner fingerprint when the host injected one, else the
-/// wallet-scoped legacy records.
-pub fn session_owner(ctx: &Ctx, wallet: &str) -> SessionOwner {
-    SessionOwner::scope(ctx, wallet)
+    account: u32,
 }
 
 impl SessionOwner {
-    pub fn scope(ctx: &Ctx, wallet: &str) -> Self {
-        Self {
+    pub fn scope(ctx: &Ctx, wallet: &str) -> Result<Self, String> {
+        Self::from_params(
+            wallet,
+            petal::route_param(ctx, "bloom.wallet"),
+            petal::route_param(ctx, "bloom.account"),
+        )
+    }
+
+    fn from_params(
+        wallet: &str,
+        mounted_wallet: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(mounted) = mounted_wallet
+            && mounted != wallet
+        {
+            return Err(format!(
+                "session wallet {wallet:?} is not the mounted wallet {mounted:?}"
+            ));
+        }
+        let account = match account {
+            None => 0,
+            Some(raw) => raw
+                .parse::<u32>()
+                .map_err(|error| format!("bloom.account must be a u32: {error}"))?,
+        };
+        Ok(Self {
             wallet: wallet.to_owned(),
-            account: petal::account_ctx(ctx)
-                .ok()
-                .map(|account| (account.account, account.owner_key_fingerprint)),
-        }
+            account,
+        })
     }
 
-    fn record_segment(&self) -> &str {
-        match &self.account {
-            Some((_, fingerprint)) => fingerprint,
-            None => &self.wallet,
+    /// The directory holding this owner's sessions, one child per id.
+    fn sessions_prefix(&self, n: Network) -> String {
+        let network = if matches!(n, Network::Mainnet) {
+            "mainnet"
+        } else {
+            "testnet"
+        };
+        if self.account == 0 {
+            state_key(&["sessions", network, &self.wallet, ""])
+        } else {
+            let account = self.account.to_string();
+            state_key(&["account-sessions", network, &self.wallet, &account, ""])
         }
-    }
-
-    /// The legacy wallet-scoped prefix, readable only for account 0, whose
-    /// records may predate the numbered tree.
-    fn legacy_segment(&self) -> Option<&str> {
-        match &self.account {
-            Some((0, _)) => Some(self.wallet.as_str()),
-            _ => None,
-        }
-    }
-
-    fn key_slot_owner(&self) -> Option<&str> {
-        self.account
-            .as_ref()
-            .map(|(_, fingerprint)| fingerprint.as_str())
     }
 }
 fn save_json(
@@ -1241,7 +1254,7 @@ fn request_session_key(
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: owner.wallet.clone(),
-        key_slot: session_key_slot(n, owner.key_slot_owner(), session_id),
+        key_slot: session_key_slot(n, owner, session_id),
         // The host replaces this legacy field with the package-authenticated
         // canonical route scope declared in [[key.derive]].
         allowed_routes: Vec::new(),
@@ -1252,7 +1265,7 @@ fn request_session_key(
     .map_err(|error| backend(error.message()))
 }
 
-fn session_key_slot(n: Network, owner_fingerprint: Option<&str>, session_id: &str) -> String {
+fn session_key_slot(n: Network, owner: &SessionOwner, session_id: &str) -> String {
     let network = match n {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
@@ -1263,8 +1276,8 @@ fn session_key_slot(n: Network, owner_fingerprint: Option<&str>, session_id: &st
         b"\0",
     ]
     .concat();
-    if let Some(fingerprint) = owner_fingerprint {
-        input.extend_from_slice(fingerprint.as_bytes());
+    if owner.account != 0 {
+        input.extend_from_slice(owner.account.to_string().as_bytes());
         input.push(0);
     }
     input.extend_from_slice(session_id.as_bytes());
@@ -1323,51 +1336,16 @@ fn session_preflight(req: &NewSession) -> Result<String, String> {
 }
 
 fn session_key(n: Network, owner: &SessionOwner, id: &str, file: &str) -> String {
-    state_key(&[
-        "sessions",
-        if matches!(n, Network::Mainnet) {
-            "mainnet"
-        } else {
-            "testnet"
-        },
-        owner.record_segment(),
-        id,
-        file,
-    ])
+    format!("{}{id}/{file}", owner.sessions_prefix(n))
 }
 
-/// Read one session record: the owner-scoped key first, then the legacy
-/// wallet-scoped key when this is account 0. Writes always go to the
-/// owner-scoped key, so a legacy session continues under its own records.
-fn load_session_json<T: serde::de::DeserializeOwned>(
-    n: Network,
-    owner: &SessionOwner,
-    id: &str,
-    file: &str,
-) -> Result<Option<T>, DispatchResponse> {
-    if let Some(value) = load_json::<T>(session_key(n, owner, id, file))? {
-        return Ok(Some(value));
-    }
-    if let Some(legacy) = owner
-        .legacy_segment()
-        .filter(|legacy| *legacy != owner.record_segment())
-    {
-        let legacy_owner = SessionOwner {
-            wallet: legacy.to_owned(),
-            account: None,
-        };
-        return load_json::<T>(session_key(n, &legacy_owner, id, file));
-    }
-    Ok(None)
-}
 pub fn load_session(
     ctx: &Ctx,
     n: Network,
     w: &str,
     id: &str,
 ) -> Result<Option<Session>, DispatchResponse> {
-    let owner = SessionOwner::scope(ctx, w);
-    load_session_scoped(n, &owner, id)
+    load_session_scoped(n, &SessionOwner::scope(ctx, w).map_err(invalid)?, id)
 }
 
 fn load_session_scoped(
@@ -1375,7 +1353,7 @@ fn load_session_scoped(
     owner: &SessionOwner,
     id: &str,
 ) -> Result<Option<Session>, DispatchResponse> {
-    load_session_json::<Session>(n, owner, id, "session.json")
+    load_json(session_key(n, owner, id, "session.json"))
 }
 
 pub fn load_wallet_session_error(n: Network, w: &str) -> Result<Option<String>, DispatchResponse> {
@@ -1397,7 +1375,7 @@ pub fn load_session_response(
     w: &str,
     id: &str,
 ) -> Result<Option<Value>, DispatchResponse> {
-    let owner = SessionOwner::scope(ctx, w);
+    let owner = SessionOwner::scope(ctx, w).map_err(invalid)?;
     load_json(session_key(n, &owner, id, "last_response.json"))
 }
 
@@ -1432,7 +1410,7 @@ pub fn load_session_receipt(
     cloid: &str,
     action: &str,
 ) -> Result<Option<Value>, DispatchResponse> {
-    let owner = SessionOwner::scope(ctx, w);
+    let owner = SessionOwner::scope(ctx, w).map_err(invalid)?;
     protocol::validate_cloid(cloid).map_err(invalid)?;
     let action = receipt_action_key(action)?;
     load_json(session_receipt_key(n, &owner, id, cloid, action))
@@ -1722,7 +1700,7 @@ pub fn load_session_error(
     w: &str,
     id: &str,
 ) -> Result<Option<String>, DispatchResponse> {
-    let owner = SessionOwner::scope(ctx, w);
+    let owner = SessionOwner::scope(ctx, w).map_err(invalid)?;
     load_json(session_key(n, &owner, id, "last_error.json"))
 }
 
@@ -1757,38 +1735,68 @@ fn active_session(n: Network, owner: &SessionOwner, id: &str) -> Result<Session,
 }
 
 pub fn cancel_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let owner = SessionOwner::scope(ctx, w);
-    let (mut session, recovery) = match recovery_session(n, &owner, id) {
+    let owner = match SessionOwner::scope(ctx, w) {
+        Ok(owner) => owner,
+        Err(error) => return invalid(error),
+    };
+    let (mut session, signing) = match cleanup_session(n, &owner, id) {
         Ok(target) => target,
         Err(response) => return response,
     };
-    session_cancel_all(ctx, n, &owner, id, &mut session, recovery)
+    session_cancel_all(ctx, n, &owner, id, &mut session, signing)
 }
 
 pub fn close_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let owner = SessionOwner::scope(ctx, w);
-    let (mut session, recovery) = match recovery_session(n, &owner, id) {
+    let owner = match SessionOwner::scope(ctx, w) {
+        Ok(owner) => owner,
+        Err(error) => return invalid(error),
+    };
+    let (mut session, signing) = match cleanup_session(n, &owner, id) {
         Ok(target) => target,
         Err(response) => return response,
     };
-    session_close_all(ctx, n, &owner, id, &mut session, recovery)
+    session_close_all(ctx, n, &owner, id, &mut session, signing)
 }
 
-/// A cancel/close target. An active session submits with its delegated key;
-/// a stopped or expired one is still recoverable: the cleanup submits as the
-/// owner with a fresh payload-specific Exact approval, which survives the
-/// session's stop, so a stopped session can never strand open orders.
-fn recovery_session(
+/// How a session action is signed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SessionSigning {
+    /// Trading actions: the session's delegated key and nothing else.
+    Delegated,
+    /// Cleanup on a session this Petal still records as live: the delegated
+    /// key, then the owner if the host refuses that key. Bloom's core stop
+    /// revokes the key's reusable approval without touching this Petal's
+    /// record, so that refusal is the only stop signal the Petal receives.
+    DelegatedThenOwner,
+    /// Cleanup on a session already stopped or expired: the owner, with a
+    /// payload-specific Exact approval.
+    Owner,
+}
+
+impl SessionSigning {
+    /// Whether a delegated signing attempt should be retried as the owner.
+    /// Only a host denial qualifies; any other failure is reported as is
+    /// rather than turned into an owner approval ceremony.
+    fn retry_as_owner(self, delegated: &Result<SignOutcome, String>) -> bool {
+        self == Self::DelegatedThenOwner
+            && matches!(delegated, Err(error) if *error == SdkError::Host(HostStatus::Denied).message())
+    }
+}
+
+/// A cancel/close target. Cleanup must survive a stop: the owner's Exact
+/// approval for the cleanup payload is not revoked with the session's
+/// reusable one, so a stopped session can never strand open orders.
+fn cleanup_session(
     n: Network,
     owner: &SessionOwner,
     id: &str,
-) -> Result<(Session, bool), DispatchResponse> {
+) -> Result<(Session, SessionSigning), DispatchResponse> {
     if let Ok(session) = active_session(n, owner, id) {
-        return Ok((session, false));
+        return Ok((session, SessionSigning::DelegatedThenOwner));
     }
     match load_session_scoped(n, owner, id) {
         Ok(Some(session)) if session.stopped || session.expires_ms <= petal::sdk::now_ms() => {
-            Ok((session, true))
+            Ok((session, SessionSigning::Owner))
         }
         // An unloadable or still-live session keeps the original denial.
         _ => Err(petal::error(-1, "session not found")),
@@ -1827,7 +1835,7 @@ fn session_submit(
     vault_str: Option<String>,
     expires: Option<u64>,
     explicit_nonce: Option<u64>,
-    recovery: bool,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     if let Err(e) = action.validate() {
         return invalid(e);
@@ -1888,23 +1896,26 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match sign_payload(
-        ctx,
-        &owner.wallet,
-        &signing_payload,
-        "hyperliquid.agent_action",
-        None,
-        if recovery {
-            // A stopped or expired session's reusable key is gone; the
-            // owner signs the cleanup with a payload-specific Exact
-            // approval instead.
-            None
-        } else {
-            Some(s.key_ref_jcs.clone())
-        },
-        None,
-        ClaimEffects::none(),
-    ) {
+    let sign = |key_ref_jcs| {
+        sign_payload(
+            ctx,
+            &owner.wallet,
+            &signing_payload,
+            "hyperliquid.agent_action",
+            None,
+            key_ref_jcs,
+            None,
+            ClaimEffects::none(),
+        )
+    };
+    let mut signed = sign(match signing {
+        SessionSigning::Owner => None,
+        _ => Some(s.key_ref_jcs.clone()),
+    });
+    if signing.retry_as_owner(&signed) {
+        signed = sign(None);
+    }
+    let sig = match signed {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
             Err(e) => return backend(e),
@@ -1978,7 +1989,10 @@ pub fn session_action_write(
     if let Err(error) = validate_session_target(&req) {
         return denied(error);
     }
-    let owner = SessionOwner::scope(ctx, w);
+    let owner = match SessionOwner::scope(ctx, w) {
+        Ok(owner) => owner,
+        Err(error) => return invalid(error),
+    };
     let mut s = match active_session(n, &owner, id) {
         Ok(session) => session,
         Err(response) => return response,
@@ -2001,9 +2015,7 @@ pub fn session_action_write(
         req.vault_address,
         req.expires_after,
         req.nonce,
-        // Trading actions on a live session use its delegated key; the
-        // recovery paths enter through cancel/close, not here.
-        false,
+        SessionSigning::Delegated,
     )
 }
 
@@ -2040,7 +2052,7 @@ fn append_audit(
 }
 
 pub fn read_audit(ctx: &Ctx, n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
-    let owner = SessionOwner::scope(ctx, w);
+    let owner = SessionOwner::scope(ctx, w)?;
     let mut out = load_bytes_result(&session_key(n, &owner, id, "audit.jsonl"))
         .map_err(|e| e.message())?
         .unwrap_or_default();
@@ -2068,10 +2080,10 @@ fn session_agent_submit(
     id: &str,
     s: &mut Session,
     action: ExchangeAction,
-    recovery: bool,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     session_submit(
-        ctx, n, owner, id, s, action, None, None, None, None, recovery,
+        ctx, n, owner, id, s, action, None, None, None, None, signing,
     )
 }
 fn value_string(v: &Value) -> Option<String> {
@@ -2123,7 +2135,7 @@ fn session_cancel_all(
     owner: &SessionOwner,
     id: &str,
     s: &mut Session,
-    recovery: bool,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     let open = match http_json(
         n,
@@ -2172,7 +2184,7 @@ fn session_cancel_all(
         Ok(v) => v,
         Err(e) => return invalid(e.to_string()),
     };
-    session_agent_submit(ctx, n, owner, id, s, action, recovery)
+    session_agent_submit(ctx, n, owner, id, s, action, signing)
 }
 fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String> {
     let x: f64 = raw
@@ -2210,7 +2222,7 @@ fn session_close_all(
     owner: &SessionOwner,
     id: &str,
     s: &mut Session,
-    recovery: bool,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     let state = match http_json(
         n,
@@ -2282,7 +2294,7 @@ fn session_close_all(
         grouping: protocol::Grouping::Na,
         builder: None,
     };
-    session_agent_submit(ctx, n, owner, id, s, action, recovery)
+    session_agent_submit(ctx, n, owner, id, s, action, signing)
 }
 fn canonical_abs_decimal(raw: &str) -> String {
     let mut value = raw.strip_prefix('-').unwrap_or(raw).to_owned();
@@ -2441,11 +2453,12 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
-    let owner = {
-        match session_wallet_id(&w) {
-            Ok(_) => SessionOwner::scope(ctx, &w),
-            Err(error) => return invalid(error),
-        }
+    if let Err(error) = session_wallet_id(&w) {
+        return invalid(error);
+    }
+    let owner = match SessionOwner::scope(ctx, &w) {
+        Ok(owner) => owner,
+        Err(error) => return invalid(error),
     };
     let agent_name = match session_preflight(&req) {
         Ok(agent_name) => agent_name,
@@ -2718,18 +2731,9 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
 }
 
 pub fn session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
-    let n = network(ctx)?;
-    let w = wallet(ctx)?;
-    let prefix = state_key(&[
-        "sessions",
-        if matches!(n, Network::Mainnet) {
-            "mainnet"
-        } else {
-            "testnet"
-        },
-        &w,
-        "",
-    ]);
+    let prefix = SessionOwner::scope(ctx, &wallet(ctx)?)
+        .map_err(invalid)?
+        .sessions_prefix(network(ctx)?);
     let keys =
         petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
     Ok(completed_session_ids(&prefix, keys)
@@ -2808,30 +2812,24 @@ mod tests {
         );
     }
 
-    fn legacy_owner() -> SessionOwner {
-        SessionOwner {
-            wallet: "wallet".into(),
-            account: None,
-        }
+    fn flat_owner() -> SessionOwner {
+        SessionOwner::from_params("wallet", None, None).unwrap()
     }
 
-    fn account_owner_fixture(fingerprint: &str) -> SessionOwner {
-        SessionOwner {
-            wallet: "wallet".into(),
-            account: Some((1, fingerprint.into())),
-        }
+    fn account_owner(account: &str) -> SessionOwner {
+        SessionOwner::from_params("wallet", Some("wallet"), Some(account)).unwrap()
     }
 
     #[test]
     fn session_key_slots_are_lowercase_broker_tokens_for_timestamped_ids() {
         let first = session_key_slot(
             Network::Mainnet,
-            None,
+            &flat_owner(),
             "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
         );
         let second = session_key_slot(
             Network::Mainnet,
-            None,
+            &flat_owner(),
             "bloom-eval-codex-20260814t150000z-0123456789abcdef",
         );
 
@@ -2849,12 +2847,12 @@ mod tests {
     fn session_key_slots_differ_across_networks_for_the_same_id() {
         let mainnet = session_key_slot(
             Network::Mainnet,
-            None,
+            &flat_owner(),
             "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
         );
         let testnet = session_key_slot(
             Network::Testnet,
-            None,
+            &flat_owner(),
             "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
         );
 
@@ -2862,41 +2860,87 @@ mod tests {
     }
 
     #[test]
+    fn session_owner_is_the_mounted_account_number() {
+        // The flat mount and account 0 are one owner.
+        assert_eq!(flat_owner(), account_owner("0"));
+        assert_ne!(flat_owner(), account_owner("1"));
+        // A session wallet other than the mounted one never borrows the
+        // mounted account's scope.
+        assert!(SessionOwner::from_params("other", Some("wallet"), Some("1")).is_err());
+        assert!(SessionOwner::from_params("wallet", Some("wallet"), Some("-1")).is_err());
+    }
+
+    #[test]
     fn the_same_session_id_on_two_accounts_yields_two_slots_and_records() {
         let id = "bloom-eval-codex-20260814T150000Z-0123456789abcdef";
-        let legacy = legacy_owner();
-        let account_one = account_owner_fixture(&"a".repeat(64));
-        let account_two = account_owner_fixture(&"b".repeat(64));
-
-        // Slots: legacy (flat mount), account 1, and account 2 all differ.
-        let legacy_slot = session_key_slot(Network::Mainnet, None, id);
-        let one_slot = session_key_slot(Network::Mainnet, account_one.key_slot_owner(), id);
-        let two_slot = session_key_slot(Network::Mainnet, account_two.key_slot_owner(), id);
-        assert_ne!(legacy_slot, one_slot);
-        assert_ne!(one_slot, two_slot);
-
-        // Records: account scopes key by the owner fingerprint, the flat
-        // mount by the wallet, and account 0 may fall back to the wallet's.
-        assert_eq!(
-            session_key(Network::Mainnet, &account_one, id, "session.json"),
-            format!(
-                "state/sessions/mainnet/{}/{id}/session.json",
-                "a".repeat(64)
-            )
+        let (flat, zero, one, two) = (
+            flat_owner(),
+            account_owner("0"),
+            account_owner("1"),
+            account_owner("2"),
         );
+
+        let slot = |owner| session_key_slot(Network::Mainnet, owner, id);
+        assert_eq!(slot(&flat), slot(&zero));
+        assert_ne!(slot(&zero), slot(&one));
+        assert_ne!(slot(&one), slot(&two));
+
+        let record = |owner| session_key(Network::Mainnet, owner, id, "session.json");
         assert_eq!(
-            session_key(Network::Mainnet, &legacy, id, "session.json"),
+            record(&flat),
             format!("state/sessions/mainnet/wallet/{id}/session.json")
         );
-        // A flat mount is already wallet-scoped; only account 0 keeps a
-        // fallback to those wallet records, and nonzero accounts have none.
-        assert_eq!(legacy.legacy_segment(), None);
-        let account_zero = SessionOwner {
-            wallet: "wallet".into(),
-            account: Some((0, "c".repeat(64))),
-        };
-        assert_eq!(account_zero.legacy_segment(), Some("wallet"));
-        assert_eq!(account_one.legacy_segment(), None);
+        assert_eq!(record(&zero), record(&flat));
+        assert_eq!(
+            record(&one),
+            format!("state/account-sessions/mainnet/wallet/1/{id}/session.json")
+        );
+        assert_ne!(record(&one), record(&two));
+    }
+
+    #[test]
+    fn each_account_lists_exactly_the_sessions_it_writes() {
+        let owners = [flat_owner(), account_owner("1"), account_owner("2")];
+        let keys = owners
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| {
+                session_key(
+                    Network::Mainnet,
+                    owner,
+                    &format!("s{index}"),
+                    "session.json",
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, owner) in owners.iter().enumerate() {
+            let prefix = owner.sessions_prefix(Network::Mainnet);
+            let listed = completed_session_ids(
+                &prefix,
+                keys.iter()
+                    .filter(|key| key.starts_with(&prefix))
+                    .cloned()
+                    .collect(),
+            );
+            assert_eq!(listed, [format!("s{index}")]);
+        }
+    }
+
+    #[test]
+    fn only_a_denied_cleanup_key_falls_back_to_owner_signing() {
+        let denied = Err(SdkError::Host(HostStatus::Denied).message());
+        let backend = Err(SdkError::Host(HostStatus::Backend).message());
+        let pending = Ok(SignOutcome::ApprovalPending {
+            action_id: "a".into(),
+            expires_ms: 1,
+        });
+        assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&denied));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&backend));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&pending));
+        // Trading never escalates to the owner, and owner signing has no
+        // delegated attempt to retry.
+        assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
+        assert!(!SessionSigning::Owner.retry_as_owner(&denied));
     }
 
     #[test]
@@ -3548,7 +3592,7 @@ mod tests {
         assert_eq!(
             session_receipt_key(
                 Network::Mainnet,
-                &legacy_owner(),
+                &flat_owner(),
                 "session",
                 "0xAABBCCDDEEFF00112233445566778899",
                 "order"
@@ -3642,7 +3686,7 @@ mod tests {
         assert_eq!(
             session_receipt_reservation_key(
                 Network::Mainnet,
-                &legacy_owner(),
+                &flat_owner(),
                 "session",
                 "0xAABBCCDDEEFF00112233445566778899",
                 "order"
