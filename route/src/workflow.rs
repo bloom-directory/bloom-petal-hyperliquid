@@ -2818,17 +2818,25 @@ mod tests {
 
     #[test]
     fn withdrawal_is_outside_the_delegated_session_scope() {
-        // The withdrawal route leaves sort after every session route, so its
-        // ids must never appear in the derived-key scope; if a route file is
-        // ever inserted ahead of them, this pins the authority boundary.
-        assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000045"),
-            "session scope must stay below the withdrawal routes"
-        );
-        let expected = [
-            "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-        ];
-        assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
+        // The derived-key scope is declared by route pattern in petal.toml;
+        // no owner-only exchange route, withdrawals included, may enter it.
+        let manifest = include_str!("../../petal.toml");
+        let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
+        let (_, routes) = derive.split_once("allowed_routes = [").unwrap();
+        let (routes, _) = routes.split_once("\n]").unwrap();
+        let routes = routes
+            .split(',')
+            .map(|route| route.trim().trim_matches('"'))
+            .filter(|route| !route.is_empty())
+            .collect::<Vec<_>>();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert!(
+                route.starts_with("[network]/agent_sessions/[wallet]/[session]/"),
+                "{route}"
+            );
+            assert!(!route.contains("withdraw"), "{route}");
+        }
     }
 
     #[test]
