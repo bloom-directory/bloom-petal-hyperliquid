@@ -19,7 +19,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(cloid) => cloid,
         Err(response) => return response,
     };
-    match crate::load_session_receipt(network, &wallet, session, cloid, "order") {
+    match crate::load_session_receipt(ctx, network, &wallet, session, cloid, "order") {
         Ok(Some(receipt)) => petal::read_json_value(&receipt),
         Ok(None) => petal::error(-1, "order receipt not found"),
         Err(response) => response,

@@ -13,7 +13,7 @@ surface covers orders, cancels, cancel-by-cloid, scheduled cancel, leverage
 updates, raw signed payloads, internal USD sends, and spot/perp USDC class
 transfers, and owner-approved withdrawals to external chains
 (`withdraw3`). Agent sessions provide owner-approved creation, bounded
-Signer-owned agent-key actions, stop, cancel-all, close-all, audit, and
+Signer-owned agent-key actions, cancel-all, close-all, audit, and
 immutable action receipts keyed by client order ID under
 `receipts/<cloid>/{order,cancel}.json`. These receipts correlate a specific
 order or cancel-by-CLOID response without racing the session's mutable
@@ -42,9 +42,23 @@ agent-session key scopes.
 
 Session actions that accept structured request bodies use JSON leaves, including
 `order.json`, `cancel.json`, and `update_leverage.json`. Lifecycle cleanup uses
-extensionless command leaves: `cancel_all`, `close_all`, and `stop`. Read each
-leaf before writing and use its exact path; do not append `.json` to a command
+extensionless command leaves: `cancel_all` and `close_all`. Read each leaf
+before writing and use its exact path; do not append `.json` to a command
 leaf.
+
+This Petal declares `[account] aware = true`: it also runs under
+`wallets/<wallet>/<n>/petals/hyperliquid/…` for any numbered account. Sessions
+are scoped by account number: the flat mount and account 0 are the same owner
+and share one set of sessions, while each numbered account `n > 0` has its own
+records and hashes `n` into its derived key slot, so the same session id on
+accounts 1 and 2 yields two sessions with two keys. There is no local `stop`
+leaf: stopping a session is the core `wallets/<w>/<n>/sessions/hyperliquid/
+<key-slot>/stop` write, which revokes the session's approvals through
+Broker. `cancel_all` and `close_all` survive a stop or expiry: when the
+session's delegated key is refused, or the session has already expired, they
+submit as the wallet owner with a fresh payload-specific Exact approval, which
+the stop does not revoke, so a stopped session cannot strand open orders.
+Retry the same write after completing that ceremony.
 
 Session key provisioning remains pending through two Bloom authority steps:
 the key-derivation custody ceremony and one reusable Sealed Approval covering
@@ -66,6 +80,11 @@ ceremonies without
 rotating its agent key. A successful write means the route completed; inspect
 the durable response, status, and error files before treating an action as
 submitted.
+
+The session key's usable routes are declared by canonical patterns in
+`petal.toml`. Bloom resolves them to package-local route IDs while packaging;
+route code does not hardcode generated IDs, so adding or reordering routes
+cannot silently change the key scope.
 
 ## Build
 
