@@ -48,7 +48,7 @@ jobs:
         run: cargo install wasm-tools --version 1.249.0 --locked
 
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev 8691f84acf98db203a75850b152d55366403f6a5 --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
 
       - name: Build source package
         run: scripts/build.sh
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/petal
-          ref: 8691f84acf98db203a75850b152d55366403f6a5
+          ref: 2beed2ff344ce2b0c112e07096027e1ae0404007
           path: .petal-tooling
           persist-credentials: false
 
@@ -81,7 +81,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom
-          ref: a8b4ac94fa2a39a0ae5d64a21a1557dfc2b14e5b
+          ref: fd894c264ab0d9ef2166d817765d765c1fb57631
           path: .bloom-contract
           persist-credentials: false
 
