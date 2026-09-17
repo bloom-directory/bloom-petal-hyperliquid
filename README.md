@@ -46,19 +46,14 @@ extensionless command leaves: `cancel_all` and `close_all`. Read each leaf
 before writing and use its exact path; do not append `.json` to a command
 leaf.
 
-This Petal declares `[account] aware = true`: it also runs under
-`wallets/<wallet>/<n>/petals/hyperliquid/…` for any numbered account. Sessions
-are scoped by account number: the flat mount and account 0 are the same owner
-and share one set of sessions, while each numbered account `n > 0` has its own
-records and hashes `n` into its derived key slot, so the same session id on
-accounts 1 and 2 yields two sessions with two keys. There is no local `stop`
-leaf: stopping a session is the core `wallets/<w>/<n>/sessions/hyperliquid/
-<key-slot>/stop` write, which revokes the session's approvals through
-Broker. `cancel_all` and `close_all` survive a stop or expiry: when the
-session's delegated key is refused, or the session has already expired, they
-submit as the wallet owner with a fresh payload-specific Exact approval, which
-the stop does not revoke, so a stopped session cannot strand open orders.
-Retry the same write after completing that ceremony.
+There is no local `stop` leaf: stopping a session is the core
+`wallets/<w>/0/sessions/hyperliquid/<key-slot>/stop` write, which revokes the
+session's approvals through Broker. `cancel_all` and `close_all` survive a
+stop or expiry: when the session's delegated key is refused, or the session
+has already expired, they submit as the wallet owner with a fresh
+payload-specific Exact approval, which the stop does not revoke, so a stopped
+session cannot strand open orders. Retry the same write after completing that
+ceremony.
 
 Session key provisioning remains pending through two Bloom authority steps:
 the key-derivation custody ceremony and one reusable Sealed Approval covering
