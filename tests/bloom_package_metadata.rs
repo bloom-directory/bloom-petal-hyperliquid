@@ -7,30 +7,30 @@ const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-        "r000008",
+        "r000007",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-        "r000009",
+        "r000008",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/close_all",
-        "r000010",
+        "r000009",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/order.json",
-        "r000013",
+        "r000012",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-        "r000019",
+        "r000018",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
-        "r000023",
+        "r000022",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000025");
+const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000024");
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/cancel.json",
