@@ -107,6 +107,10 @@ bloom vfs cat /petals/hyperliquid/README.md
 bloom vfs ls /petals/hyperliquid/mainnet
 ```
 
+The Petal packager includes the repository-root `README.md` and `AGENTS.md`.
+Bloom serves these files at the Petal root automatically; they do not need
+WASM routes or entries in the guest root index.
+
 ## Releases
 
 Installable archives are built by the tag-triggered release workflow using the
