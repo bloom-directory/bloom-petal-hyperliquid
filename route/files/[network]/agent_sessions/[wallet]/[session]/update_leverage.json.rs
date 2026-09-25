@@ -24,7 +24,7 @@ petal::route_file!(
             },
             "success_evidence": {
                 "source": "live_venue_state",
-                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/active_asset_data/BTC.json",
+                "path_from_bloom_root": "petals/hyperliquid/wallets/<wallet>/<account>/<network>/users/<owner_address>/active_asset_data/BTC.json",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
                 "predicate": "leverage.type is cross and leverage.value is 1",

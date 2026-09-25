@@ -37,3 +37,6 @@ operation_classes = ["hyperliquid.agent_action"]
 [store]
 namespaces = ["state"]
 secret_namespaces = ["secrets"] # approval reconciliation only; never key material
+
+[account]
+aware = true

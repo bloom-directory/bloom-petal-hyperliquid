@@ -90,7 +90,7 @@ default set). To install this repository manually while developing:
 ```sh
 bloom petals install https://github.com/bloom-directory/bloom-petal-hyperliquid
 bloom vfs cat /petals/hyperliquid/README.md
-bloom vfs ls /petals/hyperliquid/mainnet
+bloom vfs ls /petals/hyperliquid/wallets/main/0/mainnet
 ```
 
 The Petal packager includes the repository-root `README.md` and `AGENTS.md`.
@@ -111,3 +111,7 @@ a `v` prefix and publish:
 Published assets are immutable. Bloom's built-in catalog pins the release tag,
 source commit, archive name, and package hash. The route crate and canonical
 Petal SDK are locked in `route/Cargo.lock`.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/hyperliquid/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.

@@ -28,7 +28,7 @@ petal::route_file!(
             },
             "success_evidence": {
                 "source": "live_venue_state",
-                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "path_from_bloom_root": "petals/hyperliquid/wallets/<wallet>/<account>/<network>/users/<owner_address>/open_orders.json",
                 "correlated_receipt_path_from_session_root": "receipts/<canceled_cloid>/cancel.json (cancelByCloid only)",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
