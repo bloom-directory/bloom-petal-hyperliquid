@@ -502,6 +502,29 @@ struct PendingNonce {
     #[serde(default)]
     completed: bool,
 }
+/// A cleanup action waiting on the owner's Exact approval. The approval covers
+/// one payload, and `close_all` prices from live mids, so rebuilding on the
+/// retry would sign a different order and open another ceremony. The retry
+/// replays this action instead until the approval expires or it is submitted.
+#[derive(Debug, Serialize, Deserialize)]
+struct CleanupReplay {
+    action: ExchangeAction,
+    expires_ms: u64,
+}
+fn live_cleanup_replay(pending: Option<CleanupReplay>, now_ms: u64) -> Option<ExchangeAction> {
+    pending
+        .filter(|pending| pending.expires_ms > now_ms)
+        .map(|pending| pending.action)
+}
+fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    match petal::sdk::store_del(key) {
+        Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
+        Err(e) => Err(backend(e.message())),
+    }
+}
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     let now = petal::sdk::now_ms();
     for offset in 0..1024_u64 {
@@ -1739,6 +1762,7 @@ fn session_submit(
     expires: Option<u64>,
     explicit_nonce: Option<u64>,
     signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
     if let Err(e) = action.validate() {
         return invalid(e);
@@ -1762,6 +1786,9 @@ fn session_submit(
         Err(e) => return e,
     };
     if completed {
+        if let Err(e) = clear_cleanup_replay(replay_key) {
+            return e;
+        }
         return ok_write();
     }
     let action_kind = action.kind();
@@ -1827,6 +1854,18 @@ fn session_submit(
             action_id,
             expires_ms,
         }) => {
+            if let Some(key) = replay_key
+                && let Err(e) = save_json(
+                    key.to_owned(),
+                    &CleanupReplay {
+                        action: action.clone(),
+                        expires_ms,
+                    },
+                    false,
+                )
+            {
+                return e;
+            }
             return approval(
                 "agent_action",
                 &json!({"action_id": action_id, "expires_ms": expires_ms, "session": id}),
@@ -1841,7 +1880,13 @@ fn session_submit(
     if let Err(e) = mark_session_receipt_submission(n, w, id, &receipt_reservations) {
         return e;
     }
-    match http_json(n, "/exchange", payload) {
+    let submitted = http_json(n, "/exchange", payload);
+    if submitted.is_ok()
+        && let Err(e) = clear_cleanup_replay(replay_key)
+    {
+        return e;
+    }
+    match submitted {
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 record_session_error(n, w, id, s, nonce, action_kind, &e);
@@ -1915,6 +1960,7 @@ pub fn session_action_write(
         req.expires_after,
         req.nonce,
         SessionSigning::Delegated,
+        None,
     )
 }
 
@@ -1966,6 +2012,7 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+#[allow(clippy::too_many_arguments)]
 fn session_agent_submit(
     ctx: &Ctx,
     n: Network,
@@ -1974,8 +2021,11 @@ fn session_agent_submit(
     s: &mut Session,
     action: ExchangeAction,
     signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
-    session_submit(ctx, n, w, id, s, action, None, None, None, None, signing)
+    session_submit(
+        ctx, n, w, id, s, action, None, None, None, None, signing, replay_key,
+    )
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -2075,7 +2125,7 @@ fn session_cancel_all(
         Ok(v) => v,
         Err(e) => return invalid(e.to_string()),
     };
-    session_agent_submit(ctx, n, w, id, s, action, signing)
+    session_agent_submit(ctx, n, w, id, s, action, signing, None)
 }
 fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String> {
     let x: f64 = raw
@@ -2115,6 +2165,14 @@ fn session_close_all(
     s: &mut Session,
     signing: SessionSigning,
 ) -> DispatchResponse {
+    let replay_key = session_key(n, w, id, "close_all_replay.json");
+    let pending = match load_json::<CleanupReplay>(replay_key.clone()) {
+        Ok(pending) => pending,
+        Err(e) => return e,
+    };
+    if let Some(action) = live_cleanup_replay(pending, petal::sdk::now_ms()) {
+        return session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()));
+    }
     let state = match http_json(
         n,
         "/info",
@@ -2185,7 +2243,7 @@ fn session_close_all(
         grouping: protocol::Grouping::Na,
         builder: None,
     };
-    session_agent_submit(ctx, n, w, id, s, action, signing)
+    session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()))
 }
 fn canonical_abs_decimal(raw: &str) -> String {
     let mut value = raw.strip_prefix('-').unwrap_or(raw).to_owned();
@@ -2758,6 +2816,33 @@ mod tests {
         // delegated attempt to retry.
         assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
         assert!(!SessionSigning::Owner.retry_as_owner(&denied));
+    }
+
+    #[test]
+    fn close_all_replays_the_pending_order_until_its_approval_expires() {
+        let order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": false, "p": "90250", "s": "0.01", "r": true,
+                "t": {"limit": {"tif": "Ioc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        let stored = serde_json::to_vec(&CleanupReplay {
+            action: order.clone(),
+            expires_ms: 2_000,
+        })
+        .unwrap();
+        let pending = || serde_json::from_slice::<CleanupReplay>(&stored).ok();
+        // The replayed order signs to the same payload the owner approved.
+        let replayed = live_cleanup_replay(pending(), 1_999).unwrap();
+        assert_eq!(
+            session_operation_digest(&replayed, None, None).unwrap(),
+            session_operation_digest(&order, None, None).unwrap()
+        );
+        assert!(live_cleanup_replay(pending(), 2_000).is_none());
+        assert!(live_cleanup_replay(None, 0).is_none());
     }
 
     #[test]

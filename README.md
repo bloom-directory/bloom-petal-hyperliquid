@@ -53,7 +53,14 @@ stop or expiry: when the session's delegated key is refused, or the session
 has already expired, they submit as the wallet owner with a fresh
 payload-specific Exact approval, which the stop does not revoke, so a stopped
 session cannot strand open orders. Retry the same write after completing that
-ceremony.
+ceremony: a pending `close_all` replays the order the owner is approving until
+that approval expires, rather than repricing it from new mids.
+
+The Petal receives only a bare denial, so any refused delegated attempt, not
+only a stop, moves cleanup to owner approval. A core stop also leaves this
+Petal's `status.json` at `stopped: false`; the core
+`wallets/<w>/0/sessions/hyperliquid/<key-slot>/session.json` `stop` record is
+authoritative.
 
 Session key provisioning remains pending through two Bloom authority steps:
 the key-derivation custody ceremony and one reusable Sealed Approval covering
