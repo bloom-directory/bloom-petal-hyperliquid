@@ -20,7 +20,7 @@ uncertain), never resubmit — reconcile through the record and venue reads. A
 nonce is bound to its exact action: reusing it for a different body is
 rejected, not treated as a retry. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
-are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
+are created through `agent_sessions/new.json` with a stable `id` and
 must be inspected through their `status.json`, `last_response.json`, and
 `last_error.json` files.
 
@@ -37,3 +37,7 @@ route code.
 Never infer that a staged transaction, approval challenge, or accepted route
 write means a broadcast or fill completed. Do not use mainnet with material
 funds without explicit authorization.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/hyperliquid/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
