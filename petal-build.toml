@@ -11,4 +11,4 @@ alias = "hl_route"
 [sdk]
 package = "bloom-petal-sdk"
 git = "https://github.com/bloom-directory/petal"
-rev = "864a80b407387871bae06aabe77b91865e55f7bc"
+rev = "2beed2ff344ce2b0c112e07096027e1ae0404007"

@@ -12,15 +12,6 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000025 is the session-creation route that invokes derive_key. The Machine
-// host requires the executing route to be part of the immutable derived-key
-// scope, alongside the routes that later use the session key. Machine derives
-// one route-specific reusable Sealed Approval from this installer-verified set
-// before it reports the key ready; action routes reuse it by KeyRef.
-const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-];
-
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
     declared_debits: Vec<Value>,
@@ -89,17 +80,15 @@ fn network(ctx: &Ctx) -> Result<Network, DispatchResponse> {
     Network::parse(p(ctx, "network")?).map_err(invalid)
 }
 fn wallet(ctx: &Ctx) -> Result<String, DispatchResponse> {
-    parse_wallet_id(p(ctx, "wallet")?).map_err(invalid)
+    petal::wallet_param(ctx).map(str::to_owned)
 }
 pub fn parse_wallet_id(raw: &str) -> Result<String, String> {
-    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '/') {
-        return Err("wallet id must be 1-128 characters without '/' or control characters".into());
-    }
-    Ok(raw.to_owned())
+    petal::validate_wallet_id(raw).map(str::to_owned)
 }
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
 }
+
 fn save_json(
     key: String,
     v: &(impl Serialize + ?Sized),
@@ -512,6 +501,29 @@ struct PendingNonce {
     action_id: Option<String>,
     #[serde(default)]
     completed: bool,
+}
+/// A cleanup action waiting on the owner's Exact approval. The approval covers
+/// one payload, and `close_all` prices from live mids, so rebuilding on the
+/// retry would sign a different order and open another ceremony. The retry
+/// replays this action instead until the approval expires or it is submitted.
+#[derive(Debug, Serialize, Deserialize)]
+struct CleanupReplay {
+    action: ExchangeAction,
+    expires_ms: u64,
+}
+fn live_cleanup_replay(pending: Option<CleanupReplay>, now_ms: u64) -> Option<ExchangeAction> {
+    pending
+        .filter(|pending| pending.expires_ms > now_ms)
+        .map(|pending| pending.action)
+}
+fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    match petal::sdk::store_del(key) {
+        Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
+        Err(e) => Err(backend(e.message())),
+    }
 }
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     let now = petal::sdk::now_ms();
@@ -1194,17 +1206,17 @@ struct Pending {
 }
 
 fn request_session_key(
-    wallet: &str,
+    n: Network,
+    w: &str,
     session_id: &str,
     lifetime_ms: u64,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
-        wallet_id: wallet.into(),
-        key_slot: session_key_slot(session_id),
-        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        wallet_id: w.to_owned(),
+        key_slot: session_key_slot(n, session_id),
+        // The host replaces this legacy field with the package-authenticated
+        // canonical route scope declared in [[key.derive]].
+        allowed_routes: Vec::new(),
         allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
@@ -1212,10 +1224,16 @@ fn request_session_key(
     .map_err(|error| backend(error.message()))
 }
 
-fn session_key_slot(session_id: &str) -> String {
+fn session_key_slot(n: Network, session_id: &str) -> String {
+    let network = match n {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+    };
     let digest = Sha256::digest(
         [
-            b"bloom-hyperliquid-session-key/v1\0".as_slice(),
+            b"bloom-hyperliquid-session-key/v2\0".as_slice(),
+            network.as_bytes(),
+            b"\0",
             session_id.as_bytes(),
         ]
         .concat(),
@@ -1286,6 +1304,7 @@ fn session_key(n: Network, w: &str, id: &str, file: &str) -> String {
         file,
     ])
 }
+
 pub fn load_session(n: Network, w: &str, id: &str) -> Result<Option<Session>, DispatchResponse> {
     load_json(session_key(n, w, id, "session.json"))
 }
@@ -1649,38 +1668,65 @@ fn active_session(n: Network, w: &str, id: &str) -> Result<Session, DispatchResp
     Ok(session)
 }
 
-pub fn stop_session(n: Network, w: &str, id: &str) -> DispatchResponse {
-    let Some(mut session) = (match load_session(n, w, id) {
-        Ok(session) => session,
-        Err(response) => return response,
-    }) else {
-        return petal::error(-1, "session not found");
-    };
-    session.stopped = true;
-    session.last_error = None;
-    if let Err(response) = retire_session_key(n, w, id, &session) {
-        return response;
-    }
-    match save_json(session_key(n, w, id, "session.json"), &session, false) {
-        Ok(()) => ok_write(),
-        Err(response) => response,
-    }
-}
-
 pub fn cancel_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let mut session = match active_session(n, w, id) {
-        Ok(session) => session,
+    let (mut session, signing) = match cleanup_session(n, w, id) {
+        Ok(target) => target,
         Err(response) => return response,
     };
-    session_cancel_all(ctx, n, w, id, &mut session)
+    session_cancel_all(ctx, n, w, id, &mut session, signing)
 }
 
 pub fn close_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let mut session = match active_session(n, w, id) {
-        Ok(session) => session,
+    let (mut session, signing) = match cleanup_session(n, w, id) {
+        Ok(target) => target,
         Err(response) => return response,
     };
-    session_close_all(ctx, n, w, id, &mut session)
+    session_close_all(ctx, n, w, id, &mut session, signing)
+}
+
+/// How a session action is signed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SessionSigning {
+    /// Trading actions: the session's delegated key and nothing else.
+    Delegated,
+    /// Cleanup on a session this Petal still records as live: the delegated
+    /// key, then the owner if the host refuses that key. Bloom's core stop
+    /// revokes the key's reusable approval without touching this Petal's
+    /// record, so that refusal is the only stop signal the Petal receives.
+    DelegatedThenOwner,
+    /// Cleanup on a session already stopped or expired: the owner, with a
+    /// payload-specific Exact approval.
+    Owner,
+}
+
+impl SessionSigning {
+    /// Whether a delegated signing attempt should be retried as the owner.
+    /// Only a host denial qualifies; any other failure is reported as is
+    /// rather than turned into an owner approval ceremony.
+    fn retry_as_owner(self, delegated: &Result<SignOutcome, String>) -> bool {
+        self == Self::DelegatedThenOwner
+            && matches!(delegated, Err(error) if *error == SdkError::Host(HostStatus::Denied).message())
+    }
+}
+
+/// A cancel/close target. Cleanup must survive a stop: the owner's Exact
+/// approval for the cleanup payload is not revoked with the session's
+/// reusable one, so a stopped session can never strand open orders.
+fn cleanup_session(
+    n: Network,
+    w: &str,
+    id: &str,
+) -> Result<(Session, SessionSigning), DispatchResponse> {
+    if let Ok(session) = active_session(n, w, id) {
+        return Ok((session, SessionSigning::DelegatedThenOwner));
+    }
+    match load_session(n, w, id) {
+        Ok(Some(session)) if session.stopped || session.expires_ms <= petal::sdk::now_ms() => {
+            Ok((session, SessionSigning::Owner))
+        }
+        // An unloadable or still-live session keeps the original denial.
+        _ => Err(petal::error(-1, "session not found")),
+    }
 }
 
 fn record_session_error(
@@ -1715,6 +1761,8 @@ fn session_submit(
     vault_str: Option<String>,
     expires: Option<u64>,
     explicit_nonce: Option<u64>,
+    signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
     if let Err(e) = action.validate() {
         return invalid(e);
@@ -1738,6 +1786,9 @@ fn session_submit(
         Err(e) => return e,
     };
     if completed {
+        if let Err(e) = clear_cleanup_replay(replay_key) {
+            return e;
+        }
         return ok_write();
     }
     let action_kind = action.kind();
@@ -1775,16 +1826,26 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match sign_payload(
-        ctx,
-        w,
-        &signing_payload,
-        "hyperliquid.agent_action",
-        None,
-        Some(s.key_ref_jcs.clone()),
-        None,
-        ClaimEffects::none(),
-    ) {
+    let sign = |key_ref_jcs| {
+        sign_payload(
+            ctx,
+            w,
+            &signing_payload,
+            "hyperliquid.agent_action",
+            None,
+            key_ref_jcs,
+            None,
+            ClaimEffects::none(),
+        )
+    };
+    let mut signed = sign(match signing {
+        SessionSigning::Owner => None,
+        _ => Some(s.key_ref_jcs.clone()),
+    });
+    if signing.retry_as_owner(&signed) {
+        signed = sign(None);
+    }
+    let sig = match signed {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
             Err(e) => return backend(e),
@@ -1793,6 +1854,18 @@ fn session_submit(
             action_id,
             expires_ms,
         }) => {
+            if let Some(key) = replay_key
+                && let Err(e) = save_json(
+                    key.to_owned(),
+                    &CleanupReplay {
+                        action: action.clone(),
+                        expires_ms,
+                    },
+                    false,
+                )
+            {
+                return e;
+            }
             return approval(
                 "agent_action",
                 &json!({"action_id": action_id, "expires_ms": expires_ms, "session": id}),
@@ -1807,7 +1880,13 @@ fn session_submit(
     if let Err(e) = mark_session_receipt_submission(n, w, id, &receipt_reservations) {
         return e;
     }
-    match http_json(n, "/exchange", payload) {
+    let submitted = http_json(n, "/exchange", payload);
+    if submitted.is_ok()
+        && let Err(e) = clear_cleanup_replay(replay_key)
+    {
+        return e;
+    }
+    match submitted {
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 record_session_error(n, w, id, s, nonce, action_kind, &e);
@@ -1880,6 +1959,8 @@ pub fn session_action_write(
         req.vault_address,
         req.expires_after,
         req.nonce,
+        SessionSigning::Delegated,
+        None,
     )
 }
 
@@ -1931,6 +2012,7 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+#[allow(clippy::too_many_arguments)]
 fn session_agent_submit(
     ctx: &Ctx,
     n: Network,
@@ -1938,8 +2020,12 @@ fn session_agent_submit(
     id: &str,
     s: &mut Session,
     action: ExchangeAction,
+    signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
-    session_submit(ctx, n, w, id, s, action, None, None, None, None)
+    session_submit(
+        ctx, n, w, id, s, action, None, None, None, None, signing, replay_key,
+    )
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -1990,6 +2076,7 @@ fn session_cancel_all(
     w: &str,
     id: &str,
     s: &mut Session,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     let open = match http_json(
         n,
@@ -2038,7 +2125,7 @@ fn session_cancel_all(
         Ok(v) => v,
         Err(e) => return invalid(e.to_string()),
     };
-    session_agent_submit(ctx, n, w, id, s, action)
+    session_agent_submit(ctx, n, w, id, s, action, signing, None)
 }
 fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String> {
     let x: f64 = raw
@@ -2076,7 +2163,16 @@ fn session_close_all(
     w: &str,
     id: &str,
     s: &mut Session,
+    signing: SessionSigning,
 ) -> DispatchResponse {
+    let replay_key = session_key(n, w, id, "close_all_replay.json");
+    let pending = match load_json::<CleanupReplay>(replay_key.clone()) {
+        Ok(pending) => pending,
+        Err(e) => return e,
+    };
+    if let Some(action) = live_cleanup_replay(pending, petal::sdk::now_ms()) {
+        return session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()));
+    }
     let state = match http_json(
         n,
         "/info",
@@ -2147,7 +2243,7 @@ fn session_close_all(
         grouping: protocol::Grouping::Na,
         builder: None,
     };
-    session_agent_submit(ctx, n, w, id, s, action)
+    session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()))
 }
 fn canonical_abs_decimal(raw: &str) -> String {
     let mut value = raw.strip_prefix('-').unwrap_or(raw).to_owned();
@@ -2298,11 +2394,7 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
 /// lowercase ASCII letter, so an on-chain address can never sign. Reject that
 /// here rather than several layers down as an unqualified permission error.
 fn session_wallet_id(w: &str) -> Result<String, String> {
-    let wallet_id = parse_wallet_id(w)?;
-    if !wallet_id.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err("session routes are addressed by wallet id, not by on-chain address".into());
-    }
-    Ok(wallet_id)
+    parse_wallet_id(w)
 }
 
 pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
@@ -2310,10 +2402,9 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
-    let wallet_id = match session_wallet_id(&w) {
-        Ok(wallet_id) => wallet_id,
-        Err(error) => return invalid(error),
-    };
+    if let Err(error) = session_wallet_id(&w) {
+        return invalid(error);
+    }
     let agent_name = match session_preflight(&req) {
         Ok(agent_name) => agent_name,
         Err(error) => return invalid(error),
@@ -2380,7 +2471,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(&wallet_id, &req.id, lifetime_ms) {
+    let derived = match request_session_key(n, &w, &req.id, lifetime_ms) {
         Ok(petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
@@ -2623,16 +2714,6 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_key_scope_includes_derivation_and_action_routes() {
-        assert_eq!(
-            SESSION_KEY_ALLOWED_ROUTES,
-            [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-            ]
-        );
-    }
-
     fn bounded_session() -> Session {
         Session {
             schema: "bloom.hyperliquid_agent_session.v1".into(),
@@ -2687,8 +2768,14 @@ mod tests {
 
     #[test]
     fn session_key_slots_are_lowercase_broker_tokens_for_timestamped_ids() {
-        let first = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef");
-        let second = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef");
+        let first = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let second = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814t150000z-0123456789abcdef",
+        );
 
         assert_eq!(first.len(), 64);
         assert!(first.starts_with("hyperliquid-"));
@@ -2698,6 +2785,64 @@ mod tests {
                 .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' })
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_key_slots_differ_across_networks_for_the_same_id() {
+        let mainnet = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let testnet = session_key_slot(
+            Network::Testnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+
+        assert_ne!(mainnet, testnet);
+    }
+
+    #[test]
+    fn only_a_denied_cleanup_key_falls_back_to_owner_signing() {
+        let denied = Err(SdkError::Host(HostStatus::Denied).message());
+        let backend = Err(SdkError::Host(HostStatus::Backend).message());
+        let pending = Ok(SignOutcome::ApprovalPending {
+            action_id: "a".into(),
+            expires_ms: 1,
+        });
+        assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&denied));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&backend));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&pending));
+        // Trading never escalates to the owner, and owner signing has no
+        // delegated attempt to retry.
+        assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
+        assert!(!SessionSigning::Owner.retry_as_owner(&denied));
+    }
+
+    #[test]
+    fn close_all_replays_the_pending_order_until_its_approval_expires() {
+        let order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": false, "p": "90250", "s": "0.01", "r": true,
+                "t": {"limit": {"tif": "Ioc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        let stored = serde_json::to_vec(&CleanupReplay {
+            action: order.clone(),
+            expires_ms: 2_000,
+        })
+        .unwrap();
+        let pending = || serde_json::from_slice::<CleanupReplay>(&stored).ok();
+        // The replayed order signs to the same payload the owner approved.
+        let replayed = live_cleanup_replay(pending(), 1_999).unwrap();
+        assert_eq!(
+            session_operation_digest(&replayed, None, None).unwrap(),
+            session_operation_digest(&order, None, None).unwrap()
+        );
+        assert!(live_cleanup_replay(pending(), 2_000).is_none());
+        assert!(live_cleanup_replay(None, 0).is_none());
     }
 
     #[test]
@@ -2845,17 +2990,25 @@ mod tests {
 
     #[test]
     fn withdrawal_is_outside_the_delegated_session_scope() {
-        // The withdrawal route leaves sort after every session route, so its
-        // ids must never appear in the derived-key scope; if a route file is
-        // ever inserted ahead of them, this pins the authority boundary.
-        assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000045"),
-            "session scope must stay below the withdrawal routes"
-        );
-        let expected = [
-            "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
-        ];
-        assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
+        // The derived-key scope is declared by route pattern in petal.toml;
+        // no owner-only exchange route, withdrawals included, may enter it.
+        let manifest = include_str!("../../petal.toml");
+        let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
+        let (_, routes) = derive.split_once("allowed_routes = [").unwrap();
+        let (routes, _) = routes.split_once("\n]").unwrap();
+        let routes = routes
+            .split(',')
+            .map(|route| route.trim().trim_matches('"'))
+            .filter(|route| !route.is_empty())
+            .collect::<Vec<_>>();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert!(
+                route.starts_with("[network]/agent_sessions/[wallet]/[session]/"),
+                "{route}"
+            );
+            assert!(!route.contains("withdraw"), "{route}");
+        }
     }
 
     #[test]
@@ -3225,7 +3378,7 @@ mod tests {
                 "an address-shaped wallet must be rejected: {address}"
             );
             assert!(
-                rejected.unwrap_err().contains("addressed by wallet id"),
+                rejected.unwrap_err().contains("Bloom wallet id"),
                 "the error must say which identifier belongs where"
             );
         }
