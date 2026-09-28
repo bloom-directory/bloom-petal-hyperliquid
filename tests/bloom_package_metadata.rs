@@ -6,66 +6,66 @@ const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/cancel.json",
-        "r000041",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+        "r000008",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/cancel_all",
-        "r000042",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+        "r000009",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/close_all",
-        "r000043",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+        "r000010",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/order.json",
-        "r000046",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+        "r000013",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/schedule_cancel.json",
-        "r000052",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+        "r000019",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/agent_sessions/[session]/update_leverage.json",
-        "r000056",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
+        "r000023",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/wallets/[wallet]/[index]/agent_sessions/new.json", "r000058");
+const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/[index]/new.json", "r000025");
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
-        "[network]/wallets/[wallet]/[index]/exchange/cancel.json",
+        "[network]/exchange/[wallet]/[index]/cancel.json",
         "hyperliquid.cancel",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/cancel_by_cloid.json",
+        "[network]/exchange/[wallet]/[index]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/order.json",
+        "[network]/exchange/[wallet]/[index]/order.json",
         "hyperliquid.order",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/schedule_cancel.json",
+        "[network]/exchange/[wallet]/[index]/schedule_cancel.json",
         "hyperliquid.schedule_cancel",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/send_asset.json",
+        "[network]/exchange/[wallet]/[index]/send_asset.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/update_leverage.json",
+        "[network]/exchange/[wallet]/[index]/update_leverage.json",
         "hyperliquid.update_leverage",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/usd_class_transfer.json",
+        "[network]/exchange/[wallet]/[index]/usd_class_transfer.json",
         "hyperliquid.usd_class_transfer",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/usd_send.json",
+        "[network]/exchange/[wallet]/[index]/usd_send.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/wallets/[wallet]/[index]/exchange/withdraw.json",
+        "[network]/exchange/[wallet]/[index]/withdraw.json",
         "hyperliquid.withdraw",
     ),
 ];

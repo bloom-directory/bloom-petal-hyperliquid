@@ -40,7 +40,7 @@ funds without explicit authorization.
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/hyperliquid/<network>/wallets/<wallet>/<index>/{exchange,agent_sessions}/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
+Select a wallet and numbered account under `/petals/hyperliquid/<network>/{exchange,agent_sessions}/<wallet>/<index>/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
 
 `[wallet]` and adjacent `[index]` are explicit route captures. Bloom resolves them against the live core wallet projection and supplies trusted `bloom.wallet` and `bloom.account` context. Every numbered account, including 0, has a separate private store. Legacy unnumbered settings and sessions are not carried into account 0. The core wallet tree remains `/wallets/<wallet>/<index>/`.
 
