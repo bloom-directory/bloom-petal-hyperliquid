@@ -75,7 +75,7 @@ jobs:
           "$RUNNER_TEMP/petal" package \
             --root . \
             --out "$RUNNER_TEMP/hyperliquid-ci.petal.tar.gz" \
-            | jq -e '.routes == 72'
+            | jq -e '.routes == 73'
 
       - name: Check out exact Bloom package contract
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -98,8 +98,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          new_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/new.json.wasm'
-          action_route='petal/hyperliquid/[network]/agent_sessions/[wallet]/[session]/cancel.json.wasm'
+          new_route='petal/hyperliquid/[network]/wallets/[wallet]/[index]/agent_sessions/new.json.wasm'
+          action_route='petal/hyperliquid/[network]/wallets/[wallet]/[index]/agent_sessions/[session]/cancel.json.wasm'
           wasm-tools component wit "$new_route" | grep -Fq 'import bloom:key/derive@0.1.0;'
           wasm-tools component wit "$new_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'
           wasm-tools component wit "$action_route" | grep -Fq 'import bloom:sign/signing@0.2.0;'

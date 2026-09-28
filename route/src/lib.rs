@@ -24,7 +24,8 @@ pub fn static_list(names: &[(&str, bool, bool)]) -> Vec<petal::RouteChild> {
 mod tests {
     #[test]
     fn agent_session_creation_declares_key_derivation_capability() {
-        let source = include_str!("../files/[network]/agent_sessions/[wallet]/new.json.rs");
+        let source =
+            include_str!("../files/[network]/wallets/[wallet]/[index]/agent_sessions/new.json.rs");
         assert!(source.contains("bloom:key.derive"));
     }
 }

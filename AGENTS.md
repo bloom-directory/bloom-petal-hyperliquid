@@ -40,4 +40,10 @@ funds without explicit authorization.
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/hyperliquid/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
+Select a wallet and numbered account under `/petals/hyperliquid/<network>/wallets/<wallet>/<index>/{exchange,agent_sessions}/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
+
+`[wallet]` and adjacent `[index]` are explicit route captures. Bloom resolves them against the live core wallet projection and supplies trusted `bloom.wallet` and `bloom.account` context. Every numbered account, including 0, has a separate private store. Legacy unnumbered settings and sessions are not carried into account 0. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+
+Before upgrading from routes without `[index]`, finish and reconcile pending operations using the installed build. Retain its package and private records until recovery is complete; do not delete them. A new route/package cannot inspect outbox entries staged by the old route/package. Core wallet custody and outbox entries remain intact. Modern numbered account stores are carried through signed package lineage; the legacy unnumbered store is not automatically imported.
+For submitted withdrawals, inspect the old nonce/action record and venue withdrawal ledger before retrying; acceptance is not settlement proof. Stop/revoke old venue agents before establishing new numbered sessions, retaining the old public session state and Signer custody references for recovery.
