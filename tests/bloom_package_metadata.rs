@@ -30,7 +30,10 @@ const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
         "r000023",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/[index]/new.json", "r000025");
+const DERIVATION_ROUTE: (&str, &str) = (
+    "[network]/agent_sessions/[wallet]/[index]/new.json",
+    "r000025",
+);
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/[index]/cancel.json",
@@ -108,6 +111,51 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .get(DERIVATION_ROUTE.0)
         .expect("agent-session derivation route");
     assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
+
+    // Inspect the exact packaged runtime source, not a second manifest-only
+    // list: request_session_key passes this constant to derive_key.
+    let workflow = package
+        .files
+        .iter()
+        .find(|file| file.path == "route/src/workflow.rs")
+        .expect("packaged session runtime source");
+    let workflow = std::str::from_utf8(&workflow.bytes).expect("UTF-8 runtime source");
+    let runtime_scope = workflow
+        .split("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [")
+        .nth(1)
+        .expect("runtime key scope declaration")
+        .split("];")
+        .next()
+        .unwrap();
+    let runtime_scope = runtime_scope
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
+        .collect::<Vec<_>>();
+    let request = workflow
+        .split("fn request_session_key(")
+        .nth(1)
+        .expect("runtime derivation request")
+        .split("fn session_key_slot(")
+        .next()
+        .unwrap();
+    assert!(request.contains("allowed_routes: SESSION_KEY_ALLOWED_ROUTES"));
+    let mut expected_scope = SESSION_ACTION_ROUTES
+        .iter()
+        .map(|(pattern, _)| {
+            routes
+                .get(pattern)
+                .expect("session action route")
+                .route_id
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    expected_scope.push(derivation.route_id.as_str());
+    assert_eq!(
+        runtime_scope, expected_scope,
+        "runtime derivation scope must match the exact package's action and creation routes"
+    );
+
     assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),

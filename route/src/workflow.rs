@@ -12,13 +12,13 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000058 is the session-creation route that invokes derive_key. The Machine
+// r000025 is the session-creation route that invokes derive_key. The Machine
 // host requires the executing route to be part of the immutable derived-key
 // scope, alongside the routes that later use the session key. Machine derives
 // one route-specific reusable Sealed Approval from this installer-verified set
 // before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000041", "r000042", "r000043", "r000046", "r000052", "r000056", "r000058",
+    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2628,7 +2628,7 @@ mod tests {
         assert_eq!(
             SESSION_KEY_ALLOWED_ROUTES,
             [
-                "r000041", "r000042", "r000043", "r000046", "r000052", "r000056", "r000058",
+                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
             ]
         );
     }
@@ -2849,11 +2849,11 @@ mod tests {
         // ids must never appear in the derived-key scope; if a route file is
         // ever inserted ahead of them, this pins the authority boundary.
         assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000070"),
+            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000046"),
             "session scope must stay below the withdrawal routes"
         );
         let expected = [
-            "r000041", "r000042", "r000043", "r000046", "r000052", "r000056", "r000058",
+            "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
         ];
         assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
     }
