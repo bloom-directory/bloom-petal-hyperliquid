@@ -5,49 +5,49 @@ use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[&str] = &[
-    "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-    "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-    "[network]/agent_sessions/[wallet]/[session]/close_all",
-    "[network]/agent_sessions/[wallet]/[session]/order.json",
-    "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-    "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
 ];
-const DERIVATION_ROUTE: &str = "[network]/agent_sessions/[wallet]/new.json";
+const DERIVATION_ROUTE: &str = "[network]/agent_sessions/[wallet]/[index]/new.json";
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
-        "[network]/exchange/[wallet]/cancel.json",
+        "[network]/exchange/[wallet]/[index]/cancel.json",
         "hyperliquid.cancel",
     ),
     (
-        "[network]/exchange/[wallet]/cancel_by_cloid.json",
+        "[network]/exchange/[wallet]/[index]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
     ),
     (
-        "[network]/exchange/[wallet]/order.json",
+        "[network]/exchange/[wallet]/[index]/order.json",
         "hyperliquid.order",
     ),
     (
-        "[network]/exchange/[wallet]/schedule_cancel.json",
+        "[network]/exchange/[wallet]/[index]/schedule_cancel.json",
         "hyperliquid.schedule_cancel",
     ),
     (
-        "[network]/exchange/[wallet]/send_asset.json",
+        "[network]/exchange/[wallet]/[index]/send_asset.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/exchange/[wallet]/update_leverage.json",
+        "[network]/exchange/[wallet]/[index]/update_leverage.json",
         "hyperliquid.update_leverage",
     ),
     (
-        "[network]/exchange/[wallet]/usd_class_transfer.json",
+        "[network]/exchange/[wallet]/[index]/usd_class_transfer.json",
         "hyperliquid.usd_class_transfer",
     ),
     (
-        "[network]/exchange/[wallet]/usd_send.json",
+        "[network]/exchange/[wallet]/[index]/usd_send.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/exchange/[wallet]/withdraw.json",
+        "[network]/exchange/[wallet]/[index]/withdraw.json",
         "hyperliquid.withdraw",
     ),
 ];

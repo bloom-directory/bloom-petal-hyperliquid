@@ -3004,7 +3004,7 @@ mod tests {
         assert!(!routes.is_empty());
         for route in routes {
             assert!(
-                route.starts_with("[network]/agent_sessions/[wallet]/[session]/"),
+                route.starts_with("[network]/agent_sessions/[wallet]/[index]/[session]/"),
                 "{route}"
             );
             assert!(!route.contains("withdraw"), "{route}");

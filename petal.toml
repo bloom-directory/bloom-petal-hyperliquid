@@ -31,15 +31,15 @@ paths = ["/info", "/exchange"]
 allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.withdraw", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
 
 [[key.derive]]
-route = "[network]/agent_sessions/[wallet]/new.json"
+route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["hyperliquid.agent_action"]
 allowed_routes = [
-  "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-  "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-  "[network]/agent_sessions/[wallet]/[session]/close_all",
-  "[network]/agent_sessions/[wallet]/[session]/order.json",
-  "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-  "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
 ]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 maximum_lifetime_ms = 86400000
