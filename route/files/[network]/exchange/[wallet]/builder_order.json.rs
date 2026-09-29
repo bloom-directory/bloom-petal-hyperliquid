@@ -1,9 +1,9 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("hyperliquid.order")
+    spec: petal::signing_write_spec("hyperliquid.builder_order")
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid order.json request; signed actions require Bloom approval"
+            "description": "write a Hyperliquid order that carries a builder fee ({\"b\": lowercase builder address, \"f\": fee in tenths of a basis point}); signed under the fee-bearing hyperliquid.builder_order class and requires Bloom approval"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
@@ -30,17 +30,17 @@ petal::route_file!(
             return petal::error(
                 -3,
                 format!(
-                    "order.json cannot submit action type {}",
+                    "builder_order.json cannot submit action type {}",
                     request.action.kind()
                 ),
             );
         }
-        if request.action.carries_builder() {
+        if !request.action.carries_builder() {
             return petal::error(
                 -3,
-                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
+                "builder_order.json requires an order carrying a builder fee; write orders without one to order.json",
             );
         }
-        crate::owner_action_write(ctx, network, wallet, "order.json", body, request)
+        crate::owner_action_write(ctx, network, wallet, "builder_order.json", body, request)
     }
 );

@@ -10,11 +10,14 @@ Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `approve_builder_fee.json` are owner-only, signed by the main wallet, and
 deliberately absent from the delegated agent session surface. `send_asset.json`
 is a deprecated alias for `usd_send.json`; it does not implement Hyperliquid's
-generalized `sendAsset` action. `order.json` may carry an optional per-order
-`builder` fee; it is signed only under an authorization claim that names the
-builder address and exact fee, and a delegated session may use one only if it
-was created with a matching `builder_address`/`max_builder_fee_tenths_bps`
-bound. Owner-signed actions may return an approval-required error;
+generalized `sendAsset` action. An order carrying a per-order `builder` fee is
+written to `builder_order.json` (owner-signed, or through the session route of
+the same name), which signs under `hyperliquid.builder_order`, the Petal's only
+fee-bearing operation class; `order.json` refuses a builder. It is signed only
+under an authorization claim that names the builder address and exact fee,
+and a delegated session may use one only if it was created with a matching
+`builder_address`/`max_builder_fee_tenths_bps` bound, which is also what adds
+the builder-order route and class to that session key's scope. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
 are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
 must be inspected through their `status.json`, `last_response.json`, and

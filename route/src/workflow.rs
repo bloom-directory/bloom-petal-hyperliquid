@@ -19,8 +19,12 @@ const CLOSE_SLIPPAGE: f64 = 0.05;
 // one route-specific reusable Sealed Approval from this installer-verified set
 // before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+    "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
 ];
+/// `[session]/builder_order.json`. Added to a session key's scope, together
+/// with `BUILDER_ORDER_INTENT`, only when the session was created with a
+/// builder bound; a session without one has no builder fee to authorize.
+const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = "r000008";
 
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
@@ -1012,19 +1016,46 @@ fn request_session_key(
     wallet: &str,
     session_id: &str,
     lifetime_ms: u64,
+    builder_bound: bool,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
+    let (allowed_routes, allowed_operation_classes) = session_key_scope(builder_bound);
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
         key_slot: session_key_slot(session_id),
-        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
+        allowed_routes,
+        allowed_operation_classes,
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
+}
+
+/// The routes and operation classes a session key may sign for. A session
+/// created with a builder bound additionally gets the builder-order route and
+/// its fee-bearing class; every other session is scoped to the fee-free
+/// `hyperliquid.agent_action` surface only.
+fn session_key_scope(builder_bound: bool) -> (Vec<String>, Vec<String>) {
+    let mut routes = SESSION_KEY_ALLOWED_ROUTES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut classes = vec!["hyperliquid.agent_action".to_owned()];
+    if builder_bound {
+        routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned());
+        classes.push(protocol::BUILDER_ORDER_INTENT.to_owned());
+    }
+    (routes, classes)
+}
+
+/// The class a session-signed action is authorized under. A builder-bearing
+/// order declares a fee, so it signs under `BUILDER_ORDER_INTENT` rather than
+/// the fee-free `hyperliquid.agent_action` every other session action uses.
+fn session_operation_class(action: &ExchangeAction) -> &'static str {
+    if action.carries_builder() {
+        protocol::BUILDER_ORDER_INTENT
+    } else {
+        "hyperliquid.agent_action"
+    }
 }
 
 fn session_key_slot(session_id: &str) -> String {
@@ -1628,7 +1659,7 @@ fn session_submit(
         ctx,
         w,
         &signing_payload,
-        "hyperliquid.agent_action",
+        session_operation_class(&action),
         None,
         Some(s.key_ref_jcs.clone()),
         effects,
@@ -2279,7 +2310,12 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(&wallet_id, &req.id, lifetime_ms) {
+    let derived = match request_session_key(
+        &wallet_id,
+        &req.id,
+        lifetime_ms,
+        req.builder_address.is_some(),
+    ) {
         Ok(petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
@@ -2528,9 +2564,56 @@ mod tests {
         assert_eq!(
             SESSION_KEY_ALLOWED_ROUTES,
             [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+                "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
             ]
         );
+        assert_eq!(SESSION_KEY_BUILDER_ORDER_ROUTE, "r000008");
+    }
+
+    #[test]
+    fn session_key_scope_adds_the_builder_order_surface_only_with_a_bound() {
+        let (routes, classes) = session_key_scope(false);
+        assert_eq!(routes, SESSION_KEY_ALLOWED_ROUTES);
+        assert_eq!(classes, ["hyperliquid.agent_action"]);
+
+        let (routes, classes) = session_key_scope(true);
+        assert_eq!(routes.len(), SESSION_KEY_ALLOWED_ROUTES.len() + 1);
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(SESSION_KEY_BUILDER_ORDER_ROUTE)
+        );
+        assert_eq!(
+            classes,
+            ["hyperliquid.agent_action", protocol::BUILDER_ORDER_INTENT]
+        );
+    }
+
+    #[test]
+    fn session_actions_sign_under_the_builder_order_class_only_with_a_builder() {
+        let plain: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&plain), "hyperliquid.agent_action");
+        let with_builder: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        assert_eq!(
+            session_operation_class(&with_builder),
+            protocol::BUILDER_ORDER_INTENT
+        );
+        let cancel: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancel",
+            "cancels": [{"a": 0, "o": 1}]
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&cancel), "hyperliquid.agent_action");
     }
 
     fn bounded_session() -> Session {

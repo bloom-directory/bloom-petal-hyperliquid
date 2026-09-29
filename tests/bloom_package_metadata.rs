@@ -3,34 +3,39 @@ use std::{collections::BTreeMap, env};
 use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
+const BUILDER_ORDER_INTENT: &str = "hyperliquid.builder_order";
+const SESSION_BUILDER_ORDER_ROUTE: (&str, &str) = (
+    "[network]/agent_sessions/[wallet]/[session]/builder_order.json",
+    "r000008",
+);
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-        "r000008",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/cancel_all",
         "r000009",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[session]/close_all",
+        "[network]/agent_sessions/[wallet]/[session]/cancel_all",
         "r000010",
     ),
     (
+        "[network]/agent_sessions/[wallet]/[session]/close_all",
+        "r000011",
+    ),
+    (
         "[network]/agent_sessions/[wallet]/[session]/order.json",
-        "r000013",
+        "r000014",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-        "r000019",
+        "r000020",
     ),
     (
         "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
-        "r000023",
+        "r000024",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000025");
+const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000026");
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/approve_builder_fee.json",
@@ -43,6 +48,10 @@ const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
+    ),
+    (
+        "[network]/exchange/[wallet]/builder_order.json",
+        BUILDER_ORDER_INTENT,
     ),
     (
         "[network]/exchange/[wallet]/order.json",
@@ -108,7 +117,9 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .get(DERIVATION_ROUTE.0)
         .expect("agent-session derivation route");
     assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
-    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
+    let mut derived_classes = operation_classes(derivation);
+    derived_classes.sort_unstable();
+    assert_eq!(derived_classes, [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
@@ -145,6 +156,17 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert_eq!(required_caps(route), ACTION_CAPS, "{pattern}");
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
+
+    let builder_order = routes
+        .get(SESSION_BUILDER_ORDER_ROUTE.0)
+        .expect("session builder-order route");
+    assert_eq!(builder_order.route_id, SESSION_BUILDER_ORDER_ROUTE.1);
+    assert_eq!(
+        builder_order.install_metadata.sign_intent.as_deref(),
+        Some(BUILDER_ORDER_INTENT)
+    );
+    assert_eq!(required_caps(builder_order), ACTION_CAPS);
+    assert!(builder_order.key_derive_operation_classes.is_empty());
 
     let agent_action_routes = package
         .route_index

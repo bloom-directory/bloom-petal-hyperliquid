@@ -150,12 +150,25 @@ impl ExchangeAction {
     }
     pub fn intent(&self) -> &'static str {
         match self {
+            Self::Order {
+                builder: Some(_), ..
+            } => BUILDER_ORDER_INTENT,
             Self::Order { .. } => "hyperliquid.order",
             Self::Cancel { .. } => "hyperliquid.cancel",
             Self::CancelByCloid { .. } => "hyperliquid.cancel_by_cloid",
             Self::ScheduleCancel { .. } => "hyperliquid.schedule_cancel",
             Self::UpdateLeverage { .. } => "hyperliquid.update_leverage",
         }
+    }
+    /// True for an order that names a builder, and therefore declares a fee.
+    pub fn carries_builder(&self) -> bool {
+        matches!(
+            self,
+            Self::Order {
+                builder: Some(_),
+                ..
+            }
+        )
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
@@ -264,6 +277,15 @@ pub const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
 /// Hyperliquid's venue-enforced builder fee ceiling for perpetual orders
 /// (0.1%), expressed in tenths of a basis point, the unit of `BuilderFee::f`.
 pub const MAX_PERP_BUILDER_FEE_TENTHS_BPS: u32 = 100;
+/// The operation class every builder-bearing order signs under, whether
+/// owner- or session-signed. It is the only class in this Petal whose claims
+/// declare a fee, so Bloom can enroll it as fee-bearing while
+/// `hyperliquid.order` and `hyperliquid.agent_action` stay fee-free. Broker
+/// requires a class to be uniformly one or the other: it refuses a
+/// fee-declaring claim in a fee-free class (`FEE_NOT_ALLOWED`) and a fee-free
+/// claim in a fee-bearing one (`FEE_REQUIRED`), so a mixed class would refuse
+/// one kind of order whichever way it was enrolled.
+pub const BUILDER_ORDER_INTENT: &str = "hyperliquid.builder_order";
 /// Hyperliquid's venue-enforced builder fee ceiling for spot orders (1%),
 /// expressed in tenths of a basis point, the unit of `BuilderFee::f`.
 pub const MAX_SPOT_BUILDER_FEE_TENTHS_BPS: u32 = 1_000;
@@ -978,6 +1000,28 @@ mod tests {
             "builder": {"b": address, "f": fee_tenths_bps}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn builder_orders_sign_under_their_own_fee_bearing_intent() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        let with_builder = order_with_builder(0, addr, 10);
+        assert!(with_builder.carries_builder());
+        assert_eq!(with_builder.intent(), BUILDER_ORDER_INTENT);
+        assert_eq!(BUILDER_ORDER_INTENT, "hyperliquid.builder_order");
+        let ExchangeAction::Order {
+            orders, grouping, ..
+        } = with_builder
+        else {
+            unreachable!()
+        };
+        let without = ExchangeAction::Order {
+            orders,
+            grouping,
+            builder: None,
+        };
+        assert!(!without.carries_builder());
+        assert_eq!(without.intent(), "hyperliquid.order");
     }
 
     #[test]
