@@ -6,66 +6,69 @@ const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     (
-        "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-        "r000007",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[session]/cancel_all",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
         "r000008",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[session]/close_all",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
         "r000009",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[session]/order.json",
-        "r000012",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+        "r000010",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-        "r000018",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+        "r000013",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
-        "r000022",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+        "r000019",
+    ),
+    (
+        "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
+        "r000023",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/new.json", "r000024");
+const DERIVATION_ROUTE: (&str, &str) = (
+    "[network]/agent_sessions/[wallet]/[index]/new.json",
+    "r000025",
+);
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
-        "[network]/exchange/[wallet]/cancel.json",
+        "[network]/exchange/[wallet]/[index]/cancel.json",
         "hyperliquid.cancel",
     ),
     (
-        "[network]/exchange/[wallet]/cancel_by_cloid.json",
+        "[network]/exchange/[wallet]/[index]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
     ),
     (
-        "[network]/exchange/[wallet]/order.json",
+        "[network]/exchange/[wallet]/[index]/order.json",
         "hyperliquid.order",
     ),
     (
-        "[network]/exchange/[wallet]/schedule_cancel.json",
+        "[network]/exchange/[wallet]/[index]/schedule_cancel.json",
         "hyperliquid.schedule_cancel",
     ),
     (
-        "[network]/exchange/[wallet]/send_asset.json",
+        "[network]/exchange/[wallet]/[index]/send_asset.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/exchange/[wallet]/update_leverage.json",
+        "[network]/exchange/[wallet]/[index]/update_leverage.json",
         "hyperliquid.update_leverage",
     ),
     (
-        "[network]/exchange/[wallet]/usd_class_transfer.json",
+        "[network]/exchange/[wallet]/[index]/usd_class_transfer.json",
         "hyperliquid.usd_class_transfer",
     ),
     (
-        "[network]/exchange/[wallet]/usd_send.json",
+        "[network]/exchange/[wallet]/[index]/usd_send.json",
         "hyperliquid.usd_send",
     ),
     (
-        "[network]/exchange/[wallet]/withdraw.json",
+        "[network]/exchange/[wallet]/[index]/withdraw.json",
         "hyperliquid.withdraw",
     ),
 ];
@@ -108,6 +111,51 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .get(DERIVATION_ROUTE.0)
         .expect("agent-session derivation route");
     assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
+
+    // Inspect the exact packaged runtime source, not a second manifest-only
+    // list: request_session_key passes this constant to derive_key.
+    let workflow = package
+        .files
+        .iter()
+        .find(|file| file.path == "route/src/workflow.rs")
+        .expect("packaged session runtime source");
+    let workflow = std::str::from_utf8(&workflow.bytes).expect("UTF-8 runtime source");
+    let runtime_scope = workflow
+        .split("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [")
+        .nth(1)
+        .expect("runtime key scope declaration")
+        .split("];")
+        .next()
+        .unwrap();
+    let runtime_scope = runtime_scope
+        .split('"')
+        .enumerate()
+        .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
+        .collect::<Vec<_>>();
+    let request = workflow
+        .split("fn request_session_key(")
+        .nth(1)
+        .expect("runtime derivation request")
+        .split("fn session_key_slot(")
+        .next()
+        .unwrap();
+    assert!(request.contains("allowed_routes: SESSION_KEY_ALLOWED_ROUTES"));
+    let mut expected_scope = SESSION_ACTION_ROUTES
+        .iter()
+        .map(|(pattern, _)| {
+            routes
+                .get(pattern)
+                .expect("session action route")
+                .route_id
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    expected_scope.push(derivation.route_id.as_str());
+    assert_eq!(
+        runtime_scope, expected_scope,
+        "runtime derivation scope must match the exact package's action and creation routes"
+    );
+
     assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),

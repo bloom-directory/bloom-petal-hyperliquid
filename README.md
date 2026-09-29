@@ -90,7 +90,7 @@ default set). To install this repository manually while developing:
 ```sh
 bloom petals install https://github.com/bloom-directory/bloom-petal-hyperliquid
 bloom vfs cat /petals/hyperliquid/README.md
-bloom vfs ls /petals/hyperliquid/mainnet
+bloom vfs ls /petals/hyperliquid/mainnet/exchange/main/0
 ```
 
 The Petal packager includes the repository-root `README.md` and `AGENTS.md`.
@@ -111,3 +111,13 @@ a `v` prefix and publish:
 Published assets are immutable. Bloom's built-in catalog pins the release tag,
 source commit, archive name, and package hash. The route crate and canonical
 Petal SDK are locked in `route/Cargo.lock`.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/hyperliquid/<network>/{exchange,agent_sessions}/<wallet>/<index>/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
+
+`[wallet]` and adjacent `[index]` are explicit route captures. Bloom resolves them against the live core wallet projection and supplies trusted `bloom.wallet` and `bloom.account` context. Every numbered account, including 0, has a separate private store. Legacy unnumbered settings and sessions are not carried into account 0. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+
+Before upgrading from routes without `[index]`, finish and reconcile pending operations using the installed build. Retain its package and private records until recovery is complete; do not delete them. A new route/package cannot inspect outbox entries staged by the old route/package. Core wallet custody and outbox entries remain intact. Modern numbered account stores are carried through signed package lineage; the legacy unnumbered store is not automatically imported.
+For submitted withdrawals, inspect the old nonce/action record and venue withdrawal ledger before retrying; acceptance is not settlement proof. Stop/revoke old venue agents before establishing new numbered sessions, retaining the old public session state and Signer custody references for recovery.
