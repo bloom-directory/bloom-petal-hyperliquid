@@ -1,9 +1,9 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("hyperliquid.agent_action")
+    spec: petal::signing_write_spec("hyperliquid.builder_order")
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write one or more bounded session orders; Bloom signs them with the stored agent key",
+            "description": "write one or more bounded session orders that carry a builder fee; Bloom signs them with the stored agent key under the fee-bearing hyperliquid.builder_order class, which the session must have been created with a builder bound to use",
             "request_schema": {
                 "action": {
                     "type": "order",
@@ -17,7 +17,7 @@ petal::route_file!(
                         "c": "optional 16-byte 0x client order id"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
-                    "builder": "not accepted here; write a builder-bearing order to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class and requires the session's builder bound"
+                    "builder": {"b": "lowercase builder address matching the session's builder_address", "f": "fee in tenths of a basis point, at most the session's max_builder_fee_tenths_bps and the venue cap"}
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
@@ -34,7 +34,8 @@ petal::route_file!(
                         "t": {"limit": {"tif": "Alo"}},
                         "c": "0x00112233445566778899aabbccddeeff"
                     }],
-                    "grouping": "na"
+                    "grouping": "na",
+                    "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
                 }
             },
             "success_evidence": {
@@ -76,15 +77,15 @@ petal::route_file!(
             return petal::error(
                 -3,
                 format!(
-                    "order.json cannot submit action type {}",
+                    "builder_order.json cannot submit action type {}",
                     request.action.kind()
                 ),
             );
         }
-        if request.action.carries_builder() {
+        if !request.action.carries_builder() {
             return petal::error(
                 -3,
-                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
+                "builder_order.json requires an order carrying a builder fee; write orders without one to order.json",
             );
         }
         crate::session_action_write(ctx, network, &wallet, session, request)
