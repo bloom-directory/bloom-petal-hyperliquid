@@ -23,16 +23,16 @@ const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     ),
     (
         "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
-        "r000019",
+        "r000023",
     ),
     (
         "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
-        "r000023",
+        "r000027",
     ),
 ];
 const DERIVATION_ROUTE: (&str, &str) = (
     "[network]/agent_sessions/[wallet]/[index]/new.json",
-    "r000025",
+    "r000029",
 );
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (

@@ -361,7 +361,9 @@ fn decimal(name: &str, raw: &str) -> Result<(), String> {
         || raw.ends_with('0') && raw.contains('.')
         || !raw.chars().all(|c| c.is_ascii_digit() || c == '.')
     {
-        Err(format!("{name} must be a canonical decimal"))
+        Err(format!(
+            "{name} must be a canonical positive decimal string: no trailing fractional zeros, exponent notation, or sign; use 74907 instead of 74907.0"
+        ))
     } else {
         let value = raw
             .parse::<f64>()
@@ -1189,5 +1191,17 @@ mod tests {
             .is_err()
         );
         assert!(validate_exchange_response(&json!({"status":"ok"})).is_ok());
+    }
+
+    #[test]
+    fn mounted_canonical_decimal_examples_match_validation() {
+        for field in ["price", "size"] {
+            for valid in ["74907", "0.00011", "1.23"] {
+                assert!(decimal(field, valid).is_ok(), "{field}: {valid}");
+            }
+            for invalid in ["74907.0", "1.2300", "1e3", "+1", "-1", "0", ".1", "1."] {
+                assert!(decimal(field, invalid).is_err(), "{field}: {invalid}");
+            }
+        }
     }
 }
