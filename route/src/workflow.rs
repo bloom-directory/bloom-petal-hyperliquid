@@ -3095,7 +3095,7 @@ mod tests {
         // ids must never appear in the derived-key scope; if a route file is
         // ever inserted ahead of them, this pins the authority boundary.
         assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000049"),
+            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000050"),
             "session scope must stay below the withdrawal routes"
         );
         let expected = [

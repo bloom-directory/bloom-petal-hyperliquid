@@ -20,7 +20,7 @@ uncertain), never resubmit — reconcile through the record and venue reads. A
 nonce is bound to its exact action: reusing it for a different body is
 rejected, not treated as a retry. Owner-signed actions may return an approval-required error;
 retry the exact same body after completing the Bloom ceremony. Agent sessions
-are created through `agent_sessions/<wallet>/new.json` with a stable `id` and
+are created through `agent_sessions/new.json` with a stable `id` and
 must be inspected through their `status.json`, `last_response.json`, and
 `last_error.json` files.
 
@@ -37,3 +37,13 @@ route code.
 Never infer that a staged transaction, approval challenge, or accepted route
 write means a broadcast or fill completed. Do not use mainnet with material
 funds without explicit authorization.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/hyperliquid/<network>/{exchange,agent_sessions}/<wallet>/<index>/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
+
+`[wallet]` and adjacent `[index]` are explicit route captures. Bloom resolves them against the live core wallet projection and supplies trusted `bloom.wallet` and `bloom.account` context. Every numbered account, including 0, has a separate private store. Legacy unnumbered settings and sessions are not carried into account 0. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+
+Before upgrading from routes without `[index]`, finish and reconcile pending operations using the installed build. Retain its package and private records until recovery is complete; do not delete them. A new route/package cannot inspect outbox entries staged by the old route/package. Core wallet custody and outbox entries remain intact. Modern numbered account stores are carried through signed package lineage; the legacy unnumbered store is not automatically imported.
+For submitted withdrawals, inspect the old nonce/action record and venue withdrawal ledger before retrying; acceptance is not settlement proof. Stop/revoke old venue agents before establishing new numbered sessions, retaining the old public session state and Signer custody references for recovery.

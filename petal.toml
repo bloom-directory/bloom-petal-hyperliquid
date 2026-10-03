@@ -31,7 +31,7 @@ paths = ["/info", "/exchange"]
 allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.withdraw", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
 
 [[key.derive]]
-route = "[network]/agent_sessions/[wallet]/new.json"
+route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["hyperliquid.agent_action"]
 
 [store]
