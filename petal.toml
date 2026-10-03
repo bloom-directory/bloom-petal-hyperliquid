@@ -28,12 +28,13 @@ methods = ["post"]
 paths = ["/info", "/exchange"]
 
 [sign]
-allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.approve_builder_fee", "hyperliquid.order", "hyperliquid.builder_order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.withdraw", "hyperliquid.approve_builder_fee", "hyperliquid.order", "hyperliquid.builder_order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
 
 [[key.derive]]
-route = "[network]/agent_sessions/[wallet]/new.json"
+route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["hyperliquid.agent_action", "hyperliquid.builder_order"]
 
 [store]
 namespaces = ["state"]
+shared_keys = ["state/settings/builder-address"]
 secret_namespaces = ["secrets"] # approval reconciliation only; never key material

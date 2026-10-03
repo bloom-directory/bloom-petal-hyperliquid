@@ -25,6 +25,12 @@ surface. A delegated session may use a builder fee only if it was created with
 a matching `builder_address`/`max_builder_fee_tenths_bps` bound. Agent sessions provide owner-approved creation, bounded Signer-owned
 agent-key actions, stop, cancel-all, close-all, audit, and immutable action
 receipts keyed by client order ID under
+
+updates, raw signed payloads, internal USD sends, and spot/perp USDC class
+transfers, and owner-approved withdrawals to external chains
+(`withdraw3`). Agent sessions provide owner-approved creation, bounded
+Signer-owned agent-key actions, stop, cancel-all, close-all, audit, and
+immutable action receipts keyed by client order ID under
 `receipts/<cloid>/{order,cancel}.json`. These receipts correlate a specific
 order or cancel-by-CLOID response without racing the session's mutable
 `last_response.json`. The canonical transfer route is `usd_send.json`;
@@ -39,6 +45,25 @@ behalf: the builder needs at least 100 USDC in perps account value and must
 use standard account abstraction mode, and each user may hold at most 10
 active builder approvals at a time. Builder fees are capped by the venue at
 0.1% (100 tenths of a basis point) on perps and 1% (1000) on spot.
+
+The withdrawal route is `withdraw.json` with body
+`{"destination": "<Arbitrum address>", "amount": "<USDC decimal>"}`. It signs
+Hyperliquid's `withdraw3` user action, debits the gross amount from the
+account's withdrawable USDC, and settles on Arbitrum after the venue's
+finalization window. Hyperliquid deducts a flat venue fee from the withdrawn
+amount, so the destination receives the amount minus the fee; the route help,
+approval advisory, and the recorded operation state the fee and expected net
+without double-counting them into the debit. Every withdrawal's
+durable operation record — action identity, nonce, status
+(`approval_pending`, `submitted`, `accepted`, `rejected`), and venue response —
+is listed at `withdrawals/` and readable at `withdrawals/<nonce>.json`. Venue
+acceptance is not settlement proof; confirm the withdrawal ledger entry and
+the Arbitrum transaction before treating funds as arrived. An uncertain
+submission must be reconciled through its `withdrawals/<nonce>.json` record
+and venue reads: retrying the exact same body never creates a second
+withdrawal nonce, and a nonce is never reused for a different
+destination/amount. Withdrawals are owner-only and are excluded from delegated
+agent-session key scopes.
 
 Session actions that accept structured request bodies use JSON leaves, including
 `order.json`, `cancel.json`, and `update_leverage.json`. Lifecycle cleanup uses
@@ -90,8 +115,12 @@ default set). To install this repository manually while developing:
 ```sh
 bloom petals install https://github.com/bloom-directory/bloom-petal-hyperliquid
 bloom vfs cat /petals/hyperliquid/README.md
-bloom vfs ls /petals/hyperliquid/mainnet
+bloom vfs ls /petals/hyperliquid/mainnet/exchange/main/0
 ```
+
+The Petal packager includes the repository-root `README.md` and `AGENTS.md`.
+Bloom serves these files at the Petal root automatically; they do not need
+WASM routes or entries in the guest root index.
 
 ## Releases
 
@@ -121,3 +150,13 @@ Petal build, where `route/src/settings.rs` embeds it via `option_env!`. The
 secret is optional: an unconfigured repository, or a local build that does not
 set it, has no embedded default, and `approve_builder_fee.json` then requires
 the caller to supply `builder` explicitly.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/hyperliquid/<network>/{exchange,agent_sessions}/<wallet>/<index>/`. Market reads and `users/<account>/` address reads remain public under the network; `[account]` means an on-chain address and is distinct from `[index]`.
+
+`[wallet]` and adjacent `[index]` are explicit route captures. Bloom resolves them against the live core wallet projection and supplies trusted `bloom.wallet` and `bloom.account` context. Every numbered account, including 0, has a separate private store. Legacy unnumbered settings and sessions are not carried into account 0. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+
+Before upgrading from routes without `[index]`, finish and reconcile pending operations using the installed build. Retain its package and private records until recovery is complete; do not delete them. A new route/package cannot inspect outbox entries staged by the old route/package. Core wallet custody and outbox entries remain intact. Modern numbered account stores are carried through signed package lineage; the legacy unnumbered store is not automatically imported.
+For submitted withdrawals, inspect the old nonce/action record and venue withdrawal ledger before retrying; acceptance is not settlement proof. Stop/revoke old venue agents before establishing new numbered sessions, retaining the old public session state and Signer custody references for recovery.
