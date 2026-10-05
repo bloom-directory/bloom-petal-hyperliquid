@@ -1,18 +1,18 @@
 use serde::Serialize;
 
-/// The release build may embed the organization's own builder address so
-/// `approve_builder_fee.json` callers do not have to know or supply it. This
-/// is public on-chain data, not a credential, so unlike a secret API key
-/// there is no encryption-at-rest framing — only whether a default is
-/// present, and if so, whether it came from a release build or an operator
-/// override that can change it without cutting a new release.
-const EMBEDDED_DEFAULT_BUILDER: Option<&str> = option_env!("HYPERLIQUID_BUILDER_ADDRESS");
+/// This release's default builder address, used when an
+/// `approve_builder_fee.json` caller omits `builder` and no operator override
+/// is stored. It is public on-chain data, not a credential, so it lives here
+/// in source: a release can then be rebuilt byte for byte from its tag, and
+/// the package CI tests is the package that ships. Set it as a lowercase `0x`
+/// address; `release_default_if_set_is_a_lowercase_address` checks it.
+pub const RELEASE_DEFAULT_BUILDER: Option<&str> = None;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuilderAddressSource {
     StoreOverride,
-    EmbeddedRelease,
+    ReleaseDefault,
     Unconfigured,
 }
 
@@ -26,15 +26,15 @@ pub struct BuilderAddressStatus {
 /// Resolves the default builder address `approve_builder_fee.json` falls
 /// back to when the caller omits `builder`: an operator-set store override
 /// first, so the default can change without a release, then this release's
-/// embedded default, else none.
+/// source-declared default, else none.
 fn resolve_default(
-    embedded: Option<&str>,
+    release_default: Option<&str>,
     store_override: Option<&str>,
 ) -> Option<(String, BuilderAddressSource)> {
     if let Some(address) = store_override {
         return Some((address.to_owned(), BuilderAddressSource::StoreOverride));
     }
-    embedded.map(|address| (address.to_owned(), BuilderAddressSource::EmbeddedRelease))
+    release_default.map(|address| (address.to_owned(), BuilderAddressSource::ReleaseDefault))
 }
 
 /// Resolves the builder address an `approve_builder_fee.json` call should
@@ -42,31 +42,31 @@ fn resolve_default(
 /// an error naming what is missing.
 pub fn resolve_builder_address(
     explicit: Option<&str>,
-    embedded: Option<&str>,
+    release_default: Option<&str>,
     store_override: Option<&str>,
 ) -> Result<String, String> {
     if let Some(address) = explicit {
         return Ok(address.to_owned());
     }
-    resolve_default(embedded, store_override)
+    resolve_default(release_default, store_override)
         .map(|(address, _)| address)
         .ok_or_else(|| "builder address is required; no default builder is configured".into())
 }
 
-/// Convenience wrapper baking in this release's embedded default so callers
+/// Convenience wrapper baking in this release's declared default so callers
 /// only need to supply the caller-explicit value and the store override.
 pub fn resolve_default_builder_address(
     explicit: Option<&str>,
     store_override: Option<&str>,
 ) -> Result<String, String> {
-    resolve_builder_address(explicit, EMBEDDED_DEFAULT_BUILDER, store_override)
+    resolve_builder_address(explicit, RELEASE_DEFAULT_BUILDER, store_override)
 }
 
 fn builder_address_status(
-    embedded: Option<&str>,
+    release_default: Option<&str>,
     store_override: Option<&str>,
 ) -> BuilderAddressStatus {
-    match resolve_default(embedded, store_override) {
+    match resolve_default(release_default, store_override) {
         Some((address, source)) => BuilderAddressStatus {
             configured: true,
             source,
@@ -81,7 +81,7 @@ fn builder_address_status(
 }
 
 pub fn default_builder_address_status(store_override: Option<&str>) -> BuilderAddressStatus {
-    builder_address_status(EMBEDDED_DEFAULT_BUILDER, store_override)
+    builder_address_status(RELEASE_DEFAULT_BUILDER, store_override)
 }
 
 #[cfg(test)]
@@ -89,7 +89,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_address_always_wins_over_store_override_and_embedded_default() {
+    fn explicit_address_always_wins_over_store_override_and_release_default() {
         assert_eq!(
             resolve_builder_address(
                 Some("0x0000000000000000000000000000000000000001"),
@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn store_override_wins_over_embedded_default() {
+    fn store_override_wins_over_release_default() {
         assert_eq!(
             resolve_builder_address(
                 None,
@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_default_used_when_no_override_is_stored() {
+    fn release_default_used_when_no_override_is_stored() {
         assert_eq!(
             resolve_builder_address(
                 None,
@@ -130,11 +130,20 @@ mod tests {
     }
 
     #[test]
-    fn this_dev_build_has_no_embedded_default() {
-        // This binary is not built with HYPERLIQUID_BUILDER_ADDRESS set, so a
-        // dev build has no embedded default; release builds set the env var
-        // and `resolve_default_builder_address` would resolve to it instead.
-        assert_eq!(EMBEDDED_DEFAULT_BUILDER, None);
+    fn release_default_if_set_is_a_lowercase_address() {
+        // The default is public data declared in source, so the checks the
+        // per-order and override fields get apply to it here: a checksummed
+        // or padded value would make every call that omits `builder` fail
+        // with "builder address must be lowercase".
+        if let Some(address) = RELEASE_DEFAULT_BUILDER {
+            assert_eq!(address, address.to_ascii_lowercase());
+            assert!(crate::parse_address(address).is_ok());
+        }
+    }
+
+    #[test]
+    fn no_release_default_means_an_explicit_builder_or_override_is_required() {
+        assert_eq!(RELEASE_DEFAULT_BUILDER, None);
         assert!(resolve_default_builder_address(None, None).is_err());
         assert_eq!(
             resolve_default_builder_address(
@@ -152,12 +161,12 @@ mod tests {
         assert_eq!(unconfigured.source, BuilderAddressSource::Unconfigured);
         assert_eq!(unconfigured.address, None);
 
-        let embedded =
+        let release_default =
             builder_address_status(Some("0x0000000000000000000000000000000000000002"), None);
-        assert!(embedded.configured);
-        assert_eq!(embedded.source, BuilderAddressSource::EmbeddedRelease);
+        assert!(release_default.configured);
+        assert_eq!(release_default.source, BuilderAddressSource::ReleaseDefault);
         assert_eq!(
-            embedded.address,
+            release_default.address,
             Some("0x0000000000000000000000000000000000000002".into())
         );
 

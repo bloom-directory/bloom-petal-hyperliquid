@@ -5,7 +5,7 @@ petal::route_file!(
         petal::read_json_value(&crate::serde_json::json!({
             "description": "write a Hyperliquid approveBuilderFee request approving a maximum fee for a builder; must be signed by the main wallet and may require Bloom approval",
             "body": {
-                "builder": "optional lowercase 0x builder address; omit to use this release's embedded default builder, if configured",
+                "builder": "optional lowercase 0x builder address; omit to use the operator override or this release's default builder, if configured",
                 "max_fee_tenths_bps": "maximum builder fee in tenths of a basis point (10 = 1bp); capped by the venue at 1000 (1%)",
                 "nonce": "optional timestamp in milliseconds"
             }

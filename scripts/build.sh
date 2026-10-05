@@ -3,14 +3,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PETAL_REV="864a80b407387871bae06aabe77b91865e55f7bc"
 
-if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
-  if [[ -z "$PETAL_COMPILE_TIME_SECRET" ]]; then
-    echo "PETAL_COMPILE_TIME_SECRET is not configured" >&2
-    exit 1
-  fi
-  export HYPERLIQUID_BUILDER_ADDRESS="$PETAL_COMPILE_TIME_SECRET"
-  unset PETAL_COMPILE_TIME_SECRET
-fi
+# No build-time inputs: the release default builder address is declared in
+# route/src/settings.rs, so a tagged source rebuilds byte for byte and the
+# package CI tests is the package that ships.
+unset PETAL_COMPILE_TIME_SECRET HYPERLIQUID_BUILDER_ADDRESS
 
 # Bloom materializes composed route artifacts here after package validation
 # (both `bloom petals install <dir>` and the developer provenance-enrollment

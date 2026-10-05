@@ -96,14 +96,59 @@ impl ClaimEffects {
     }
 }
 
+/// Mid prices by asset id, fetched only when a builder-bearing action has a
+/// sell leg. A sell fills at or above its limit, so bounding its notional
+/// needs the current mid as well as the limit; a buy fills at or below its
+/// limit, so the limit alone bounds it and nothing is fetched. Perp ids come
+/// from `meta`; spot mids are keyed `@<index>` and map to
+/// `SPOT_ASSET_ID_OFFSET + index`.
+fn builder_fee_mids(
+    n: Network,
+    action: &ExchangeAction,
+) -> Result<std::collections::BTreeMap<u32, f64>, DispatchResponse> {
+    let mut out = std::collections::BTreeMap::new();
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(_),
+        ..
+    } = action
+    else {
+        return Ok(out);
+    };
+    if orders.iter().all(|o| o.is_buy) {
+        return Ok(out);
+    }
+    let mids = http_json(n, "/info", json!({"type":"allMids"}))?;
+    let assets = asset_metadata(n)?;
+    let Some(mids) = mids.as_object() else {
+        return Err(backend("Hyperliquid returned a malformed allMids response"));
+    };
+    for (coin, price) in mids {
+        let Some(mid) = value_string(price).and_then(|p| p.parse::<f64>().ok()) else {
+            continue;
+        };
+        if let Some(asset) = assets.get(coin) {
+            out.insert(asset.id, mid);
+        } else if let Some(index) = coin.strip_prefix('@').and_then(|i| i.parse::<u32>().ok()) {
+            out.insert(protocol::SPOT_ASSET_ID_OFFSET.saturating_add(index), mid);
+        }
+    }
+    Ok(out)
+}
+
 /// Computes the claim effect for an owner- or session-signed order action,
 /// naming the builder's fee exactly when the order carries one so it is never
-/// signed under `ClaimEffects::none()`. The declared amount is a conservative
-/// (rounded up) estimate of `notional * fee_tenths_bps`, using the same `f64`
-/// notional computation already used for the session `max_notional_usd`
-/// check, since Broker's claim only needs an owner-facing estimate — the
-/// venue itself computes and deducts the exact fee from the fill.
-fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> {
+/// signed under `ClaimEffects::none()`. The declared amount is an upper bound
+/// (rounded up) on `notional * fee_tenths_bps`. Hyperliquid charges the
+/// builder fee on every fill of an order that names a builder, reduce-only
+/// legs included, so every leg counts. A buy fills at or below its limit, so
+/// its limit bounds it; a sell fills at or above its limit, so it is bounded
+/// by the larger of its limit and the current mid from `mids` (an absent mid
+/// falls back to the limit). The venue computes and deducts the exact fee.
+fn order_claim_effects(
+    action: &ExchangeAction,
+    mids: &std::collections::BTreeMap<u32, f64>,
+) -> Result<ClaimEffects, String> {
     let ExchangeAction::Order {
         orders,
         builder: Some(builder),
@@ -113,23 +158,59 @@ fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> 
         return Ok(ClaimEffects::none());
     };
     protocol::parse_address(&builder.address)?;
+    Ok(ClaimEffects::builder_order_fee(
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, mids),
+    ))
+}
+
+fn builder_fee_upper_bound_micros(
+    orders: &[protocol::OrderWire],
+    fee_tenths_bps: u32,
+    mids: &std::collections::BTreeMap<u32, f64>,
+) -> u64 {
     let notional: f64 = orders
         .iter()
-        .filter(|o| !o.reduce_only)
         .map(|o| {
-            let price = o.price.parse::<f64>().unwrap_or(f64::INFINITY);
+            let limit = o.price.parse::<f64>().unwrap_or(f64::INFINITY);
             let size = o.size.parse::<f64>().unwrap_or(f64::INFINITY);
+            let price = if o.is_buy {
+                limit
+            } else {
+                mids.get(&o.asset)
+                    .copied()
+                    .map_or(limit, |mid| limit.max(mid))
+            };
             price * size
         })
         .sum();
-    let fee_micros = if notional.is_finite() && notional > 0.0 {
-        (notional * 1_000_000.0 * f64::from(builder.fee_tenths_bps) / 100_000.0)
+    if notional.is_finite() && notional > 0.0 {
+        (notional * 1_000_000.0 * f64::from(fee_tenths_bps) / 100_000.0)
             .ceil()
             .clamp(0.0, u64::MAX as f64) as u64
     } else {
         0
+    }
+}
+
+/// The ceremony advisory for an order that carries a builder fee, so the
+/// owner sees the recipient and the rate rather than only an opaque hash.
+fn builder_order_advisory_for(
+    action: &ExchangeAction,
+    mids: &std::collections::BTreeMap<u32, f64>,
+) -> Option<Vec<u8>> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return None;
     };
-    Ok(ClaimEffects::builder_order_fee(fee_micros))
+    Some(builder_order_advisory(
+        &builder.address,
+        builder.fee_tenths_bps,
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, mids),
+    ))
 }
 
 fn ok_write() -> DispatchResponse {
@@ -427,6 +508,24 @@ fn owner_sign_or_approval(
     }
 }
 
+/// The public owner address last recovered from one of this wallet's owner
+/// signatures. Kept so a check that needs it, the builder-approval precheck,
+/// can run before the next ceremony instead of only after it; the
+/// authoritative check on the freshly recovered signer still runs after.
+fn owner_address_key(w: &str) -> String {
+    state_key(&["owner-address", w])
+}
+
+fn cached_owner_address(w: &str) -> Option<String> {
+    load_json::<String>(owner_address_key(w)).ok().flatten()
+}
+
+fn remember_owner_address(w: &str, address: &str) {
+    // Best effort: a failed write only costs a wasted ceremony on a later
+    // call, never correctness, because the post-signature check still runs.
+    let _ = save_json(owner_address_key(w), &address.to_owned(), false);
+}
+
 pub fn owner_action_write(
     ctx: &Ctx,
     n: Network,
@@ -458,7 +557,22 @@ pub fn owner_action_write(
             Ok(h) => h,
             Err(e) => return invalid(e),
         };
-    let effects = match order_claim_effects(&req.action) {
+    let carries_builder = req.action.carries_builder();
+    // Refuse an unapproved builder before the ceremony whenever the owner
+    // address is already known from an earlier signature, so the owner is
+    // not asked for a passkey tap the venue would then make pointless. The
+    // authoritative check on the recovered signer still runs below.
+    if carries_builder
+        && let Some(owner_address) = cached_owner_address(&w)
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
+    }
+    let mids = match builder_fee_mids(n, &req.action) {
+        Ok(mids) => mids,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&req.action, &mids) {
         Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
@@ -471,27 +585,22 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            advisory: None,
+            advisory: builder_order_advisory_for(&req.action, &mids),
             effects,
         },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
     };
-    if matches!(
-        &req.action,
-        protocol::ExchangeAction::Order {
-            builder: Some(_),
-            ..
-        }
-    ) {
-        let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
-            Ok(address) => address,
-            Err(e) => return backend(e),
-        };
-        if let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action) {
-            return e;
-        }
+    let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+        Ok(address) => address,
+        Err(e) => return backend(e),
+    };
+    remember_owner_address(&w, &owner_address);
+    if carries_builder
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
     }
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
@@ -847,7 +956,7 @@ pub fn builder_address_status() -> Result<settings::BuilderAddressStatus, Dispat
 
 /// Sets or clears the operator-set builder-address override for
 /// `settings/builder-address`. An empty body clears the override, reverting
-/// to this release's embedded default, if any.
+/// to this release's default, if any.
 pub fn set_builder_address_override(body: &[u8]) -> DispatchResponse {
     let text = match std::str::from_utf8(body) {
         Ok(x) => x.trim(),
@@ -905,6 +1014,17 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
+    let builder_source = if req.builder.is_some() {
+        "explicit in this request"
+    } else {
+        match settings::default_builder_address_status(store_override.as_deref()).source {
+            settings::BuilderAddressSource::StoreOverride => {
+                "operator override in settings/builder-address"
+            }
+            settings::BuilderAddressSource::ReleaseDefault => "this release's default",
+            settings::BuilderAddressSource::Unconfigured => "unconfigured",
+        }
+    };
     let builder = match protocol::parse_address(&resolved_builder) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -944,7 +1064,12 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "approve_builder_fee",
-            advisory: None,
+            advisory: Some(builder_fee_approval_advisory(
+                n,
+                &resolved_builder,
+                req.max_fee_tenths_bps,
+                builder_source,
+            )),
             // Approving a cap charges nothing by itself — only a later order
             // that actually carries a builder fee has an effect to declare —
             // and Broker's DeclaredFee schema has no field for a bare ceiling
@@ -955,6 +1080,9 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         Ok(sig) => sig,
         Err(response) => return response,
     };
+    if let Ok(owner_address) = protocol::recover_signer_from_json(&payload.hash, &sig) {
+        remember_owner_address(&w, &owner_address);
+    }
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
     {
@@ -1071,6 +1199,61 @@ struct WithdrawOperation {
     #[serde(default)]
     response: Option<Value>,
     updated_ms: u64,
+}
+
+/// What the owner sees when approving a builder-fee cap. The recipient and
+/// the ceiling are otherwise only inside the EIP-712 hash, so without this
+/// the ceremony could not show which builder is being approved, or for how
+/// much, or where that address came from.
+fn builder_fee_approval_advisory(
+    n: Network,
+    builder: &str,
+    cap_tenths_bps: u32,
+    source: &str,
+) -> Vec<u8> {
+    let mut lines = vec![
+        format!(
+            "Approves builder {builder} to charge up to {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional on this account's Hyperliquid {} orders.",
+            protocol::builder_fee_max_rate_string(cap_tenths_bps),
+            n.chain()
+        ),
+        format!("Builder address source: {source}."),
+    ];
+    if cap_tenths_bps == 0 {
+        lines.push("A cap of 0% revokes this builder's approval.".to_owned());
+    } else {
+        lines.push(
+            "Only orders that name this builder pay it; Hyperliquid enforces its own ceilings of 0.1% on perps and 1% on spot."
+                .to_owned(),
+        );
+    }
+    lines.join("\n").into_bytes()
+}
+
+/// What the owner sees when signing an order that carries a builder fee.
+fn builder_order_advisory(builder: &str, fee_tenths_bps: u32, fee_micros: u64) -> Vec<u8> {
+    [
+        format!(
+            "This order pays a builder fee to {builder}: {} ({fee_tenths_bps} tenths of a basis point) of each fill's notional.",
+            protocol::builder_fee_max_rate_string(fee_tenths_bps)
+        ),
+        format!(
+            "Declared upper bound: {} USDC across all legs, reduce-only included; the venue deducts the exact fee from each fill.",
+            micros_decimal(fee_micros)
+        ),
+    ]
+    .join("\n")
+    .into_bytes()
+}
+
+/// What the owner sees when approving a session created with a builder
+/// bound: the one builder its orders may pay, and the most they may pay it.
+fn session_builder_bound_advisory(builder: &str, cap_tenths_bps: u32) -> Vec<u8> {
+    format!(
+        "This session may submit builder-fee orders only to builder {builder}, at most {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional; an order naming another builder or a higher fee is refused before signing.",
+        protocol::builder_fee_max_rate_string(cap_tenths_bps)
+    )
+    .into_bytes()
 }
 
 fn withdraw_advisory(amount_micros: u64, destination: Address) -> Vec<u8> {
@@ -2072,7 +2255,11 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let effects = match order_claim_effects(&action) {
+    let mids = match builder_fee_mids(n, &action) {
+        Ok(mids) => mids,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&action, &mids) {
         Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
@@ -2842,6 +3029,11 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     {
         return e;
     };
+    let builder_bound_advisory =
+        match (&session.builder_address, session.max_builder_fee_tenths_bps) {
+            (Some(builder), Some(cap)) => Some(session_builder_bound_advisory(builder, cap)),
+            _ => None,
+        };
     let sig = match sign_payload(
         ctx,
         &w,
@@ -2849,7 +3041,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         "hyperliquid.approve_agent",
         approval_hint,
         None,
-        None,
+        builder_bound_advisory,
         ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(raw)) => {
@@ -3168,7 +3360,10 @@ mod tests {
             cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
             fast: None,
         };
-        assert_eq!(order_claim_effects(&cancel).unwrap(), ClaimEffects::none());
+        assert_eq!(
+            order_claim_effects(&cancel, &Default::default()).unwrap(),
+            ClaimEffects::none()
+        );
 
         let plain_order: ExchangeAction = serde_json::from_value(json!({
             "type": "order",
@@ -3180,14 +3375,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            order_claim_effects(&plain_order).unwrap(),
+            order_claim_effects(&plain_order, &Default::default()).unwrap(),
             ClaimEffects::none()
         );
 
         // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
         let builder_order =
             order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
-        let effects = order_claim_effects(&builder_order).unwrap();
+        let effects = order_claim_effects(&builder_order, &Default::default()).unwrap();
         assert!(effects.declared_debits.is_empty());
         assert!(effects.declared_destinations.is_empty());
         assert_eq!(
@@ -3202,23 +3397,100 @@ mod tests {
     }
 
     #[test]
-    fn order_claim_effects_fee_excludes_reduce_only_orders_from_notional() {
+    fn order_claim_effects_fee_includes_reduce_only_legs() {
         let action: ExchangeAction = serde_json::from_value(json!({
             "type": "order",
             "orders": [
                 {"a": 0, "b": true, "p": "100", "s": "0.01", "r": false, "t": {"limit": {"tif": "Gtc"}}},
-                {"a": 0, "b": false, "p": "1000000", "s": "1000000", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+                {"a": 0, "b": true, "p": "200", "s": "0.5", "r": true, "t": {"limit": {"tif": "Gtc"}}},
             ],
             "grouping": "na",
             "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
         }))
         .unwrap();
-        // Only the non-reduce-only leg counts, matching the same exclusion
-        // session_policy's max_notional_usd check already applies.
+        // Hyperliquid charges the builder fee on every fill of an order that
+        // names a builder, reduce-only legs included, so both legs count:
+        // (1 + 100) notional at 1 bp is 10100 micro-USDC. The session
+        // max_notional_usd check still excludes reduce-only legs; that is a
+        // different bound with a different purpose.
         assert_eq!(
-            order_claim_effects(&action).unwrap().declared_fee,
-            json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "100"})
+            order_claim_effects(&action, &Default::default())
+                .unwrap()
+                .declared_fee,
+            json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
         );
+    }
+
+    #[test]
+    fn order_claim_effects_bound_sells_by_the_mid_when_it_exceeds_the_limit() {
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            ],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        let declared = |mids: &std::collections::BTreeMap<u32, f64>| {
+            order_claim_effects(&action, mids).unwrap().declared_fee["amount"].clone()
+        };
+        // A sell fills at or above its limit: with no mid the limit bounds
+        // it (100 * 1 bp = 10000), with a higher mid the mid does (150 * 1
+        // bp = 15000), and a lower mid never lowers the bound.
+        assert_eq!(declared(&Default::default()), "10000");
+        assert_eq!(declared(&[(0, 150.0)].into_iter().collect()), "15000");
+        assert_eq!(declared(&[(0, 80.0)].into_iter().collect()), "10000");
+        // A buy fills at or below its limit, so a higher mid is irrelevant.
+        let buy: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            ],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        assert_eq!(
+            order_claim_effects(&buy, &[(0, 150.0)].into_iter().collect())
+                .unwrap()
+                .declared_fee["amount"],
+            "10000"
+        );
+    }
+
+    #[test]
+    fn builder_advisories_name_the_recipient_and_the_rate() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approval = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            10,
+            "explicit in this request",
+        ))
+        .unwrap();
+        assert!(approval.contains(builder));
+        assert!(approval.contains("0.01%"));
+        assert!(approval.contains("10 tenths of a basis point"));
+        assert!(approval.contains("explicit in this request"));
+        let revoke = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            0,
+            "x",
+        ))
+        .unwrap();
+        assert!(revoke.contains("revokes"));
+
+        let order = String::from_utf8(builder_order_advisory(builder, 10, 10100)).unwrap();
+        assert!(order.contains(builder));
+        assert!(order.contains("0.01%"));
+        assert!(order.contains("0.0101 USDC"));
+
+        let bound = String::from_utf8(session_builder_bound_advisory(builder, 25)).unwrap();
+        assert!(bound.contains(builder));
+        assert!(bound.contains("0.025%"));
+        assert!(bound.contains("25 tenths of a basis point"));
     }
 
     #[test]

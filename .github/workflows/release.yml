@@ -21,5 +21,3 @@ jobs:
       build-command: scripts/build.sh
       package-root: .
       expected-route-count: 83
-    secrets:
-      compile-time-secret: ${{ secrets.HYPERLIQUID_BUILDER_ADDRESS }}

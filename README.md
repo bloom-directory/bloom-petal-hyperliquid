@@ -137,19 +137,18 @@ Published assets are immutable. Bloom's built-in catalog pins the release tag,
 source commit, archive name, and package hash. The route crate and canonical
 Petal SDK are locked in `route/Cargo.lock`.
 
-## Embedded default builder address
+## Default builder address
 
-A release build may embed a default builder address so `approve_builder_fee.json`
-callers do not have to supply one. This is public on-chain data, not a
-credential — there is no private-store override, only present/absent. The
-repository secret `HYPERLIQUID_BUILDER_ADDRESS` is passed to the pinned
-`bloom-directory/petal` release workflow as its generic `compile-time-secret`
-input, which exposes it to `scripts/build.sh` as `PETAL_COMPILE_TIME_SECRET`;
-the script re-exports it as `HYPERLIQUID_BUILDER_ADDRESS` before invoking the
-Petal build, where `route/src/settings.rs` embeds it via `option_env!`. The
-secret is optional: an unconfigured repository, or a local build that does not
-set it, has no embedded default, and `approve_builder_fee.json` then requires
-the caller to supply `builder` explicitly.
+`approve_builder_fee.json` resolves its builder as: the request's explicit
+`builder`, else the operator override written to `settings/builder-address`,
+else this release's default, `RELEASE_DEFAULT_BUILDER` in
+`route/src/settings.rs`. The default is public on-chain data and is declared
+in source, never injected at build time, so a tagged release rebuilds byte for
+byte and the package CI checks is the package that ships. With no default
+declared and no override stored, callers must supply `builder` explicitly.
+Every approval ceremony states the builder address, the fee cap, and which of
+those three sources the address came from, so the owner never approves a
+recipient they cannot see.
 
 ## Account-scoped routes
 
