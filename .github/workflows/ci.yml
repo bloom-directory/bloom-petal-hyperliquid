@@ -81,7 +81,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom
-          ref: b751087b4d7bb65a0f2796a00cf49237e20d9cda
+          ref: 7fbbf3800e1c002991b38a2db9d3621819aa0bdc
           path: .bloom-contract
           persist-credentials: false
 

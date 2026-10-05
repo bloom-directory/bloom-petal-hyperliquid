@@ -142,9 +142,16 @@ mod tests {
     }
 
     #[test]
-    fn no_release_default_means_an_explicit_builder_or_override_is_required() {
-        assert_eq!(RELEASE_DEFAULT_BUILDER, None);
-        assert!(resolve_default_builder_address(None, None).is_err());
+    fn the_release_wrapper_resolves_exactly_this_release_default() {
+        // Whatever this release declares (including nothing), the wrapper
+        // resolves exactly that when the caller and the store are silent,
+        // and a store override still wins over it. The no-default case
+        // itself is `nothing_configured_is_an_explicit_error`, with an
+        // explicit `None`, so setting a release default breaks no test.
+        assert_eq!(
+            resolve_default_builder_address(None, None).ok(),
+            RELEASE_DEFAULT_BUILDER.map(str::to_owned)
+        );
         assert_eq!(
             resolve_default_builder_address(
                 None,

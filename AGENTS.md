@@ -5,26 +5,27 @@ account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
-`raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`, and
-`approve_builder_fee.json`. `usd_class_transfer.json` and
-`approve_builder_fee.json` are owner-only, signed by the main wallet, and
-deliberately absent from the delegated agent session surface. `send_asset.json`
-is a deprecated alias for `usd_send.json`; it does not implement Hyperliquid's
-generalized `sendAsset` action. An order carrying a per-order `builder` fee is
-written to `builder_order.json` (owner-signed, or through the session route of
-the same name), which signs under `hyperliquid.builder_order`, the Petal's only
-fee-bearing operation class; `order.json` refuses a builder. It is signed only
-under an authorization claim that names the builder address and exact fee,
-and a delegated session may use one only if it was created with a matching
-`builder_address`/`max_builder_fee_tenths_bps` bound, which is also what adds
-the builder-order route and class to that session key's scope. Owner-signed actions may return an approval-required error;
-
-`withdraw.json`.
+`raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`,
+`approve_builder_fee.json`, `builder_order.json`, and `withdraw.json`.
 `usd_class_transfer.json` moves USDC between the wallet's own spot and perp
-engines and is owner-only; it is deliberately absent from the delegated agent
-session surface. `send_asset.json` is a deprecated alias
-for `usd_send.json`; it does not implement Hyperliquid's generalized
-`sendAsset` action. `withdraw.json` submits Hyperliquid's `withdraw3`
+engines; it and `approve_builder_fee.json` are owner-only, signed by the main
+wallet, and deliberately absent from the delegated agent session surface.
+`send_asset.json` is a deprecated alias for `usd_send.json`; it does not
+implement Hyperliquid's generalized `sendAsset` action. An order carrying a
+per-order `builder` fee is written to `builder_order.json` (owner-signed, or
+through the session route of the same name), which signs under
+`hyperliquid.builder_order`, the Petal's only fee-bearing operation class;
+`order.json` refuses a builder. Its authorization claim declares the fee asset
+(Hyperliquid USDC) and an upper bound on the amount the venue will charge; the
+builder address and rate are committed in the signed order payload and shown
+in the owner's approval advisory, not carried in the claim. The bound uses
+each leg's limit price, or for a sell the larger of its limit and the current
+mid, so a builder-bearing trigger order is refused (its fill price cannot be
+bounded in advance) and a builder-bearing sell is refused when the venue
+publishes no mid for its asset. A delegated session may use a builder fee only
+if it was created with a matching `builder_address`/`max_builder_fee_tenths_bps`
+bound, which is also what adds the builder-order route and class to that
+session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
 settlement proof. Operation records are listed at `withdrawals/` and readable

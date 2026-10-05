@@ -200,3 +200,33 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
 }
+
+/// The package's only fee-bearing class must be the one the pinned Bloom
+/// catalogues with a fee asset, on both of the Machine's enrollment paths.
+/// Bloom's exact-signing check refuses a `{"kind":"fee"}` claim under a class
+/// catalogued fee-free (`FEE_NOT_ALLOWED`), so a pin whose enrollment writes
+/// `fee_asset: None` for every class cannot sign a builder order at all. The
+/// catalogue is private to the `bloom` binary, so this reads the enrollment
+/// source the check script's Bloom checkout provides; it runs from
+/// `crates/bloom-petals` inside that checkout.
+#[test]
+fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
+    let enrollment = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../bloom/src/triad_enrollment.rs");
+    let source = std::fs::read_to_string(&enrollment)
+        .unwrap_or_else(|error| panic!("read {}: {error}", enrollment.display()));
+    assert!(
+        source.contains(&format!(
+            "const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = \"{BUILDER_ORDER_INTENT}\";"
+        )),
+        "the pinned Bloom does not catalogue {BUILDER_ORDER_INTENT} as a fee-bearing class"
+    );
+    assert!(
+        source.matches("fee_asset: catalogued_fee_asset(").count() >= 2,
+        "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
+    );
+    assert!(
+        !source.contains("fee_asset: None"),
+        "the pinned Bloom still enrolls a class with an unconditional fee_asset: None"
+    );
+}
