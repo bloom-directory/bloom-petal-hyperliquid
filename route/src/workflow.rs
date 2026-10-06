@@ -98,120 +98,25 @@ impl ClaimEffects {
     }
 }
 
-/// Mid prices by asset id, fetched only when a builder-bearing action has a
-/// sell leg. A sell fills at or above its limit, so bounding its notional
-/// needs the current mid as well as the limit; a buy fills at or below its
-/// limit, so the limit alone bounds it and nothing is fetched. `allMids` is
-/// keyed by name: perp names resolve through `meta`, spot pair names through
-/// `spotMeta` (`@<index>` for most pairs, but `PURR/USDC` for the canonical
-/// pair, so a name is never derived from an id), and each is fetched only
-/// when a sell leg of that kind is present.
-fn builder_fee_mids(
-    n: Network,
-    action: &ExchangeAction,
-) -> Result<std::collections::BTreeMap<u32, f64>, DispatchResponse> {
-    let ExchangeAction::Order {
-        orders,
-        builder: Some(_),
-        ..
-    } = action
-    else {
-        return Ok(Default::default());
-    };
-    let sells = || orders.iter().filter(|o| !o.is_buy);
-    if sells().next().is_none() {
-        return Ok(Default::default());
-    }
-    let all_mids = http_json(n, "/info", json!({"type":"allMids"}))?;
-    let perps = if sells().any(|o| o.asset < protocol::SPOT_ASSET_ID_OFFSET) {
-        asset_metadata(n)?
-    } else {
-        Default::default()
-    };
-    let spot_pairs = if sells().any(|o| o.asset >= protocol::SPOT_ASSET_ID_OFFSET) {
-        spot_pair_ids(n)?
-    } else {
-        Default::default()
-    };
-    mids_by_asset(&all_mids, &perps, &spot_pairs)
-}
-
-/// Spot pair names to their asset ids (`SPOT_ASSET_ID_OFFSET + index`) from
-/// `spotMeta`'s `universe`.
-fn spot_pair_ids(n: Network) -> Result<std::collections::BTreeMap<String, u32>, DispatchResponse> {
-    parse_spot_pair_ids(&http_json(n, "/info", json!({"type":"spotMeta"}))?)
-}
-
-fn parse_spot_pair_ids(
-    spot_meta: &Value,
-) -> Result<std::collections::BTreeMap<String, u32>, DispatchResponse> {
-    let Some(universe) = spot_meta.get("universe").and_then(Value::as_array) else {
-        return Err(backend(
-            "Hyperliquid returned a malformed spotMeta response",
-        ));
-    };
-    let mut out = std::collections::BTreeMap::new();
-    for pair in universe {
-        let (Some(name), Some(index)) = (
-            pair.get("name").and_then(Value::as_str),
-            pair.get("index")
-                .and_then(Value::as_u64)
-                .and_then(|index| u32::try_from(index).ok()),
-        ) else {
-            return Err(backend(
-                "Hyperliquid returned a spot pair without a name and index",
-            ));
-        };
-        out.insert(
-            name.to_owned(),
-            protocol::SPOT_ASSET_ID_OFFSET.saturating_add(index),
-        );
-    }
-    Ok(out)
-}
-
-/// Keys `allMids` by asset id using the venue's own names: a perp by its
-/// `meta` entry, a spot pair by its `spotMeta` entry. A name neither table
-/// knows is skipped; a sell on such an asset then fails the fee bound rather
-/// than being declared from its limit alone.
-fn mids_by_asset(
-    all_mids: &Value,
-    perps: &std::collections::BTreeMap<String, PerpAsset>,
-    spot_pairs: &std::collections::BTreeMap<String, u32>,
-) -> Result<std::collections::BTreeMap<u32, f64>, DispatchResponse> {
-    let Some(all_mids) = all_mids.as_object() else {
-        return Err(backend("Hyperliquid returned a malformed allMids response"));
-    };
-    let mut out = std::collections::BTreeMap::new();
-    for (name, price) in all_mids {
-        let Some(mid) = value_string(price).and_then(|p| p.parse::<f64>().ok()) else {
-            continue;
-        };
-        if let Some(asset) = perps.get(name) {
-            out.insert(asset.id, mid);
-        } else if let Some(asset) = spot_pairs.get(name) {
-            out.insert(*asset, mid);
-        }
-    }
-    Ok(out)
-}
-
 /// Computes the claim effect for an owner- or session-signed order action,
 /// naming the builder's fee exactly when the order carries one so it is never
 /// signed under `ClaimEffects::none()`. The declared amount is an upper bound
-/// (rounded up) on `notional * fee_tenths_bps`. Hyperliquid charges the
-/// builder fee on every fill of an order that names a builder, reduce-only
-/// legs included, so every leg counts. A buy fills at or below its limit, so
-/// its limit bounds it; a sell fills at or above its limit, so it is bounded
-/// by the larger of its limit and the current mid from `mids`, and a sell
-/// whose mid is unknown is refused rather than declared from its limit. A
-/// trigger order is refused: once triggered it fills at the market (or at a
-/// limit the venue may fill above), so no price the request contains bounds
-/// its fee. The venue computes and deducts the exact fee.
-fn order_claim_effects(
-    action: &ExchangeAction,
-    mids: &std::collections::BTreeMap<u32, f64>,
-) -> Result<ClaimEffects, String> {
+/// (rounded up) on `notional * fee_tenths_bps`, from prices the request itself
+/// fixes, so nothing fetched before signing can go stale:
+///
+/// - A buy fills at or below its limit, so its limit bounds it.
+/// - A sell crossing the book fills at the resting bid, which no order price
+///   caps from above, so a builder-bearing sell must be post-only (`Alo`):
+///   the venue refuses it rather than let it cross, and as a maker it fills
+///   at exactly its limit.
+/// - Hyperliquid charges no builder fee on the buying side of spot trades, so
+///   spot buys add nothing; an order of only spot buys is refused, since its
+///   builder would earn nothing.
+/// - A trigger order fills at the market once triggered, so it is refused.
+///
+/// Every other leg counts, reduce-only included. The venue computes and
+/// deducts the exact fee.
+fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> {
     let ExchangeAction::Order {
         orders,
         builder: Some(builder),
@@ -222,37 +127,42 @@ fn order_claim_effects(
     };
     protocol::parse_address(&builder.address)?;
     Ok(ClaimEffects::builder_order_fee(
-        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, mids)?,
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps)?,
     ))
+}
+
+fn is_spot_buy(order: &protocol::OrderWire) -> bool {
+    order.is_buy && order.asset >= protocol::SPOT_ASSET_ID_OFFSET
 }
 
 fn builder_fee_upper_bound_micros(
     orders: &[protocol::OrderWire],
     fee_tenths_bps: u32,
-    mids: &std::collections::BTreeMap<u32, f64>,
 ) -> Result<u64, String> {
+    if orders.iter().all(is_spot_buy) {
+        return Err(
+            "Hyperliquid charges no builder fee on spot buys, so a builder on an order of only spot buys earns nothing; submit it without a builder through order.json".into(),
+        );
+    }
     let mut notional = 0.0_f64;
     for o in orders {
-        if o.order_type.trigger.is_some() {
+        let Some(limit_type) = &o.order_type.limit else {
             return Err(
                 "a builder-bearing trigger order cannot be bounded: a stop or take-profit fills at the market once triggered, so its builder fee cannot be declared in advance; submit it without a builder or as a limit order".into(),
             );
+        };
+        if !o.is_buy && !matches!(limit_type.tif, protocol::TimeInForce::Alo) {
+            return Err(
+                "a builder-bearing sell must be post-only (tif \"Alo\"): a sell that crosses the book fills at the resting bid, which nothing in the order caps, so its builder fee cannot be bounded; a post-only sell fills at exactly its limit".into(),
+            );
+        }
+        if is_spot_buy(o) {
+            continue;
         }
         let (Ok(limit), Ok(size)) = (o.price.parse::<f64>(), o.size.parse::<f64>()) else {
             return Err("order price and size must be decimal numbers".into());
         };
-        let price = if o.is_buy {
-            limit
-        } else {
-            let Some(mid) = mids.get(&o.asset) else {
-                return Err(format!(
-                    "no mid price for asset {}: a builder-bearing sell cannot be bounded without one",
-                    o.asset
-                ));
-            };
-            limit.max(*mid)
-        };
-        notional += price * size;
+        notional += limit * size;
     }
     if !notional.is_finite() {
         return Err("order notional is not a finite number".into());
@@ -266,10 +176,7 @@ fn builder_fee_upper_bound_micros(
 
 /// The ceremony advisory for an order that carries a builder fee, so the
 /// owner sees the recipient and the rate rather than only an opaque hash.
-fn builder_order_advisory_for(
-    action: &ExchangeAction,
-    mids: &std::collections::BTreeMap<u32, f64>,
-) -> Option<Vec<u8>> {
+fn builder_order_advisory_for(action: &ExchangeAction) -> Option<Vec<u8>> {
     let ExchangeAction::Order {
         orders,
         builder: Some(builder),
@@ -278,13 +185,14 @@ fn builder_order_advisory_for(
     else {
         return None;
     };
-    // Runs after `order_claim_effects` accepted the same action and mids, so
-    // the bound that produced the declared fee is the one shown here.
-    let fee_micros = builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, mids).ok()?;
+    // Runs after `order_claim_effects` accepted the same action, so the bound
+    // that produced the declared fee is the one shown here.
+    let fee_micros = builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps).ok()?;
     Some(builder_order_advisory(
         &builder.address,
         builder.fee_tenths_bps,
         fee_micros,
+        orders.iter().any(is_spot_buy),
     ))
 }
 
@@ -643,11 +551,7 @@ pub fn owner_action_write(
     {
         return e;
     }
-    let mids = match builder_fee_mids(n, &req.action) {
-        Ok(mids) => mids,
-        Err(e) => return e,
-    };
-    let effects = match order_claim_effects(&req.action, &mids) {
+    let effects = match order_claim_effects(&req.action) {
         Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
@@ -660,7 +564,7 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            advisory: builder_order_advisory_for(&req.action, &mids),
+            advisory: builder_order_advisory_for(&req.action),
             effects,
         },
     ) {
@@ -1306,14 +1210,24 @@ fn builder_fee_approval_advisory(
 }
 
 /// What the owner sees when signing an order that carries a builder fee.
-fn builder_order_advisory(builder: &str, fee_tenths_bps: u32, fee_micros: u64) -> Vec<u8> {
+fn builder_order_advisory(
+    builder: &str,
+    fee_tenths_bps: u32,
+    fee_micros: u64,
+    has_spot_buys: bool,
+) -> Vec<u8> {
+    let legs = if has_spot_buys {
+        "across all legs except spot buys, which pay no builder fee, reduce-only included"
+    } else {
+        "across all legs, reduce-only included"
+    };
     [
         format!(
             "This order pays a builder fee to {builder}: {} ({fee_tenths_bps} tenths of a basis point) of each fill's notional.",
             protocol::builder_fee_max_rate_string(fee_tenths_bps)
         ),
         format!(
-            "Declared upper bound: {} USDC across all legs, reduce-only included; the venue deducts the exact fee from each fill.",
+            "Declared upper bound: {} USDC {legs}; the venue deducts the exact fee from each fill.",
             micros_decimal(fee_micros)
         ),
     ]
@@ -2330,11 +2244,7 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let mids = match builder_fee_mids(n, &action) {
-        Ok(mids) => mids,
-        Err(e) => return e,
-    };
-    let effects = match order_claim_effects(&action, &mids) {
+    let effects = match order_claim_effects(&action) {
         Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
@@ -3435,10 +3345,7 @@ mod tests {
             cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
             fast: None,
         };
-        assert_eq!(
-            order_claim_effects(&cancel, &Default::default()).unwrap(),
-            ClaimEffects::none()
-        );
+        assert_eq!(order_claim_effects(&cancel).unwrap(), ClaimEffects::none());
 
         let plain_order: ExchangeAction = serde_json::from_value(json!({
             "type": "order",
@@ -3450,14 +3357,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            order_claim_effects(&plain_order, &Default::default()).unwrap(),
+            order_claim_effects(&plain_order).unwrap(),
             ClaimEffects::none()
         );
 
         // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
         let builder_order =
             order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
-        let effects = order_claim_effects(&builder_order, &Default::default()).unwrap();
+        let effects = order_claim_effects(&builder_order).unwrap();
         assert!(effects.declared_debits.is_empty());
         assert!(effects.declared_destinations.is_empty());
         assert_eq!(
@@ -3489,66 +3396,93 @@ mod tests {
         // max_notional_usd check still excludes reduce-only legs; that is a
         // different bound with a different purpose.
         assert_eq!(
-            order_claim_effects(&action, &Default::default())
-                .unwrap()
-                .declared_fee,
+            order_claim_effects(&action).unwrap().declared_fee,
             json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
         );
     }
 
+    fn builder_order(legs: Value) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": legs,
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap()
+    }
+
+    fn declared_amount(action: &ExchangeAction) -> Result<Value, String> {
+        order_claim_effects(action).map(|effects| effects.declared_fee["amount"].clone())
+    }
+
     #[test]
-    fn order_claim_effects_bound_sells_by_the_mid_when_it_exceeds_the_limit() {
-        let action: ExchangeAction = serde_json::from_value(json!({
-            "type": "order",
-            "orders": [
-                {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
-            ],
-            "grouping": "na",
-            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
-        }))
-        .unwrap();
-        let declared = |mids: &std::collections::BTreeMap<u32, f64>| {
-            order_claim_effects(&action, mids).map(|effects| effects.declared_fee["amount"].clone())
-        };
-        // A sell fills at or above its limit: with a higher mid the mid
-        // bounds it (150 * 1 bp = 15000), a lower mid never lowers the bound
-        // (100 * 1 bp = 10000), and without a mid nothing in the request
-        // bounds it, so it is refused rather than declared from the limit.
-        assert_eq!(
-            declared(&[(0, 150.0)].into_iter().collect()).unwrap(),
-            "15000"
-        );
-        assert_eq!(
-            declared(&[(0, 80.0)].into_iter().collect()).unwrap(),
-            "10000"
-        );
-        let missing = declared(&Default::default()).unwrap_err();
-        assert!(missing.contains("no mid price for asset 0"), "{missing}");
-        // A buy fills at or below its limit, so a higher mid is irrelevant.
-        let buy: ExchangeAction = serde_json::from_value(json!({
-            "type": "order",
-            "orders": [
-                {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
-            ],
-            "grouping": "na",
-            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
-        }))
-        .unwrap();
-        assert_eq!(
-            order_claim_effects(&buy, &[(0, 150.0)].into_iter().collect())
-                .unwrap()
-                .declared_fee["amount"],
-            "10000"
+    fn a_builder_bearing_sell_must_be_post_only() {
+        // A GTC or IOC sell at limit 100 crosses into bids at 200 and fills
+        // at 200: the venue charges 200 * 1 bp = 20000 micro-USDC, above any
+        // bound the request or a pre-signing mid could give. It is refused.
+        for tif in ["Gtc", "Ioc"] {
+            let action = builder_order(json!([
+                {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": tif}}}
+            ]));
+            let err = declared_amount(&action).unwrap_err();
+            assert!(err.contains("post-only"), "{err}");
+            assert!(builder_order_advisory_for(&action).is_none());
+        }
+        // Post-only, the same sell can only rest and fill at exactly 100,
+        // however far bids later rise: 100 * 1 bp = 10000 micro-USDC.
+        let post_only = builder_order(json!([
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(declared_amount(&post_only).unwrap(), "10000");
+        // Buys keep any time in force: they fill at or below their limit.
+        let ioc_buy = builder_order(json!([
+            {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Ioc"}}}
+        ]));
+        assert_eq!(declared_amount(&ioc_buy).unwrap(), "10000");
+    }
+
+    #[test]
+    fn spot_buys_pay_no_builder_fee() {
+        let spot = protocol::SPOT_ASSET_ID_OFFSET;
+        // Only spot buys: the builder would earn nothing, so it is refused
+        // rather than signed with a meaningless zero fee.
+        let only_spot_buys = builder_order(json!([
+            {"a": spot, "b": true, "p": "10", "s": "5", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": spot + 1, "b": true, "p": "2", "s": "50", "r": false, "t": {"limit": {"tif": "Ioc"}}}
+        ]));
+        let err = declared_amount(&only_spot_buys).unwrap_err();
+        assert!(err.contains("no builder fee on spot buys"), "{err}");
+        assert!(builder_order_advisory_for(&only_spot_buys).is_none());
+
+        // Mixed: the spot buy (10 * 5 = 50) adds nothing; the post-only spot
+        // sell (20 * 3 = 60) and the perp buy (100 * 1 = 100) do, so the bound
+        // is 160 * 1 bp = 16000 micro-USDC.
+        let mixed = builder_order(json!([
+            {"a": spot, "b": true, "p": "10", "s": "5", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": spot, "b": false, "p": "20", "s": "3", "r": false, "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert_eq!(declared_amount(&mixed).unwrap(), "16000");
+        let advisory = String::from_utf8(builder_order_advisory_for(&mixed).unwrap()).unwrap();
+        assert!(advisory.contains("0.016 USDC"), "{advisory}");
+        assert!(advisory.contains("except spot buys"), "{advisory}");
+
+        // A spot sell must still be post-only.
+        let spot_gtc_sell = builder_order(json!([
+            {"a": spot, "b": false, "p": "20", "s": "3", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert!(
+            declared_amount(&spot_gtc_sell)
+                .unwrap_err()
+                .contains("post-only")
         );
     }
 
     #[test]
     fn a_builder_bearing_trigger_order_is_refused() {
-        // A take-profit sell with limit 190000 and trigger 200000 fills at or
-        // above 200000 once triggered; neither the limit nor the current mid
-        // (100000) bounds the 20 USDC the venue would charge on such a fill,
-        // so the request is refused instead of declaring 19 USDC.
-        let mids: std::collections::BTreeMap<u32, f64> = [(0, 100_000.0)].into_iter().collect();
+        // A take-profit with limit 190000 and trigger 200000 fills at the
+        // market once triggered; its limit does not bound the fee the venue
+        // would charge on such a fill, so the request is refused.
         for (is_buy, is_market) in [(false, false), (false, true), (true, false)] {
             let action: ExchangeAction = serde_json::from_value(json!({
                 "type": "order",
@@ -3560,9 +3494,9 @@ mod tests {
                 "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
             }))
             .unwrap();
-            let err = order_claim_effects(&action, &mids).unwrap_err();
+            let err = order_claim_effects(&action).unwrap_err();
             assert!(err.contains("trigger order cannot be bounded"), "{err}");
-            assert!(builder_order_advisory_for(&action, &mids).is_none());
+            assert!(builder_order_advisory_for(&action).is_none());
         }
         // The same order without a builder declares no fee and is not the
         // fee bound's concern.
@@ -3575,66 +3509,7 @@ mod tests {
             "grouping": "na"
         }))
         .unwrap();
-        assert_eq!(
-            order_claim_effects(&plain, &mids).unwrap(),
-            ClaimEffects::none()
-        );
-    }
-
-    #[test]
-    fn spot_mids_resolve_through_spot_meta_names() {
-        // `allMids` names the canonical pair `PURR/USDC`, not `@0`, so a mid
-        // derived from `@<index>` alone never finds it; every other pair is
-        // `@<index>`. Both resolve through `spotMeta`'s own names.
-        let spot_meta = json!({"universe": [
-            {"name": "PURR/USDC", "index": 0, "tokens": [1, 0], "isCanonical": true},
-            {"name": "@1", "index": 1, "tokens": [2, 0], "isCanonical": false}
-        ]});
-        let spot_pairs = parse_spot_pair_ids(&spot_meta).unwrap();
-        assert_eq!(spot_pairs["PURR/USDC"], protocol::SPOT_ASSET_ID_OFFSET);
-        assert_eq!(spot_pairs["@1"], protocol::SPOT_ASSET_ID_OFFSET + 1);
-        let perps: std::collections::BTreeMap<String, PerpAsset> = [(
-            "BTC".to_owned(),
-            PerpAsset {
-                id: 0,
-                sz_decimals: 5,
-            },
-        )]
-        .into_iter()
-        .collect();
-        let mids = mids_by_asset(
-            &json!({"BTC": "85195.5", "PURR/USDC": "0.16638", "@1": "12.5665", "@7": "1.0"}),
-            &perps,
-            &spot_pairs,
-        )
-        .unwrap();
-        assert_eq!(mids[&0], 85195.5);
-        assert_eq!(mids[&protocol::SPOT_ASSET_ID_OFFSET], 0.16638);
-        assert_eq!(mids[&(protocol::SPOT_ASSET_ID_OFFSET + 1)], 12.5665);
-        assert!(!mids.contains_key(&(protocol::SPOT_ASSET_ID_OFFSET + 7)));
-        assert!(parse_spot_pair_ids(&json!({"universe": [{"name": "@1"}]})).is_err());
-        assert!(mids_by_asset(&json!([]), &perps, &spot_pairs).is_err());
-
-        // A PURR sell at limit 0.001 for 1,000,000 PURR with a 10 bp builder
-        // fee: at the mid of 0.16638 the venue charges about 1663.80 USDC,
-        // which is what the claim declares once the mid resolves, and the
-        // order is refused rather than declared at 10 USDC when it does not.
-        let action: ExchangeAction = serde_json::from_value(json!({
-            "type": "order",
-            "orders": [{
-                "a": protocol::SPOT_ASSET_ID_OFFSET, "b": false, "p": "0.001", "s": "1000000",
-                "r": false, "t": {"limit": {"tif": "Gtc"}}
-            }],
-            "grouping": "na",
-            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 1000}
-        }))
-        .unwrap();
-        assert_eq!(
-            order_claim_effects(&action, &mids).unwrap().declared_fee["amount"],
-            "1663800000"
-        );
-        let err = order_claim_effects(&action, &Default::default()).unwrap_err();
-        assert!(err.contains("no mid price for asset 10000"), "{err}");
+        assert_eq!(order_claim_effects(&plain).unwrap(), ClaimEffects::none());
     }
 
     #[test]
@@ -3660,7 +3535,7 @@ mod tests {
         .unwrap();
         assert!(revoke.contains("revokes"));
 
-        let order = String::from_utf8(builder_order_advisory(builder, 10, 10100)).unwrap();
+        let order = String::from_utf8(builder_order_advisory(builder, 10, 10100, false)).unwrap();
         assert!(order.contains(builder));
         assert!(order.contains("0.01%"));
         assert!(order.contains("0.0101 USDC"));

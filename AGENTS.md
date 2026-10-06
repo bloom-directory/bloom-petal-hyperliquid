@@ -19,10 +19,12 @@ through the session route of the same name), which signs under
 (Hyperliquid USDC) and an upper bound on the amount the venue will charge; the
 builder address and rate are committed in the signed order payload and shown
 in the owner's approval advisory, not carried in the claim. The bound uses
-each leg's limit price, or for a sell the larger of its limit and the current
-mid, so a builder-bearing trigger order is refused (its fill price cannot be
-bounded in advance) and a builder-bearing sell is refused when the venue
-publishes no mid for its asset. A delegated session may use a builder fee only
+each leg's limit price. A buy fills at or below its limit; a builder-bearing
+sell must be post-only (`Alo`), since a crossing sell fills at the resting bid,
+which no order price caps, while a post-only sell fills at exactly its limit.
+Spot buys pay no builder fee and add nothing, and an order of only spot buys
+is refused. A builder-bearing trigger order is refused, since it fills at the
+market once triggered. A delegated session may use a builder fee only
 if it was created with a matching `builder_address`/`max_builder_fee_tenths_bps`
 bound, which is also what adds the builder-order route and class to that
 session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
