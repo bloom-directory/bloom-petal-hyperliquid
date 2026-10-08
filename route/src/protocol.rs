@@ -189,12 +189,22 @@ impl ExchangeAction {
                     if builder.fee_tenths_bps == 0 {
                         return Err("builder fee must be greater than zero".into());
                     }
-                    let cap = if orders.iter().any(|o| o.asset < SPOT_ASSET_ID_OFFSET) {
-                        MAX_PERP_BUILDER_FEE_TENTHS_BPS
+                    // Any perp leg (core or HIP-3) takes the perp cap, else
+                    // any spot leg the spot cap. Hyperliquid documents no
+                    // cap for outcomes; the fee claim refuses them anyway.
+                    let cap = if orders
+                        .iter()
+                        .any(|o| is_core_perp_asset(o.asset) || is_hip3_perp_asset(o.asset))
+                    {
+                        Some(MAX_PERP_BUILDER_FEE_TENTHS_BPS)
+                    } else if orders.iter().any(|o| is_spot_asset(o.asset)) {
+                        Some(MAX_SPOT_BUILDER_FEE_TENTHS_BPS)
                     } else {
-                        MAX_SPOT_BUILDER_FEE_TENTHS_BPS
+                        None
                     };
-                    if builder.fee_tenths_bps > cap {
+                    if let Some(cap) = cap
+                        && builder.fee_tenths_bps > cap
+                    {
                         return Err(format!(
                             "builder fee exceeds the venue cap of {cap} tenths of a basis point for this order's asset type"
                         ));
@@ -272,8 +282,35 @@ pub enum Grouping {
     #[serde(rename = "positionTpsl")]
     PositionTpsl,
 }
-/// Perpetual asset ids are below this offset; spot asset ids are at or above it.
+/// Core perpetual asset ids are below this offset; spot asset ids are
+/// `SPOT_ASSET_ID_OFFSET + spot pair index`.
 pub const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
+/// Builder-deployed (HIP-3) perpetual asset ids are
+/// `HIP3_ASSET_ID_OFFSET + perp_dex_index * 10_000 + index_in_meta`, below
+/// `OUTCOME_ASSET_ID_OFFSET`.
+pub const HIP3_ASSET_ID_OFFSET: u32 = 100_000;
+/// Outcome asset ids are `OUTCOME_ASSET_ID_OFFSET + 10 * outcome + side`.
+pub const OUTCOME_ASSET_ID_OFFSET: u32 = 100_000_000;
+/// The spot token index of USDC, the core perps' collateral and the quote
+/// token of USDC-quoted spot pairs, on both mainnet and testnet.
+pub const USDC_SPOT_TOKEN_INDEX: u64 = 0;
+
+/// A core (non-HIP-3) perpetual.
+pub fn is_core_perp_asset(asset: u32) -> bool {
+    asset < SPOT_ASSET_ID_OFFSET
+}
+/// A spot pair: between the spot and HIP-3 offsets.
+pub fn is_spot_asset(asset: u32) -> bool {
+    (SPOT_ASSET_ID_OFFSET..HIP3_ASSET_ID_OFFSET).contains(&asset)
+}
+/// A builder-deployed (HIP-3) perpetual.
+pub fn is_hip3_perp_asset(asset: u32) -> bool {
+    (HIP3_ASSET_ID_OFFSET..OUTCOME_ASSET_ID_OFFSET).contains(&asset)
+}
+/// An outcome market.
+pub fn is_outcome_asset(asset: u32) -> bool {
+    asset >= OUTCOME_ASSET_ID_OFFSET
+}
 /// Hyperliquid's venue-enforced builder fee ceiling for perpetual orders
 /// (0.1%), expressed in tenths of a basis point, the unit of `BuilderFee::f`.
 pub const MAX_PERP_BUILDER_FEE_TENTHS_BPS: u32 = 100;
@@ -1129,6 +1166,51 @@ mod tests {
         // over the perp cap: rejected, even though it is within the spot cap
         assert!(
             mixed_batch(101)
+                .validate()
+                .unwrap_err()
+                .contains("venue cap of 100")
+        );
+    }
+
+    #[test]
+    fn hip3_perps_take_the_perp_builder_fee_cap() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        // 100000 + dex 1 * 10000 + index 0: a perp, so 0.1% is the ceiling.
+        assert!(is_hip3_perp_asset(110_000));
+        assert!(!is_spot_asset(110_000));
+        assert!(is_spot_asset(SPOT_ASSET_ID_OFFSET));
+        assert!(is_spot_asset(HIP3_ASSET_ID_OFFSET - 1));
+        assert!(is_core_perp_asset(SPOT_ASSET_ID_OFFSET - 1));
+        assert!(!is_core_perp_asset(SPOT_ASSET_ID_OFFSET));
+        assert!(is_hip3_perp_asset(HIP3_ASSET_ID_OFFSET));
+        assert!(is_hip3_perp_asset(OUTCOME_ASSET_ID_OFFSET - 1));
+        // 100000000 + 10 * outcome 1 + side 0: an outcome, not a HIP-3 perp.
+        assert!(is_outcome_asset(100_000_010));
+        assert!(!is_hip3_perp_asset(100_000_010));
+        assert!(!is_spot_asset(100_000_010));
+        // No cap is stated for an outcome-only order (the fee claim refuses
+        // it with its own reason); beside a perp leg the perp cap applies.
+        assert_eq!(
+            order_with_builder(100_000_010, addr, 500).validate(),
+            Ok(())
+        );
+        let mixed: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 100_000_010, "b": true, "p": "0.5", "s": "10", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+                {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+            ],
+            "grouping": "na",
+            "builder": {"b": addr, "f": 500}
+        }))
+        .unwrap();
+        assert!(mixed.validate().unwrap_err().contains("venue cap of 100"));
+        assert_eq!(
+            order_with_builder(110_000, addr, MAX_PERP_BUILDER_FEE_TENTHS_BPS).validate(),
+            Ok(())
+        );
+        assert!(
+            order_with_builder(110_000, addr, MAX_PERP_BUILDER_FEE_TENTHS_BPS + 1)
                 .validate()
                 .unwrap_err()
                 .contains("venue cap of 100")

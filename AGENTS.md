@@ -24,7 +24,13 @@ sell must be post-only (`Alo`), since a crossing sell fills at the resting bid,
 which no order price caps, while a post-only sell fills at exactly its limit.
 Spot buys pay no builder fee and add nothing, and an order of only spot buys
 is refused. A builder-bearing trigger order is refused, since it fills at the
-market once triggered. A delegated session may use a builder fee only
+market once triggered. Hyperliquid collects the builder fee in the market's
+quote or collateral asset and the claim declares USDC, so a builder-bearing
+leg is accepted only where the fee is known to be USDC: core perps, and spot
+sells on pairs quoted in USDC (read from `spotMeta`; a spot buy pays no fee).
+A spot sell on a pair quoted in another token is refused. HIP-3 perps and
+outcome markets are refused too: this Petal does not look up their fee asset,
+which for HIP-3 depends on the dex. A delegated session may use a builder fee only
 if it was created with a matching `builder_address`/`max_builder_fee_tenths_bps`
 bound, which is also what adds the builder-order route and class to that
 session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`

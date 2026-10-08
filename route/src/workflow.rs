@@ -113,10 +113,20 @@ impl ClaimEffects {
 ///   spot buys add nothing; an order of only spot buys is refused, since its
 ///   builder would earn nothing.
 /// - A trigger order fills at the market once triggered, so it is refused.
+/// - Hyperliquid collects the builder fee in the market's quote or collateral
+///   asset, and the claim declares USDC, so only legs known to pay in USDC
+///   are accepted: core perps and spot sells on pairs quoted in USDC
+///   (`usdc_quoted_spot_assets`). A spot sell on a pair quoted in any other
+///   token is refused, and so are HIP-3 perps and outcomes, whose fee asset
+///   this Petal does not look up. A spot buy pays no builder fee, so its
+///   pair's quote token does not matter.
 ///
 /// Every other leg counts, reduce-only included. The venue computes and
 /// deducts the exact fee.
-fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> {
+fn order_claim_effects(
+    action: &ExchangeAction,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Result<ClaimEffects, String> {
     let ExchangeAction::Order {
         orders,
         builder: Some(builder),
@@ -127,18 +137,52 @@ fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> 
     };
     protocol::parse_address(&builder.address)?;
     Ok(ClaimEffects::builder_order_fee(
-        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps)?,
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, usdc_quoted_spot_assets)?,
     ))
 }
 
 fn is_spot_buy(order: &protocol::OrderWire) -> bool {
-    order.is_buy && order.asset >= protocol::SPOT_ASSET_ID_OFFSET
+    order.is_buy && protocol::is_spot_asset(order.asset)
+}
+
+/// Refuses a builder-bearing leg on a market whose builder fee is not paid in
+/// USDC, the only fee asset the claim can declare.
+fn ensure_builder_fee_paid_in_usdc(
+    order: &protocol::OrderWire,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Result<(), String> {
+    if protocol::is_hip3_perp_asset(order.asset) {
+        return Err(format!(
+            "asset {} is a builder-deployed (HIP-3) perp; Hyperliquid collects its builder fee in that dex's collateral asset, which is not always USDC and which this Petal does not look up, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    if protocol::is_outcome_asset(order.asset) {
+        return Err(format!(
+            "asset {} is an outcome market; this Petal does not bound builder fees on outcomes, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    if protocol::is_spot_asset(order.asset)
+        && !order.is_buy
+        && !usdc_quoted_spot_assets.contains(&order.asset)
+    {
+        return Err(format!(
+            "spot asset {} is not quoted in USDC; Hyperliquid collects its builder fee in its quote token, which this order's claim cannot declare, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    Ok(())
 }
 
 fn builder_fee_upper_bound_micros(
     orders: &[protocol::OrderWire],
     fee_tenths_bps: u32,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
 ) -> Result<u64, String> {
+    for o in orders {
+        ensure_builder_fee_paid_in_usdc(o, usdc_quoted_spot_assets)?;
+    }
     if orders.iter().all(is_spot_buy) {
         return Err(
             "Hyperliquid charges no builder fee on spot buys, so a builder on an order of only spot buys earns nothing; submit it without a builder through order.json".into(),
@@ -176,7 +220,10 @@ fn builder_fee_upper_bound_micros(
 
 /// The ceremony advisory for an order that carries a builder fee, so the
 /// owner sees the recipient and the rate rather than only an opaque hash.
-fn builder_order_advisory_for(action: &ExchangeAction) -> Option<Vec<u8>> {
+fn builder_order_advisory_for(
+    action: &ExchangeAction,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Option<Vec<u8>> {
     let ExchangeAction::Order {
         orders,
         builder: Some(builder),
@@ -187,13 +234,72 @@ fn builder_order_advisory_for(action: &ExchangeAction) -> Option<Vec<u8>> {
     };
     // Runs after `order_claim_effects` accepted the same action, so the bound
     // that produced the declared fee is the one shown here.
-    let fee_micros = builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps).ok()?;
+    let fee_micros =
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, usdc_quoted_spot_assets)
+            .ok()?;
     Some(builder_order_advisory(
         &builder.address,
         builder.fee_tenths_bps,
         fee_micros,
         orders.iter().any(is_spot_buy),
     ))
+}
+
+/// Asset ids of the spot pairs quoted in USDC, read from `spotMeta` only when
+/// a builder-bearing order has a spot sell (a spot buy pays no builder fee).
+/// A pair's quote token is fixed pair metadata, not a price, so it cannot go
+/// stale while the owner approves.
+fn builder_order_usdc_quoted_spot_assets(
+    n: Network,
+    action: &ExchangeAction,
+) -> Result<std::collections::BTreeSet<u32>, DispatchResponse> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(_),
+        ..
+    } = action
+    else {
+        return Ok(Default::default());
+    };
+    if !orders
+        .iter()
+        .any(|o| protocol::is_spot_asset(o.asset) && !o.is_buy)
+    {
+        return Ok(Default::default());
+    }
+    parse_usdc_quoted_spot_assets(&http_json(n, "/info", json!({"type":"spotMeta"}))?)
+}
+
+fn parse_usdc_quoted_spot_assets(
+    spot_meta: &Value,
+) -> Result<std::collections::BTreeSet<u32>, DispatchResponse> {
+    let malformed = || backend("Hyperliquid returned a malformed spotMeta response");
+    let universe = spot_meta
+        .get("universe")
+        .and_then(Value::as_array)
+        .ok_or_else(malformed)?;
+    let mut out = std::collections::BTreeSet::new();
+    for pair in universe {
+        let index = pair
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(malformed)?;
+        let quote = pair
+            .get("tokens")
+            .and_then(Value::as_array)
+            .filter(|tokens| tokens.len() == 2)
+            .and_then(|tokens| tokens[1].as_u64())
+            .ok_or_else(malformed)?;
+        let asset = protocol::SPOT_ASSET_ID_OFFSET
+            .checked_add(index)
+            .filter(|asset| protocol::is_spot_asset(*asset))
+            .ok_or_else(malformed)?;
+        if quote == protocol::USDC_SPOT_TOKEN_INDEX {
+            out.insert(asset);
+        }
+    }
+    Ok(out)
 }
 
 fn ok_write() -> DispatchResponse {
@@ -541,6 +647,17 @@ pub fn owner_action_write(
             Err(e) => return invalid(e),
         };
     let carries_builder = req.action.carries_builder();
+    // The claim (and with it every market and bound refusal) comes first, so
+    // an order this Petal will refuse anyway never sends the owner to approve
+    // its builder.
+    let usdc_quoted_spot_assets = match builder_order_usdc_quoted_spot_assets(n, &req.action) {
+        Ok(assets) => assets,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&req.action, &usdc_quoted_spot_assets) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
     // Refuse an unapproved builder before the ceremony whenever the owner
     // address is already known from an earlier signature, so the owner is
     // not asked for a passkey tap the venue would then make pointless. The
@@ -551,10 +668,6 @@ pub fn owner_action_write(
     {
         return e;
     }
-    let effects = match order_claim_effects(&req.action) {
-        Ok(effects) => effects,
-        Err(e) => return invalid(e),
-    };
     let sig = match owner_sign_or_approval(
         ctx,
         &w,
@@ -564,7 +677,7 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            advisory: builder_order_advisory_for(&req.action),
+            advisory: builder_order_advisory_for(&req.action, &usdc_quoted_spot_assets),
             effects,
         },
     ) {
@@ -2188,6 +2301,17 @@ fn session_submit(
     if let Err(e) = session_policy(s, &action) {
         return denied(e);
     }
+    // The claim (and every market and bound refusal) comes before the
+    // builder-approval check and before any nonce or receipt is reserved, so
+    // an order refused here reserves nothing and never prompts an approval.
+    let usdc_quoted_spot_assets = match builder_order_usdc_quoted_spot_assets(n, &action) {
+        Ok(assets) => assets,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&action, &usdc_quoted_spot_assets) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
     if let Err(e) = ensure_builder_fee_is_approved(n, &s.owner_address, &action) {
         return e;
     }
@@ -2242,10 +2366,6 @@ fn session_submit(
     }
     let signing_payload = match protocol::l1_signing_payload(n, &action, nonce, vault, expires) {
         Ok(x) => x,
-        Err(e) => return invalid(e),
-    };
-    let effects = match order_claim_effects(&action) {
-        Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
     let sig = match sign_payload(
@@ -2637,7 +2757,7 @@ fn session_allows_asset(session: &Session, asset: u32) -> bool {
 }
 fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     a.validate()?;
-    let is_perpetual = |asset: u32| asset < protocol::SPOT_ASSET_ID_OFFSET;
+    let is_perpetual = protocol::is_core_perp_asset;
     let all_perpetual = match a {
         ExchangeAction::Order { orders, .. } => orders.iter().all(|o| is_perpetual(o.asset)),
         ExchangeAction::Cancel { cancels, .. } => cancels.iter().all(|o| is_perpetual(o.asset)),
@@ -2648,7 +2768,10 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         ExchangeAction::ScheduleCancel { .. } => true,
     };
     if !all_perpetual {
-        return Err("delegated sessions do not support spot asset ids".into());
+        return Err(
+            "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                .into(),
+        );
     }
     if let ExchangeAction::UpdateLeverage { leverage, .. } = a
         && s.max_leverage.is_some_and(|m| *leverage > m)
@@ -3345,7 +3468,10 @@ mod tests {
             cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
             fast: None,
         };
-        assert_eq!(order_claim_effects(&cancel).unwrap(), ClaimEffects::none());
+        assert_eq!(
+            order_claim_effects(&cancel, &usdc_spot()).unwrap(),
+            ClaimEffects::none()
+        );
 
         let plain_order: ExchangeAction = serde_json::from_value(json!({
             "type": "order",
@@ -3357,14 +3483,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            order_claim_effects(&plain_order).unwrap(),
+            order_claim_effects(&plain_order, &usdc_spot()).unwrap(),
             ClaimEffects::none()
         );
 
         // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
         let builder_order =
             order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
-        let effects = order_claim_effects(&builder_order).unwrap();
+        let effects = order_claim_effects(&builder_order, &usdc_spot()).unwrap();
         assert!(effects.declared_debits.is_empty());
         assert!(effects.declared_destinations.is_empty());
         assert_eq!(
@@ -3396,9 +3522,127 @@ mod tests {
         // max_notional_usd check still excludes reduce-only legs; that is a
         // different bound with a different purpose.
         assert_eq!(
-            order_claim_effects(&action).unwrap().declared_fee,
+            order_claim_effects(&action, &usdc_spot())
+                .unwrap()
+                .declared_fee,
             json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
         );
+    }
+
+    /// The USDC-quoted spot pairs the tests assume: pairs 0 and 1.
+    fn usdc_spot() -> std::collections::BTreeSet<u32> {
+        [
+            protocol::SPOT_ASSET_ID_OFFSET,
+            protocol::SPOT_ASSET_ID_OFFSET + 1,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn builder_fees_are_accepted_only_where_they_are_paid_in_usdc() {
+        // HIP-3 perps (100000 + dex * 10000 + index) are perps, not spot: a
+        // buy pays the builder fee, in the dex's collateral asset. It is
+        // refused on that ground, not as an "only spot buys" order, and not
+        // silently left out of the fee.
+        let hip3_buy = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        let err = declared_amount(&hip3_buy).unwrap_err();
+        assert!(err.contains("HIP-3"), "{err}");
+        assert!(!err.contains("spot buys"), "{err}");
+        assert!(builder_order_advisory_for(&hip3_buy, &usdc_spot()).is_none());
+
+        // With a post-only core sell beside it, the HIP-3 buy would have been
+        // charged without being declared; the whole order is refused.
+        let hip3_with_core_sell = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert!(
+            declared_amount(&hip3_with_core_sell)
+                .unwrap_err()
+                .contains("HIP-3")
+        );
+
+        // Outcomes (100000000 + 10 * outcome + side) are not HIP-3 perps, and
+        // are refused with their own reason.
+        let outcome = builder_order(json!([
+            {"a": 100_000_010, "b": false, "p": "0.5", "s": "100", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        let err = declared_amount(&outcome).unwrap_err();
+        assert!(err.contains("outcome market"), "{err}");
+        assert!(!err.contains("HIP-3"), "{err}");
+
+        // A post-only sell on a spot pair not quoted in USDC (mainnet @207 is
+        // quoted in USDT0) pays its builder fee in that quote token: refused.
+        let non_usdc_spot = protocol::SPOT_ASSET_ID_OFFSET + 207;
+        let non_usdc_sell = builder_order(json!([
+            {"a": non_usdc_spot, "b": false, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        let err = declared_amount(&non_usdc_sell).unwrap_err();
+        assert!(err.contains("not quoted in USDC"), "{err}");
+        assert!(builder_order_advisory_for(&non_usdc_sell, &usdc_spot()).is_none());
+
+        // A spot buy pays no builder fee, so a buy on that same non-USDC pair
+        // is not refused for its quote token: beside a post-only core sell it
+        // adds nothing (100 * 1 at 1 bp), and alone it is the "only spot
+        // buys" refusal, not a quote-token one.
+        let non_usdc_buy_with_core_sell = builder_order(json!([
+            {"a": non_usdc_spot, "b": true, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(
+            declared_amount(&non_usdc_buy_with_core_sell).unwrap(),
+            "10000"
+        );
+        let only_non_usdc_buy = builder_order(json!([
+            {"a": non_usdc_spot, "b": true, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        let err = declared_amount(&only_non_usdc_buy).unwrap_err();
+        assert!(err.contains("no builder fee on spot buys"), "{err}");
+
+        // The same sell on a USDC-quoted pair, and a core perp sell, are
+        // declared as before: 1 * 50 and 100 * 1 at 1 bp.
+        let usdc_sell = builder_order(json!([
+            {"a": protocol::SPOT_ASSET_ID_OFFSET + 1, "b": false, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(declared_amount(&usdc_sell).unwrap(), "15000");
+    }
+
+    #[test]
+    fn usdc_quoted_spot_pairs_come_from_spot_meta_quote_tokens() {
+        // Pair 0 (PURR/USDC) and pair 1 are quoted in token 0 (USDC); pair
+        // 207 is quoted in token 268 (USDT0).
+        let spot_meta = json!({
+            "tokens": [{"name": "USDC", "index": 0}, {"name": "USDT0", "index": 268}],
+            "universe": [
+                {"name": "PURR/USDC", "index": 0, "tokens": [1, 0]},
+                {"name": "@1", "index": 1, "tokens": [2, 0]},
+                {"name": "@207", "index": 207, "tokens": [300, 268]}
+            ]
+        });
+        let assets = parse_usdc_quoted_spot_assets(&spot_meta).unwrap();
+        assert_eq!(
+            assets.into_iter().collect::<Vec<_>>(),
+            vec![
+                protocol::SPOT_ASSET_ID_OFFSET,
+                protocol::SPOT_ASSET_ID_OFFSET + 1
+            ]
+        );
+        for malformed in [
+            json!({}),
+            json!({"universe": [{"name": "@1", "index": 1}]}),
+            json!({"universe": [{"name": "@1", "index": 1, "tokens": [2]}]}),
+            json!({"universe": [{"name": "@1", "tokens": [2, 0]}]}),
+            json!({"universe": [{"name": "@x", "index": 90000, "tokens": [2, 0]}]}),
+        ] {
+            assert!(
+                parse_usdc_quoted_spot_assets(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
     }
 
     fn builder_order(legs: Value) -> ExchangeAction {
@@ -3412,7 +3656,8 @@ mod tests {
     }
 
     fn declared_amount(action: &ExchangeAction) -> Result<Value, String> {
-        order_claim_effects(action).map(|effects| effects.declared_fee["amount"].clone())
+        order_claim_effects(action, &usdc_spot())
+            .map(|effects| effects.declared_fee["amount"].clone())
     }
 
     #[test]
@@ -3426,7 +3671,7 @@ mod tests {
             ]));
             let err = declared_amount(&action).unwrap_err();
             assert!(err.contains("post-only"), "{err}");
-            assert!(builder_order_advisory_for(&action).is_none());
+            assert!(builder_order_advisory_for(&action, &usdc_spot()).is_none());
         }
         // Post-only, the same sell can only rest and fill at exactly 100,
         // however far bids later rise: 100 * 1 bp = 10000 micro-USDC.
@@ -3452,7 +3697,7 @@ mod tests {
         ]));
         let err = declared_amount(&only_spot_buys).unwrap_err();
         assert!(err.contains("no builder fee on spot buys"), "{err}");
-        assert!(builder_order_advisory_for(&only_spot_buys).is_none());
+        assert!(builder_order_advisory_for(&only_spot_buys, &usdc_spot()).is_none());
 
         // Mixed: the spot buy (10 * 5 = 50) adds nothing; the post-only spot
         // sell (20 * 3 = 60) and the perp buy (100 * 1 = 100) do, so the bound
@@ -3463,7 +3708,8 @@ mod tests {
             {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
         ]));
         assert_eq!(declared_amount(&mixed).unwrap(), "16000");
-        let advisory = String::from_utf8(builder_order_advisory_for(&mixed).unwrap()).unwrap();
+        let advisory =
+            String::from_utf8(builder_order_advisory_for(&mixed, &usdc_spot()).unwrap()).unwrap();
         assert!(advisory.contains("0.016 USDC"), "{advisory}");
         assert!(advisory.contains("except spot buys"), "{advisory}");
 
@@ -3494,9 +3740,9 @@ mod tests {
                 "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
             }))
             .unwrap();
-            let err = order_claim_effects(&action).unwrap_err();
+            let err = order_claim_effects(&action, &usdc_spot()).unwrap_err();
             assert!(err.contains("trigger order cannot be bounded"), "{err}");
-            assert!(builder_order_advisory_for(&action).is_none());
+            assert!(builder_order_advisory_for(&action, &usdc_spot()).is_none());
         }
         // The same order without a builder declares no fee and is not the
         // fee bound's concern.
@@ -3509,7 +3755,10 @@ mod tests {
             "grouping": "na"
         }))
         .unwrap();
-        assert_eq!(order_claim_effects(&plain).unwrap(), ClaimEffects::none());
+        assert_eq!(
+            order_claim_effects(&plain, &usdc_spot()).unwrap(),
+            ClaimEffects::none()
+        );
     }
 
     #[test]
@@ -3832,7 +4081,22 @@ mod tests {
         };
         assert_eq!(
             session_policy(&unrestricted, &spot),
-            Err("delegated sessions do not support spot asset ids".into())
+            Err(
+                "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                    .into()
+            )
+        );
+        let hip3 = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire {
+                asset: 110_000,
+                oid: 42,
+            }],
+            fast: None,
+        };
+        assert!(
+            session_policy(&unrestricted, &hip3)
+                .unwrap_err()
+                .contains("core perpetual")
         );
     }
 
