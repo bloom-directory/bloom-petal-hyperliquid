@@ -188,7 +188,7 @@ fn builder_fee_upper_bound_micros(
             "Hyperliquid charges no builder fee on spot buys, so a builder on an order of only spot buys earns nothing; submit it without a builder through order.json".into(),
         );
     }
-    let mut notional = 0.0_f64;
+    let mut fee_micros = 0_u64;
     for o in orders {
         let Some(limit_type) = &o.order_type.limit else {
             return Err(
@@ -203,19 +203,45 @@ fn builder_fee_upper_bound_micros(
         if is_spot_buy(o) {
             continue;
         }
-        let (Ok(limit), Ok(size)) = (o.price.parse::<f64>(), o.size.parse::<f64>()) else {
-            return Err("order price and size must be decimal numbers".into());
-        };
-        notional += limit * size;
+        let leg_fee = exact_builder_fee_micros(&o.price, &o.size, fee_tenths_bps)?;
+        fee_micros = fee_micros
+            .checked_add(leg_fee)
+            .ok_or("builder fee exceeds the supported USDC amount")?;
     }
-    if !notional.is_finite() {
-        return Err("order notional is not a finite number".into());
+    Ok(fee_micros)
+}
+
+/// Round each leg upward in micro-USDC using the signed decimal bytes.
+/// Floating-point rounding can erase a fraction above an integer, and
+/// saturating a large fee silently understates the amount being authorized.
+fn exact_builder_fee_micros(price: &str, size: &str, rate: u32) -> Result<u64, String> {
+    use alloy_primitives::U256;
+
+    let decimal = |raw: &str| -> Result<(U256, usize), String> {
+        let fraction = raw.split_once('.').map_or(0, |(_, value)| value.len());
+        let mantissa = raw
+            .replace('.', "")
+            .parse::<U256>()
+            .map_err(|_| "order price and size exceed the supported decimal range")?;
+        Ok((mantissa, fraction))
+    };
+    let (price, price_scale) = decimal(price)?;
+    let (size, size_scale) = decimal(size)?;
+    let overflow = "builder fee exceeds the supported USDC amount";
+    // 1 USDC = 10^6 micros; one tenth-basis-point = 1/10^5.
+    let numerator = price
+        .checked_mul(size)
+        .and_then(|value| value.checked_mul(U256::from(rate)))
+        .and_then(|value| value.checked_mul(U256::from(10)))
+        .ok_or(overflow)?;
+    let denominator = U256::from(10)
+        .checked_pow(U256::from(price_scale + size_scale))
+        .ok_or(overflow)?;
+    let mut bound = numerator / denominator;
+    if numerator % denominator != U256::ZERO {
+        bound = bound.checked_add(U256::from(1)).ok_or(overflow)?;
     }
-    Ok(
-        (notional * 1_000_000.0 * f64::from(fee_tenths_bps) / 100_000.0)
-            .ceil()
-            .clamp(0.0, u64::MAX as f64) as u64,
-    )
+    bound.try_into().map_err(|_| overflow.into())
 }
 
 /// The ceremony advisory for an order that carries a builder fee, so the
@@ -3598,6 +3624,28 @@ mod tests {
                 .unwrap()
                 .declared_fee,
             json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
+        );
+    }
+
+    #[test]
+    fn builder_fee_bound_preserves_sub_micro_fractions_and_refuses_overflow() {
+        // f64 erases the fraction and declares 10_000_000 micros instead
+        // of rounding the exact positive fraction upward.
+        assert_eq!(
+            exact_builder_fee_micros("100000.000000000001", "1", 10),
+            Ok(10_000_001)
+        );
+        assert_eq!(exact_builder_fee_micros("0.1", "0.1", 1), Ok(1));
+        assert_eq!(exact_builder_fee_micros("100", "0.01", 10), Ok(100));
+        assert!(exact_builder_fee_micros("18446744073709551616", "1", 100).is_err());
+
+        let action = builder_order(json!([
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert!(
+            declared_amount(&action).is_err(),
+            "the summed fee must not saturate"
         );
     }
 
