@@ -5,6 +5,7 @@ use sha2::Sha256;
 use sha3::Digest;
 
 use crate::protocol::{self, ExchangeAction, Network, SignSubmit};
+use crate::settings;
 use petal::{
     Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
     SignSelector,
@@ -12,14 +13,18 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000025 is the session-creation route that invokes derive_key. The Machine
+// r000026 is the session-creation route that invokes derive_key. The Machine
 // host requires the executing route to be part of the immutable derived-key
 // scope, alongside the routes that later use the session key. Machine derives
 // one route-specific reusable Sealed Approval from this installer-verified set
 // before it reports the key ready; action routes reuse it by KeyRef.
 const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+    "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
 ];
+/// `[session]/builder_order.json`. Added to a session key's scope, together
+/// with `BUILDER_ORDER_INTENT`, only when the session was created with a
+/// builder bound; a session without one has no builder fee to authorize.
+const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = "r000008";
 
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
@@ -50,6 +55,7 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+
     /// A withdrawal debits the gross amount from the Hyperliquid account and
     /// settles on the destination chain (Arbitrum). The Broker catalogues petal
     /// operation classes with a `none` fee asset, so the claim itself cannot
@@ -68,6 +74,258 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+
+    /// An order that carries a per-order builder fee pays it to a third-party
+    /// address the caller chose, so it is a real economic effect the owner's
+    /// approval ceremony must see rather than `{"kind":"none"}`. Broker's
+    /// `DeclaredFee` is a closed schema (`{"kind":"none"}` or
+    /// `{"kind":"fee","chain","asset","amount"}`, `amount` a plain integer
+    /// string) with no field for the fee's recipient, so the builder address
+    /// itself cannot be carried here — only what will be charged. The
+    /// recipient and rate are committed in the signed order payload and
+    /// shown in the owner's advisory instead.
+    fn builder_order_fee(fee_micros: u64) -> Self {
+        Self {
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": fee_micros.to_string(),
+            }),
+        }
+    }
+}
+
+/// Computes the claim effect for an owner- or session-signed order action,
+/// naming the builder's fee exactly when the order carries one so it is never
+/// signed under `ClaimEffects::none()`. The declared amount is an upper bound
+/// (rounded up) on `notional * fee_tenths_bps`, from prices the request itself
+/// fixes, so nothing fetched before signing can go stale:
+///
+/// - A buy fills at or below its limit, so its limit bounds it.
+/// - A sell crossing the book fills at the resting bid, which no order price
+///   caps from above, so a builder-bearing sell must be post-only (`Alo`):
+///   the venue refuses it rather than let it cross, and as a maker it fills
+///   at exactly its limit.
+/// - Hyperliquid charges no builder fee on the buying side of spot trades, so
+///   spot buys add nothing; an order of only spot buys is refused, since its
+///   builder would earn nothing.
+/// - A trigger order fills at the market once triggered, so it is refused.
+/// - Hyperliquid collects the builder fee in the market's quote or collateral
+///   asset, and the claim declares USDC, so only legs known to pay in USDC
+///   are accepted: core perps and spot sells on pairs quoted in USDC
+///   (`usdc_quoted_spot_assets`). A spot sell on a pair quoted in any other
+///   token is refused, and so are HIP-3 perps and outcomes, whose fee asset
+///   this Petal does not look up. A spot buy pays no builder fee, so its
+///   pair's quote token does not matter.
+///
+/// Every other leg counts, reduce-only included. The venue computes and
+/// deducts the exact fee.
+fn order_claim_effects(
+    action: &ExchangeAction,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Result<ClaimEffects, String> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(ClaimEffects::none());
+    };
+    protocol::parse_address(&builder.address)?;
+    Ok(ClaimEffects::builder_order_fee(
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, usdc_quoted_spot_assets)?,
+    ))
+}
+
+fn is_spot_buy(order: &protocol::OrderWire) -> bool {
+    order.is_buy && protocol::is_spot_asset(order.asset)
+}
+
+/// Refuses a builder-bearing leg on a market whose builder fee is not paid in
+/// USDC, the only fee asset the claim can declare.
+fn ensure_builder_fee_paid_in_usdc(
+    order: &protocol::OrderWire,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Result<(), String> {
+    if protocol::is_hip3_perp_asset(order.asset) {
+        return Err(format!(
+            "asset {} is a builder-deployed (HIP-3) perp; Hyperliquid collects its builder fee in that dex's collateral asset, which is not always USDC and which this Petal does not look up, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    if protocol::is_outcome_asset(order.asset) {
+        return Err(format!(
+            "asset {} is an outcome market; this Petal does not bound builder fees on outcomes, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    if protocol::is_spot_asset(order.asset)
+        && !order.is_buy
+        && !usdc_quoted_spot_assets.contains(&order.asset)
+    {
+        return Err(format!(
+            "spot asset {} is not quoted in USDC; Hyperliquid collects its builder fee in its quote token, which this order's claim cannot declare, so builder fees are accepted only on core perps and USDC-quoted spot pairs",
+            order.asset
+        ));
+    }
+    Ok(())
+}
+
+fn builder_fee_upper_bound_micros(
+    orders: &[protocol::OrderWire],
+    fee_tenths_bps: u32,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Result<u64, String> {
+    for o in orders {
+        ensure_builder_fee_paid_in_usdc(o, usdc_quoted_spot_assets)?;
+    }
+    if orders.iter().all(is_spot_buy) {
+        return Err(
+            "Hyperliquid charges no builder fee on spot buys, so a builder on an order of only spot buys earns nothing; submit it without a builder through order.json".into(),
+        );
+    }
+    let mut fee_micros = 0_u64;
+    for o in orders {
+        let Some(limit_type) = &o.order_type.limit else {
+            return Err(
+                "a builder-bearing trigger order cannot be bounded: a stop or take-profit fills at the market once triggered, so its builder fee cannot be declared in advance; submit it without a builder or as a limit order".into(),
+            );
+        };
+        if !o.is_buy && !matches!(limit_type.tif, protocol::TimeInForce::Alo) {
+            return Err(
+                "a builder-bearing sell must be post-only (tif \"Alo\"): a sell that crosses the book fills at the resting bid, which nothing in the order caps, so its builder fee cannot be bounded; a post-only sell fills at exactly its limit".into(),
+            );
+        }
+        if is_spot_buy(o) {
+            continue;
+        }
+        let leg_fee = exact_builder_fee_micros(&o.price, &o.size, fee_tenths_bps)?;
+        fee_micros = fee_micros
+            .checked_add(leg_fee)
+            .ok_or("builder fee exceeds the supported USDC amount")?;
+    }
+    Ok(fee_micros)
+}
+
+/// Round each leg upward in micro-USDC using the signed decimal bytes.
+/// Floating-point rounding can erase a fraction above an integer, and
+/// saturating a large fee silently understates the amount being authorized.
+fn exact_builder_fee_micros(price: &str, size: &str, rate: u32) -> Result<u64, String> {
+    use alloy_primitives::U256;
+
+    let decimal = |raw: &str| -> Result<(U256, usize), String> {
+        let fraction = raw.split_once('.').map_or(0, |(_, value)| value.len());
+        let mantissa = raw
+            .replace('.', "")
+            .parse::<U256>()
+            .map_err(|_| "order price and size exceed the supported decimal range")?;
+        Ok((mantissa, fraction))
+    };
+    let (price, price_scale) = decimal(price)?;
+    let (size, size_scale) = decimal(size)?;
+    let overflow = "builder fee exceeds the supported USDC amount";
+    // 1 USDC = 10^6 micros; one tenth-basis-point = 1/10^5.
+    let numerator = price
+        .checked_mul(size)
+        .and_then(|value| value.checked_mul(U256::from(rate)))
+        .and_then(|value| value.checked_mul(U256::from(10)))
+        .ok_or(overflow)?;
+    let denominator = U256::from(10)
+        .checked_pow(U256::from(price_scale + size_scale))
+        .ok_or(overflow)?;
+    let mut bound = numerator / denominator;
+    if numerator % denominator != U256::ZERO {
+        bound = bound.checked_add(U256::from(1)).ok_or(overflow)?;
+    }
+    bound.try_into().map_err(|_| overflow.into())
+}
+
+/// The ceremony advisory for an order that carries a builder fee, so the
+/// owner sees the recipient and the rate rather than only an opaque hash.
+fn builder_order_advisory_for(
+    action: &ExchangeAction,
+    usdc_quoted_spot_assets: &std::collections::BTreeSet<u32>,
+) -> Option<Vec<u8>> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return None;
+    };
+    // Runs after `order_claim_effects` accepted the same action, so the bound
+    // that produced the declared fee is the one shown here.
+    let fee_micros =
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps, usdc_quoted_spot_assets)
+            .ok()?;
+    Some(builder_order_advisory(
+        &builder.address,
+        builder.fee_tenths_bps,
+        fee_micros,
+        orders.iter().any(is_spot_buy),
+    ))
+}
+
+/// Asset ids of the spot pairs quoted in USDC, read from `spotMeta` only when
+/// a builder-bearing order has a spot sell (a spot buy pays no builder fee).
+/// A pair's quote token is fixed pair metadata, not a price, so it cannot go
+/// stale while the owner approves.
+fn builder_order_usdc_quoted_spot_assets(
+    n: Network,
+    action: &ExchangeAction,
+) -> Result<std::collections::BTreeSet<u32>, DispatchResponse> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(_),
+        ..
+    } = action
+    else {
+        return Ok(Default::default());
+    };
+    if !orders
+        .iter()
+        .any(|o| protocol::is_spot_asset(o.asset) && !o.is_buy)
+    {
+        return Ok(Default::default());
+    }
+    parse_usdc_quoted_spot_assets(&http_json(n, "/info", json!({"type":"spotMeta"}))?)
+}
+
+fn parse_usdc_quoted_spot_assets(
+    spot_meta: &Value,
+) -> Result<std::collections::BTreeSet<u32>, DispatchResponse> {
+    let malformed = || backend("Hyperliquid returned a malformed spotMeta response");
+    let universe = spot_meta
+        .get("universe")
+        .and_then(Value::as_array)
+        .ok_or_else(malformed)?;
+    let mut out = std::collections::BTreeSet::new();
+    for pair in universe {
+        let index = pair
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(malformed)?;
+        let quote = pair
+            .get("tokens")
+            .and_then(Value::as_array)
+            .filter(|tokens| tokens.len() == 2)
+            .and_then(|tokens| tokens[1].as_u64())
+            .ok_or_else(malformed)?;
+        let asset = protocol::SPOT_ASSET_ID_OFFSET
+            .checked_add(index)
+            .filter(|asset| protocol::is_spot_asset(*asset))
+            .ok_or_else(malformed)?;
+        if quote == protocol::USDC_SPOT_TOKEN_INDEX {
+            out.insert(asset);
+        }
+    }
+    Ok(out)
 }
 
 fn ok_write() -> DispatchResponse {
@@ -365,6 +623,24 @@ fn owner_sign_or_approval(
     }
 }
 
+/// The public owner address last recovered from one of this wallet's owner
+/// signatures. Kept so a check that needs it, the builder-approval precheck,
+/// can run before the next ceremony instead of only after it; the
+/// authoritative check on the freshly recovered signer still runs after.
+fn owner_address_key(w: &str) -> String {
+    state_key(&["owner-address", w])
+}
+
+fn cached_owner_address(w: &str) -> Option<String> {
+    load_json::<String>(owner_address_key(w)).ok().flatten()
+}
+
+fn remember_owner_address(w: &str, address: &str) {
+    // Best effort: a failed write only costs a wasted ceremony on a later
+    // call, never correctness, because the post-signature check still runs.
+    let _ = save_json(owner_address_key(w), &address.to_owned(), false);
+}
+
 pub fn owner_action_write(
     ctx: &Ctx,
     n: Network,
@@ -396,6 +672,28 @@ pub fn owner_action_write(
             Ok(h) => h,
             Err(e) => return invalid(e),
         };
+    let carries_builder = req.action.carries_builder();
+    // The claim (and with it every market and bound refusal) comes first, so
+    // an order this Petal will refuse anyway never sends the owner to approve
+    // its builder.
+    let usdc_quoted_spot_assets = match builder_order_usdc_quoted_spot_assets(n, &req.action) {
+        Ok(assets) => assets,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&req.action, &usdc_quoted_spot_assets) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
+    // Refuse an unapproved builder before the ceremony whenever the owner
+    // address is already known from an earlier signature, so the owner is
+    // not asked for a passkey tap the venue would then make pointless. The
+    // authoritative check on the recovered signer still runs below.
+    if carries_builder
+        && let Some(owner_address) = cached_owner_address(&w)
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
+    }
     let sig = match owner_sign_or_approval(
         ctx,
         &w,
@@ -405,13 +703,23 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            advisory: None,
-            effects: ClaimEffects::none(),
+            advisory: builder_order_advisory_for(&req.action, &usdc_quoted_spot_assets),
+            effects,
         },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
     };
+    let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+        Ok(address) => address,
+        Err(e) => return backend(e),
+    };
+    remember_owner_address(&w, &owner_address);
+    if carries_builder
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
+    }
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
     {
@@ -740,6 +1048,211 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+/// Shared across every wallet account, so the global `settings/` route and
+/// the account-scoped `approve_builder_fee.json` see the same value. The SDK
+/// adds the `state` namespace itself, so this key must not repeat it: the
+/// host's canonical key must equal the `[store].shared_keys` entry in
+/// petal.toml, `state/settings/builder-address`, or each account would read
+/// its own (empty) copy.
+const BUILDER_ADDRESS_OVERRIDE_KEY: &str = "settings/builder-address";
+
+fn builder_address_override_key() -> String {
+    BUILDER_ADDRESS_OVERRIDE_KEY.to_owned()
+}
+
+/// Reads the operator-set builder-address override, if any. Stored as plain
+/// UTF-8 bytes, not JSON, in the "state" namespace — a builder address is
+/// public data, not a credential, so it does not belong in the secret store.
+fn builder_address_override() -> Result<Option<String>, DispatchResponse> {
+    let bytes = load_bytes(&builder_address_override_key())?;
+    Ok(bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Reports which builder address `approve_builder_fee.json` would use as its
+/// default today, and why, for `settings/status.json`.
+pub fn builder_address_status() -> Result<settings::BuilderAddressStatus, DispatchResponse> {
+    let store_override = builder_address_override()?;
+    Ok(settings::default_builder_address_status(
+        store_override.as_deref(),
+    ))
+}
+
+/// Sets or clears the operator-set builder-address override for
+/// `settings/builder-address`. An empty body clears the override, reverting
+/// to this release's default, if any.
+pub fn set_builder_address_override(body: &[u8]) -> DispatchResponse {
+    let key = builder_address_override_key();
+    match parse_builder_address_override(body) {
+        Ok(None) => match petal::sdk::store_del(&key) {
+            Ok(()) => ok_write(),
+            Err(e) => backend(e.message()),
+        },
+        Ok(Some(address)) => match petal::sdk::store_put(&key, address.as_bytes(), false) {
+            Ok(()) => ok_write(),
+            Err(e) => backend(e.message()),
+        },
+        Err(e) => invalid(e),
+    }
+}
+
+/// The address a `settings/builder-address` write stores, or `None` to clear
+/// the override. Surrounding whitespace is trimmed (so `echo addr >` works);
+/// anything else that is not a lowercase 0x address is refused.
+fn parse_builder_address_override(body: &[u8]) -> Result<Option<&str>, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "builder address must be UTF-8".to_owned())?
+        .trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    protocol::parse_address(text)?;
+    // Required lowercase for the same reason as the per-order and approval
+    // builder fields: a stored override must match what orders will send
+    // byte-for-byte, never silently normalized.
+    if text != text.to_ascii_lowercase() {
+        return Err("builder address must be lowercase".into());
+    }
+    Ok(Some(text))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveBuilderFee {
+    #[serde(default)]
+    builder: Option<String>,
+    max_fee_tenths_bps: u32,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+/// What a repeated `approve_builder_fee.json` write is matched on. A body that
+/// omits `builder` resolves it from the override or the release default, so
+/// the same body can mean a different builder later; matching on the body
+/// alone would report a new builder's approval as already done.
+fn approve_builder_fee_identity(body: &[u8], resolved_builder: &str) -> Vec<u8> {
+    let mut identity = body.to_vec();
+    identity.extend_from_slice(b"\0builder=");
+    identity.extend_from_slice(resolved_builder.as_bytes());
+    identity
+}
+
+/// Approves a maximum builder fee for a builder address. Hyperliquid requires
+/// this to be signed by the main wallet, so — like `usd_class_transfer` — it
+/// is deliberately absent from the delegated agent session surface: it is
+/// reached only through `owner_sign_or_approval`, never through a session's
+/// Signer-owned key.
+pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<ApproveBuilderFee>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid approve_builder_fee body: {e}")),
+    };
+    let store_override = match builder_address_override() {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let resolved_builder = match settings::resolve_default_builder_address(
+        req.builder.as_deref(),
+        store_override.as_deref(),
+    ) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let builder_source = if req.builder.is_some() {
+        "explicit in this request"
+    } else {
+        match settings::default_builder_address_status(store_override.as_deref()).source {
+            settings::BuilderAddressSource::StoreOverride => {
+                "operator override in settings/builder-address"
+            }
+            settings::BuilderAddressSource::ReleaseDefault => "this release's default",
+            settings::BuilderAddressSource::Unconfigured => "unconfigured",
+        }
+    };
+    let builder = match protocol::parse_address(&resolved_builder) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    // The per-order builder field is required lowercase so it matches this
+    // approval byte-for-byte; require the approval's address the same way
+    // rather than silently normalizing it, so the two can never drift.
+    if resolved_builder != resolved_builder.to_ascii_lowercase() {
+        return invalid("builder address must be lowercase");
+    }
+    if req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS {
+        return invalid(format!(
+            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval. One approval covers perp and spot orders, so it is bounded by the venue's spot ceiling; each perp order is still capped at {}",
+            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS,
+            protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
+        ));
+    }
+    let identity = approve_builder_fee_identity(body, &resolved_builder);
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "approve_builder_fee.json", &identity, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    if completed {
+        return ok_write();
+    }
+    let max_fee_rate = protocol::builder_fee_max_rate_string(req.max_fee_tenths_bps);
+    let (action, payload) =
+        match protocol::approve_builder_fee_payload(n, builder, &max_fee_rate, nonce) {
+            Ok(x) => x,
+            Err(e) => return invalid(e),
+        };
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.approve_builder_fee",
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "approve_builder_fee",
+            advisory: Some(builder_fee_approval_advisory(
+                n,
+                &resolved_builder,
+                req.max_fee_tenths_bps,
+                builder_source,
+            )),
+            // Approving a cap charges nothing by itself — only a later order
+            // that actually carries a builder fee has an effect to declare —
+            // and Broker's DeclaredFee schema has no field for a bare ceiling
+            // in any case (only `{"kind":"fee",...}` or `{"kind":"none"}`).
+            effects: ClaimEffects::none(),
+        },
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    if let Ok(owner_address) = protocol::recover_signer_from_json(&payload.hash, &sig) {
+        remember_owner_address(&w, &owner_address);
+    }
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            if let Err(e) = protocol::validate_exchange_response(&v) {
+                return backend(e);
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            ok_write()
+        }
+        Err(e) => e,
+    }
+}
 /// Venue-reported flat withdrawal fee at implementation time (Hyperliquid
 /// exchange docs, 2026-09). Hyperliquid deducts it from the withdrawn amount,
 /// so the destination receives the amount minus this fee; the venue may change
@@ -833,6 +1346,71 @@ struct WithdrawOperation {
     #[serde(default)]
     response: Option<Value>,
     updated_ms: u64,
+}
+
+/// What the owner sees when approving a builder-fee cap. The recipient and
+/// the ceiling are otherwise only inside the EIP-712 hash, so without this
+/// the ceremony could not show which builder is being approved, or for how
+/// much, or where that address came from.
+fn builder_fee_approval_advisory(
+    n: Network,
+    builder: &str,
+    cap_tenths_bps: u32,
+    source: &str,
+) -> Vec<u8> {
+    let mut lines = vec![
+        format!(
+            "Approves builder {builder} to charge up to {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional on this account's Hyperliquid {} orders.",
+            protocol::builder_fee_max_rate_string(cap_tenths_bps),
+            n.chain()
+        ),
+        format!("Builder address source: {source}."),
+    ];
+    if cap_tenths_bps == 0 {
+        lines.push("A cap of 0% revokes this builder's approval.".to_owned());
+    } else {
+        lines.push(
+            "Only orders that name this builder pay it; Hyperliquid enforces its own ceilings of 0.1% on perps and 1% on spot."
+                .to_owned(),
+        );
+    }
+    lines.join("\n").into_bytes()
+}
+
+/// What the owner sees when signing an order that carries a builder fee.
+fn builder_order_advisory(
+    builder: &str,
+    fee_tenths_bps: u32,
+    fee_micros: u64,
+    has_spot_buys: bool,
+) -> Vec<u8> {
+    let legs = if has_spot_buys {
+        "across all legs except spot buys, which pay no builder fee, reduce-only included"
+    } else {
+        "across all legs, reduce-only included"
+    };
+    [
+        format!(
+            "This order pays a builder fee to {builder}: {} ({fee_tenths_bps} tenths of a basis point) of each fill's notional.",
+            protocol::builder_fee_max_rate_string(fee_tenths_bps)
+        ),
+        format!(
+            "Declared upper bound: {} USDC {legs}; the venue deducts the exact fee from each fill.",
+            micros_decimal(fee_micros)
+        ),
+    ]
+    .join("\n")
+    .into_bytes()
+}
+
+/// What the owner sees when approving a session created with a builder
+/// bound: the one builder its orders may pay, and the most they may pay it.
+fn session_builder_bound_advisory(builder: &str, cap_tenths_bps: u32) -> Vec<u8> {
+    format!(
+        "This session may submit builder-fee orders only to builder {builder}, at most {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional; an order naming another builder or a higher fee is refused before signing.",
+        protocol::builder_fee_max_rate_string(cap_tenths_bps)
+    )
+    .into_bytes()
 }
 
 fn withdraw_advisory(amount_micros: u64, destination: Address) -> Vec<u8> {
@@ -1175,6 +1753,8 @@ pub struct Session {
     pub max_notional_usd: Option<String>,
     pub max_leverage: Option<u32>,
     pub assets: Vec<String>,
+    pub builder_address: Option<String>,
+    pub max_builder_fee_tenths_bps: Option<u32>,
     pub stopped: bool,
     pub last_response: Option<Value>,
     pub last_error: Option<String>,
@@ -1197,19 +1777,46 @@ fn request_session_key(
     wallet: &str,
     session_id: &str,
     lifetime_ms: u64,
+    builder_bound: bool,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
+    let (allowed_routes, allowed_operation_classes) = session_key_scope(builder_bound);
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: wallet.into(),
         key_slot: session_key_slot(session_id),
-        allowed_routes: SESSION_KEY_ALLOWED_ROUTES
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
+        allowed_routes,
+        allowed_operation_classes,
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
+}
+
+/// The routes and operation classes a session key may sign for. A session
+/// created with a builder bound additionally gets the builder-order route and
+/// its fee-bearing class; every other session is scoped to the fee-free
+/// `hyperliquid.agent_action` surface only.
+fn session_key_scope(builder_bound: bool) -> (Vec<String>, Vec<String>) {
+    let mut routes = SESSION_KEY_ALLOWED_ROUTES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut classes = vec!["hyperliquid.agent_action".to_owned()];
+    if builder_bound {
+        routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned());
+        classes.push(protocol::BUILDER_ORDER_INTENT.to_owned());
+    }
+    (routes, classes)
+}
+
+/// The class a session-signed action is authorized under. A builder-bearing
+/// order declares a fee, so it signs under `BUILDER_ORDER_INTENT` rather than
+/// the fee-free `hyperliquid.agent_action` every other session action uses.
+fn session_operation_class(action: &ExchangeAction) -> &'static str {
+    if action.carries_builder() {
+        protocol::BUILDER_ORDER_INTENT
+    } else {
+        "hyperliquid.agent_action"
+    }
 }
 
 fn session_key_slot(session_id: &str) -> String {
@@ -1237,6 +1844,10 @@ struct NewSession {
     #[serde(default)]
     assets: Vec<String>,
     #[serde(default)]
+    builder_address: Option<String>,
+    #[serde(default)]
+    max_builder_fee_tenths_bps: Option<u32>,
+    #[serde(default)]
     nonce: Option<u64>,
 }
 
@@ -1263,6 +1874,29 @@ fn session_preflight(req: &NewSession) -> Result<String, String> {
         .is_some_and(|value| !(1..=50).contains(&value))
     {
         return Err("max_leverage must be 1..=50".into());
+    }
+    match (&req.builder_address, req.max_builder_fee_tenths_bps) {
+        (Some(address), Some(fee)) => {
+            protocol::parse_address(address)?;
+            if address != &address.to_ascii_lowercase() {
+                return Err("builder_address must be lowercase".into());
+            }
+            // Delegated sessions never submit spot orders (session_policy
+            // rejects spot asset ids unconditionally), so the session-level
+            // bound is capped at the perp venue ceiling.
+            if fee == 0 || fee > protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS {
+                return Err(format!(
+                    "max_builder_fee_tenths_bps must be 1..={}",
+                    protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "builder_address and max_builder_fee_tenths_bps must be set together".into(),
+            );
+        }
     }
     valid_session_id(&req.id)?;
     let agent_name = req
@@ -1722,6 +2356,20 @@ fn session_submit(
     if let Err(e) = session_policy(s, &action) {
         return denied(e);
     }
+    // The claim (and every market and bound refusal) comes before the
+    // builder-approval check and before any nonce or receipt is reserved, so
+    // an order refused here reserves nothing and never prompts an approval.
+    let usdc_quoted_spot_assets = match builder_order_usdc_quoted_spot_assets(n, &action) {
+        Ok(assets) => assets,
+        Err(e) => return e,
+    };
+    let effects = match order_claim_effects(&action, &usdc_quoted_spot_assets) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
+    if let Err(e) = ensure_builder_fee_is_approved(n, &s.owner_address, &action) {
+        return e;
+    }
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
         return e;
     }
@@ -1779,11 +2427,11 @@ fn session_submit(
         ctx,
         w,
         &signing_payload,
-        "hyperliquid.agent_action",
+        session_operation_class(&action),
         None,
         Some(s.key_ref_jcs.clone()),
         None,
-        ClaimEffects::none(),
+        effects,
     ) {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
@@ -2164,7 +2812,7 @@ fn session_allows_asset(session: &Session, asset: u32) -> bool {
 }
 fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     a.validate()?;
-    let is_perpetual = |asset: u32| asset < 10_000;
+    let is_perpetual = protocol::is_core_perp_asset;
     let all_perpetual = match a {
         ExchangeAction::Order { orders, .. } => orders.iter().all(|o| is_perpetual(o.asset)),
         ExchangeAction::Cancel { cancels, .. } => cancels.iter().all(|o| is_perpetual(o.asset)),
@@ -2175,7 +2823,10 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         ExchangeAction::ScheduleCancel { .. } => true,
     };
     if !all_perpetual {
-        return Err("delegated sessions do not support spot asset ids".into());
+        return Err(
+            "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                .into(),
+        );
     }
     if let ExchangeAction::UpdateLeverage { leverage, .. } = a
         && s.max_leverage.is_some_and(|m| *leverage > m)
@@ -2217,6 +2868,23 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         };
         if !all_allowed {
             return Err("asset is outside the session allow-list".into());
+        }
+    }
+    // A per-order builder fee routes venue fee revenue to a third-party address
+    // the agent chooses, so it is bounded like notional, leverage, and assets
+    // are: an agent may only ever use the single builder and fee ceiling the
+    // owner approved when the session was created.
+    if let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = a
+    {
+        match (&s.builder_address, s.max_builder_fee_tenths_bps) {
+            (Some(allowed), Some(cap))
+                if *allowed == builder.address && builder.fee_tenths_bps <= cap => {}
+            _ => {
+                return Err("builder fee is outside the session's approved builder bound".into());
+            }
         }
     }
     Ok(())
@@ -2284,6 +2952,40 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
         .and_then(value_string)?
         .parse::<u32>()
         .ok()
+}
+
+/// Hyperliquid silently rejects a builder-fee order unless the account has
+/// already signed a separate `approveBuilderFee` action authorizing at least
+/// the requested rate for that builder. Checking this ourselves turns that
+/// into a clear, actionable error instead of a venue-side rejection the
+/// caller has no way to interpret.
+fn ensure_builder_fee_is_approved(
+    n: Network,
+    account: &str,
+    action: &ExchangeAction,
+) -> Result<(), DispatchResponse> {
+    let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    let response = http_json(
+        n,
+        "/info",
+        json!({"type": "maxBuilderFee", "user": account, "builder": builder.address}),
+    )?;
+    let approved = response
+        .as_u64()
+        .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))?;
+    if approved < u64::from(builder.fee_tenths_bps) {
+        return Err(invalid(format!(
+            "builder {} is not yet approved for a fee of {} tenths of a basis point (currently approved up to {approved}); call approve_builder_fee.json for this builder before placing this order",
+            builder.address, builder.fee_tenths_bps
+        )));
+    }
+    Ok(())
 }
 /// The single wallet identity a session is created under.
 ///
@@ -2380,7 +3082,12 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(&wallet_id, &req.id, lifetime_ms) {
+    let derived = match request_session_key(
+        &wallet_id,
+        &req.id,
+        lifetime_ms,
+        req.builder_address.is_some(),
+    ) {
         Ok(petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
@@ -2434,6 +3141,8 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         max_notional_usd: req.max_notional_usd,
         max_leverage: req.max_leverage,
         assets: session_assets,
+        builder_address: req.builder_address,
+        max_builder_fee_tenths_bps: req.max_builder_fee_tenths_bps,
         stopped: false,
         last_response: None,
         last_error: None,
@@ -2483,6 +3192,11 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     {
         return e;
     };
+    let builder_bound_advisory =
+        match (&session.builder_address, session.max_builder_fee_tenths_bps) {
+            (Some(builder), Some(cap)) => Some(session_builder_bound_advisory(builder, cap)),
+            _ => None,
+        };
     let sig = match sign_payload(
         ctx,
         &w,
@@ -2490,7 +3204,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         "hyperliquid.approve_agent",
         approval_hint,
         None,
-        None,
+        builder_bound_advisory,
         ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(raw)) => {
@@ -2621,6 +3335,71 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_builder_address_override_is_stored_under_its_declared_shared_key() {
+        // The host stores `<namespace>/<key>` and shares only keys declared in
+        // petal.toml; the SDK supplies the `state` namespace. Anything else
+        // leaves the override invisible to account-scoped routes.
+        let manifest = include_str!("../../petal.toml");
+        let shared = format!("state/{}", builder_address_override_key());
+        assert!(
+            manifest.contains(&format!("shared_keys = [\"{shared}\"]")),
+            "petal.toml must share {shared}"
+        );
+        assert!(!builder_address_override_key().starts_with("state/"));
+    }
+
+    #[test]
+    fn a_changed_default_builder_is_not_mistaken_for_a_repeat_approval() {
+        // The same body resolves to builder A, then (after the override
+        // changes) to builder B: each must get its own approval record.
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        let a = "0x00000000000000000000000000000000000000aa";
+        let b = "0x00000000000000000000000000000000000000bb";
+        let key = |builder| {
+            owner_nonce_key(
+                Network::Testnet,
+                "main",
+                "approve_builder_fee.json",
+                &approve_builder_fee_identity(body, builder),
+            )
+        };
+        assert_ne!(key(a), key(b));
+        // An exact repeat for the same builder still matches its record.
+        assert_eq!(key(a), key(a));
+    }
+
+    #[test]
+    fn builder_address_override_writes_are_validated() {
+        let addr = "0x00000000000000000000000000000000000000aa";
+        assert_eq!(
+            parse_builder_address_override(addr.as_bytes()),
+            Ok(Some(addr))
+        );
+        // Surrounding whitespace, as `echo addr > settings/builder-address`
+        // writes, is trimmed rather than refused.
+        assert_eq!(
+            parse_builder_address_override(format!("  {addr}\n").as_bytes()),
+            Ok(Some(addr))
+        );
+        // Empty or whitespace-only clears the override.
+        assert_eq!(parse_builder_address_override(b""), Ok(None));
+        assert_eq!(parse_builder_address_override(b" \n"), Ok(None));
+        for garbage in [
+            &addr[..41],                                   // 39 hex digits
+            "0x00000000000000000000000000000000000000aaa", // 41 hex digits
+            "00000000000000000000000000000000000000aa",    // no 0x
+            "0x00000000000000000000000000000000000000zz",  // not hex
+            "0x00000000000000000000000000000000000000AA",  // not lowercase
+        ] {
+            assert!(
+                parse_builder_address_override(garbage.as_bytes()).is_err(),
+                "{garbage}"
+            );
+        }
+        assert!(parse_builder_address_override(&[0xff, 0xfe]).is_err());
+    }
     use super::*;
 
     #[test]
@@ -2628,9 +3407,56 @@ mod tests {
         assert_eq!(
             SESSION_KEY_ALLOWED_ROUTES,
             [
-                "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+                "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
             ]
         );
+        assert_eq!(SESSION_KEY_BUILDER_ORDER_ROUTE, "r000008");
+    }
+
+    #[test]
+    fn session_key_scope_adds_the_builder_order_surface_only_with_a_bound() {
+        let (routes, classes) = session_key_scope(false);
+        assert_eq!(routes, SESSION_KEY_ALLOWED_ROUTES);
+        assert_eq!(classes, ["hyperliquid.agent_action"]);
+
+        let (routes, classes) = session_key_scope(true);
+        assert_eq!(routes.len(), SESSION_KEY_ALLOWED_ROUTES.len() + 1);
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(SESSION_KEY_BUILDER_ORDER_ROUTE)
+        );
+        assert_eq!(
+            classes,
+            ["hyperliquid.agent_action", protocol::BUILDER_ORDER_INTENT]
+        );
+    }
+
+    #[test]
+    fn session_actions_sign_under_the_builder_order_class_only_with_a_builder() {
+        let plain: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&plain), "hyperliquid.agent_action");
+        let with_builder: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        assert_eq!(
+            session_operation_class(&with_builder),
+            protocol::BUILDER_ORDER_INTENT
+        );
+        let cancel: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancel",
+            "cancels": [{"a": 0, "o": 1}]
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&cancel), "hyperliquid.agent_action");
     }
 
     fn bounded_session() -> Session {
@@ -2648,6 +3474,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: Some(3),
             assets: vec!["0".into()],
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             stopped: false,
             last_response: None,
             last_error: None,
@@ -2677,6 +3505,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: None,
             assets: Vec::new(),
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             nonce: None,
         };
         assert_eq!(
@@ -2737,6 +3567,374 @@ mod tests {
             })]
         );
         assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    fn order_action_with_builder(address: &str, fee_tenths_bps: u32) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na",
+            "builder": {"b": address, "f": fee_tenths_bps}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn order_claim_effects_name_the_builder_and_fee_only_when_present() {
+        let cancel = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+            fast: None,
+        };
+        assert_eq!(
+            order_claim_effects(&cancel, &usdc_spot()).unwrap(),
+            ClaimEffects::none()
+        );
+
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(
+            order_claim_effects(&plain_order, &usdc_spot()).unwrap(),
+            ClaimEffects::none()
+        );
+
+        // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
+        let builder_order =
+            order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+        let effects = order_claim_effects(&builder_order, &usdc_spot()).unwrap();
+        assert!(effects.declared_debits.is_empty());
+        assert!(effects.declared_destinations.is_empty());
+        assert_eq!(
+            effects.declared_fee,
+            json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": "100",
+            })
+        );
+    }
+
+    #[test]
+    fn order_claim_effects_fee_includes_reduce_only_legs() {
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 0, "b": true, "p": "100", "s": "0.01", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+                {"a": 0, "b": true, "p": "200", "s": "0.5", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+            ],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        // Hyperliquid charges the builder fee on every fill of an order that
+        // names a builder, reduce-only legs included, so both legs count:
+        // (1 + 100) notional at 1 bp is 10100 micro-USDC. The session
+        // max_notional_usd check still excludes reduce-only legs; that is a
+        // different bound with a different purpose.
+        assert_eq!(
+            order_claim_effects(&action, &usdc_spot())
+                .unwrap()
+                .declared_fee,
+            json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
+        );
+    }
+
+    #[test]
+    fn builder_fee_bound_preserves_sub_micro_fractions_and_refuses_overflow() {
+        // f64 erases the fraction and declares 10_000_000 micros instead
+        // of rounding the exact positive fraction upward.
+        assert_eq!(
+            exact_builder_fee_micros("100000.000000000001", "1", 10),
+            Ok(10_000_001)
+        );
+        assert_eq!(exact_builder_fee_micros("0.1", "0.1", 1), Ok(1));
+        assert_eq!(exact_builder_fee_micros("100", "0.01", 10), Ok(100));
+        assert!(exact_builder_fee_micros("18446744073709551616", "1", 100).is_err());
+
+        let action = builder_order(json!([
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert!(
+            declared_amount(&action).is_err(),
+            "the summed fee must not saturate"
+        );
+    }
+
+    /// The USDC-quoted spot pairs the tests assume: pairs 0 and 1.
+    fn usdc_spot() -> std::collections::BTreeSet<u32> {
+        [
+            protocol::SPOT_ASSET_ID_OFFSET,
+            protocol::SPOT_ASSET_ID_OFFSET + 1,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn builder_fees_are_accepted_only_where_they_are_paid_in_usdc() {
+        // HIP-3 perps (100000 + dex * 10000 + index) are perps, not spot: a
+        // buy pays the builder fee, in the dex's collateral asset. It is
+        // refused on that ground, not as an "only spot buys" order, and not
+        // silently left out of the fee.
+        let hip3_buy = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        let err = declared_amount(&hip3_buy).unwrap_err();
+        assert!(err.contains("HIP-3"), "{err}");
+        assert!(!err.contains("spot buys"), "{err}");
+        assert!(builder_order_advisory_for(&hip3_buy, &usdc_spot()).is_none());
+
+        // With a post-only core sell beside it, the HIP-3 buy would have been
+        // charged without being declared; the whole order is refused.
+        let hip3_with_core_sell = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert!(
+            declared_amount(&hip3_with_core_sell)
+                .unwrap_err()
+                .contains("HIP-3")
+        );
+
+        // Outcomes (100000000 + 10 * outcome + side) are not HIP-3 perps, and
+        // are refused with their own reason.
+        let outcome = builder_order(json!([
+            {"a": 100_000_010, "b": false, "p": "0.5", "s": "100", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        let err = declared_amount(&outcome).unwrap_err();
+        assert!(err.contains("outcome market"), "{err}");
+        assert!(!err.contains("HIP-3"), "{err}");
+
+        // A post-only sell on a spot pair not quoted in USDC (mainnet @207 is
+        // quoted in USDT0) pays its builder fee in that quote token: refused.
+        let non_usdc_spot = protocol::SPOT_ASSET_ID_OFFSET + 207;
+        let non_usdc_sell = builder_order(json!([
+            {"a": non_usdc_spot, "b": false, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        let err = declared_amount(&non_usdc_sell).unwrap_err();
+        assert!(err.contains("not quoted in USDC"), "{err}");
+        assert!(builder_order_advisory_for(&non_usdc_sell, &usdc_spot()).is_none());
+
+        // A spot buy pays no builder fee, so a buy on that same non-USDC pair
+        // is not refused for its quote token: beside a post-only core sell it
+        // adds nothing (100 * 1 at 1 bp), and alone it is the "only spot
+        // buys" refusal, not a quote-token one.
+        let non_usdc_buy_with_core_sell = builder_order(json!([
+            {"a": non_usdc_spot, "b": true, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(
+            declared_amount(&non_usdc_buy_with_core_sell).unwrap(),
+            "10000"
+        );
+        let only_non_usdc_buy = builder_order(json!([
+            {"a": non_usdc_spot, "b": true, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        let err = declared_amount(&only_non_usdc_buy).unwrap_err();
+        assert!(err.contains("no builder fee on spot buys"), "{err}");
+
+        // The same sell on a USDC-quoted pair, and a core perp sell, are
+        // declared as before: 1 * 50 and 100 * 1 at 1 bp.
+        let usdc_sell = builder_order(json!([
+            {"a": protocol::SPOT_ASSET_ID_OFFSET + 1, "b": false, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(declared_amount(&usdc_sell).unwrap(), "15000");
+    }
+
+    #[test]
+    fn usdc_quoted_spot_pairs_come_from_spot_meta_quote_tokens() {
+        // Pair 0 (PURR/USDC) and pair 1 are quoted in token 0 (USDC); pair
+        // 207 is quoted in token 268 (USDT0).
+        let spot_meta = json!({
+            "tokens": [{"name": "USDC", "index": 0}, {"name": "USDT0", "index": 268}],
+            "universe": [
+                {"name": "PURR/USDC", "index": 0, "tokens": [1, 0]},
+                {"name": "@1", "index": 1, "tokens": [2, 0]},
+                {"name": "@207", "index": 207, "tokens": [300, 268]}
+            ]
+        });
+        let assets = parse_usdc_quoted_spot_assets(&spot_meta).unwrap();
+        assert_eq!(
+            assets.into_iter().collect::<Vec<_>>(),
+            vec![
+                protocol::SPOT_ASSET_ID_OFFSET,
+                protocol::SPOT_ASSET_ID_OFFSET + 1
+            ]
+        );
+        for malformed in [
+            json!({}),
+            json!({"universe": [{"name": "@1", "index": 1}]}),
+            json!({"universe": [{"name": "@1", "index": 1, "tokens": [2]}]}),
+            json!({"universe": [{"name": "@1", "tokens": [2, 0]}]}),
+            json!({"universe": [{"name": "@x", "index": 90000, "tokens": [2, 0]}]}),
+        ] {
+            assert!(
+                parse_usdc_quoted_spot_assets(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    fn builder_order(legs: Value) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": legs,
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap()
+    }
+
+    fn declared_amount(action: &ExchangeAction) -> Result<Value, String> {
+        order_claim_effects(action, &usdc_spot())
+            .map(|effects| effects.declared_fee["amount"].clone())
+    }
+
+    #[test]
+    fn a_builder_bearing_sell_must_be_post_only() {
+        // A GTC or IOC sell at limit 100 crosses into bids at 200 and fills
+        // at 200: the venue charges 200 * 1 bp = 20000 micro-USDC, above any
+        // bound the request or a pre-signing mid could give. It is refused.
+        for tif in ["Gtc", "Ioc"] {
+            let action = builder_order(json!([
+                {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": tif}}}
+            ]));
+            let err = declared_amount(&action).unwrap_err();
+            assert!(err.contains("post-only"), "{err}");
+            assert!(builder_order_advisory_for(&action, &usdc_spot()).is_none());
+        }
+        // Post-only, the same sell can only rest and fill at exactly 100,
+        // however far bids later rise: 100 * 1 bp = 10000 micro-USDC.
+        let post_only = builder_order(json!([
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(declared_amount(&post_only).unwrap(), "10000");
+        // Buys keep any time in force: they fill at or below their limit.
+        let ioc_buy = builder_order(json!([
+            {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Ioc"}}}
+        ]));
+        assert_eq!(declared_amount(&ioc_buy).unwrap(), "10000");
+    }
+
+    #[test]
+    fn spot_buys_pay_no_builder_fee() {
+        let spot = protocol::SPOT_ASSET_ID_OFFSET;
+        // Only spot buys: the builder would earn nothing, so it is refused
+        // rather than signed with a meaningless zero fee.
+        let only_spot_buys = builder_order(json!([
+            {"a": spot, "b": true, "p": "10", "s": "5", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": spot + 1, "b": true, "p": "2", "s": "50", "r": false, "t": {"limit": {"tif": "Ioc"}}}
+        ]));
+        let err = declared_amount(&only_spot_buys).unwrap_err();
+        assert!(err.contains("no builder fee on spot buys"), "{err}");
+        assert!(builder_order_advisory_for(&only_spot_buys, &usdc_spot()).is_none());
+
+        // Mixed: the spot buy (10 * 5 = 50) adds nothing; the post-only spot
+        // sell (20 * 3 = 60) and the perp buy (100 * 1 = 100) do, so the bound
+        // is 160 * 1 bp = 16000 micro-USDC.
+        let mixed = builder_order(json!([
+            {"a": spot, "b": true, "p": "10", "s": "5", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": spot, "b": false, "p": "20", "s": "3", "r": false, "t": {"limit": {"tif": "Alo"}}},
+            {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert_eq!(declared_amount(&mixed).unwrap(), "16000");
+        let advisory =
+            String::from_utf8(builder_order_advisory_for(&mixed, &usdc_spot()).unwrap()).unwrap();
+        assert!(advisory.contains("0.016 USDC"), "{advisory}");
+        assert!(advisory.contains("except spot buys"), "{advisory}");
+
+        // A spot sell must still be post-only.
+        let spot_gtc_sell = builder_order(json!([
+            {"a": spot, "b": false, "p": "20", "s": "3", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert!(
+            declared_amount(&spot_gtc_sell)
+                .unwrap_err()
+                .contains("post-only")
+        );
+    }
+
+    #[test]
+    fn a_builder_bearing_trigger_order_is_refused() {
+        // A take-profit with limit 190000 and trigger 200000 fills at the
+        // market once triggered; its limit does not bound the fee the venue
+        // would charge on such a fill, so the request is refused.
+        for (is_buy, is_market) in [(false, false), (false, true), (true, false)] {
+            let action: ExchangeAction = serde_json::from_value(json!({
+                "type": "order",
+                "orders": [{
+                    "a": 0, "b": is_buy, "p": "190000", "s": "1", "r": false,
+                    "t": {"trigger": {"isMarket": is_market, "triggerPx": "200000", "tpsl": "tp"}}
+                }],
+                "grouping": "na",
+                "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+            }))
+            .unwrap();
+            let err = order_claim_effects(&action, &usdc_spot()).unwrap_err();
+            assert!(err.contains("trigger order cannot be bounded"), "{err}");
+            assert!(builder_order_advisory_for(&action, &usdc_spot()).is_none());
+        }
+        // The same order without a builder declares no fee and is not the
+        // fee bound's concern.
+        let plain: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": false, "p": "190000", "s": "1", "r": false,
+                "t": {"trigger": {"isMarket": false, "triggerPx": "200000", "tpsl": "tp"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(
+            order_claim_effects(&plain, &usdc_spot()).unwrap(),
+            ClaimEffects::none()
+        );
+    }
+
+    #[test]
+    fn builder_advisories_name_the_recipient_and_the_rate() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approval = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            10,
+            "explicit in this request",
+        ))
+        .unwrap();
+        assert!(approval.contains(builder));
+        assert!(approval.contains("0.01%"));
+        assert!(approval.contains("10 tenths of a basis point"));
+        assert!(approval.contains("explicit in this request"));
+        let revoke = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            0,
+            "x",
+        ))
+        .unwrap();
+        assert!(revoke.contains("revokes"));
+
+        let order = String::from_utf8(builder_order_advisory(builder, 10, 10100, false)).unwrap();
+        assert!(order.contains(builder));
+        assert!(order.contains("0.01%"));
+        assert!(order.contains("0.0101 USDC"));
+
+        let bound = String::from_utf8(session_builder_bound_advisory(builder, 25)).unwrap();
+        assert!(bound.contains(builder));
+        assert!(bound.contains("0.025%"));
+        assert!(bound.contains("25 tenths of a basis point"));
     }
 
     #[test]
@@ -2849,11 +4047,11 @@ mod tests {
         // ids must never appear in the derived-key scope; if a route file is
         // ever inserted ahead of them, this pins the authority boundary.
         assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000046"),
+            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000049"),
             "session scope must stay below the withdrawal routes"
         );
         let expected = [
-            "r000008", "r000009", "r000010", "r000013", "r000019", "r000023", "r000025",
+            "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
         ];
         assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
     }
@@ -3025,7 +4223,22 @@ mod tests {
         };
         assert_eq!(
             session_policy(&unrestricted, &spot),
-            Err("delegated sessions do not support spot asset ids".into())
+            Err(
+                "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                    .into()
+            )
+        );
+        let hip3 = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire {
+                asset: 110_000,
+                oid: 42,
+            }],
+            fast: None,
+        };
+        assert!(
+            session_policy(&unrestricted, &hip3)
+                .unwrap_err()
+                .contains("core perpetual")
         );
     }
 
@@ -3101,6 +4314,123 @@ mod tests {
         assert_eq!(
             session_policy(&bounded_session(), &excessive_leverage),
             Err("requested leverage exceeds session bound".into())
+        );
+    }
+
+    #[test]
+    fn session_policy_enforces_the_session_builder_bound() {
+        let mut session = bounded_session();
+        let order = order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+
+        // no builder bound configured on the session: rejected outright
+        assert_eq!(
+            session_policy(&session, &order),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        session.builder_address = Some("0x0000000000000000000000000000000000000001".into());
+        session.max_builder_fee_tenths_bps = Some(10);
+        // matching address, fee at the session cap: accepted
+        assert_eq!(session_policy(&session, &order), Ok(()));
+
+        // fee above the session's cap (but within the venue cap): rejected
+        let over_cap = order_action_with_builder("0x0000000000000000000000000000000000000001", 11);
+        assert_eq!(
+            session_policy(&session, &over_cap),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // a different builder address: rejected even though the fee is in range
+        let other_builder =
+            order_action_with_builder("0x0000000000000000000000000000000000000002", 5);
+        assert_eq!(
+            session_policy(&session, &other_builder),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // an order without a builder is unaffected by the bound
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_policy(&session, &plain_order), Ok(()));
+    }
+
+    #[test]
+    fn session_preflight_enforces_builder_bound_pairing_case_and_cap() {
+        fn request(
+            builder_address: Option<&str>,
+            max_builder_fee_tenths_bps: Option<u32>,
+        ) -> NewSession {
+            NewSession {
+                id: "session".into(),
+                duration_ms: None,
+                agent_name: None,
+                max_notional_usd: None,
+                max_leverage: None,
+                assets: Vec::new(),
+                builder_address: builder_address.map(str::to_owned),
+                max_builder_fee_tenths_bps,
+                nonce: None,
+            }
+        }
+
+        // neither field set: fine, no builder bound
+        assert!(session_preflight(&request(None, None)).is_ok());
+
+        // set together, within the perp venue cap: fine
+        assert!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(100)
+            ))
+            .is_ok()
+        );
+
+        // only one of the pair set: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                None
+            )),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+        assert_eq!(
+            session_preflight(&request(None, Some(10))),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+
+        // uppercase address: rejected (the "0x" prefix must stay intact)
+        let checksummed = format!(
+            "0x{}",
+            "000000000000000000000000000000000000000a".to_ascii_uppercase()
+        );
+        assert_eq!(
+            session_preflight(&request(Some(checksummed.as_str()), Some(10))),
+            Err("builder_address must be lowercase".into())
+        );
+
+        // above the perp venue cap (sessions never submit spot orders): rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(101)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
+        );
+
+        // zero: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(0)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
         );
     }
 
