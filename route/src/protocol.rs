@@ -1184,6 +1184,9 @@ mod tests {
         assert!(!is_core_perp_asset(SPOT_ASSET_ID_OFFSET));
         assert!(is_hip3_perp_asset(HIP3_ASSET_ID_OFFSET));
         assert!(is_hip3_perp_asset(OUTCOME_ASSET_ID_OFFSET - 1));
+        // Outcome 0, side 0 is the first outcome id.
+        assert!(is_outcome_asset(OUTCOME_ASSET_ID_OFFSET));
+        assert!(!is_hip3_perp_asset(OUTCOME_ASSET_ID_OFFSET));
         // 100000000 + 10 * outcome 1 + side 0: an outcome, not a HIP-3 perp.
         assert!(is_outcome_asset(100_000_010));
         assert!(!is_hip3_perp_asset(100_000_010));
