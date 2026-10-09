@@ -6,7 +6,7 @@ petal::route_file!(
             "description": "write a Hyperliquid approveBuilderFee request approving a maximum fee for a builder; must be signed by the main wallet and may require Bloom approval",
             "body": {
                 "builder": "optional lowercase 0x builder address; omit to use the operator override or this release's default builder, if configured",
-                "max_fee_tenths_bps": "maximum builder fee in tenths of a basis point (10 = 1bp); capped by the venue at 1000 (1%)",
+                "max_fee_tenths_bps": "maximum builder fee in tenths of a basis point (10 = 1bp), 0 through 1000; 0 revokes the approval. One approval covers both perp and spot orders, so it is bounded by the venue's 1% spot ceiling; each perp order is still capped at 100 (0.1%) when it is placed",
                 "nonce": "optional timestamp in milliseconds"
             }
         }))

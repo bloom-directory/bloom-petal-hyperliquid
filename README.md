@@ -151,7 +151,7 @@ Petal SDK are locked in `route/Cargo.lock`.
 
 `approve_builder_fee.json` resolves its builder as: the request's explicit
 `builder`, else the operator override written to `settings/builder-address`,
-else this release's default, `RELEASE_DEFAULT_BUILDER` in
+else this release's default, `RELEASE_DEFAULT_BUILDER_ADDRESS` in
 `route/src/settings.rs`. The default is public on-chain data and is declared
 in source, never injected at build time, so a tagged release rebuilds byte for
 byte and the package CI checks is the package that ships. With no default

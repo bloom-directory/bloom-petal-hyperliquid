@@ -121,6 +121,75 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .get(DERIVATION_ROUTE.0)
         .expect("agent-session derivation route");
     assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
+
+    // Inspect the exact packaged runtime source, not a second manifest-only
+    // list: request_session_key passes session_key_scope(..) to derive_key,
+    // which builds the scope from these two constants.
+    let workflow = package
+        .files
+        .iter()
+        .find(|file| file.path == "route/src/workflow.rs")
+        .expect("packaged session runtime source");
+    let workflow = std::str::from_utf8(&workflow.bytes).expect("UTF-8 runtime source");
+    let quoted = |declaration: &str, end: &str| {
+        workflow
+            .split(declaration)
+            .nth(1)
+            .unwrap_or_else(|| panic!("runtime declaration {declaration}"))
+            .split(end)
+            .next()
+            .unwrap()
+            .split('"')
+            .enumerate()
+            .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
+            .collect::<Vec<_>>()
+    };
+    let runtime_scope = quoted("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [", "];");
+    let runtime_builder_route = quoted("const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = ", ";");
+    let request = workflow
+        .split("fn request_session_key(")
+        .nth(1)
+        .expect("runtime derivation request")
+        .split("fn session_key_slot(")
+        .next()
+        .unwrap();
+    assert!(request.contains("session_key_scope(builder_bound)"));
+    assert!(request.contains("allowed_routes,"));
+    let scope_fn = workflow
+        .split("fn session_key_scope(")
+        .nth(1)
+        .expect("runtime session key scope")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(scope_fn.contains("SESSION_KEY_ALLOWED_ROUTES"));
+    assert!(scope_fn.contains("routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned())"));
+    let mut expected_scope = SESSION_ACTION_ROUTES
+        .iter()
+        .map(|(pattern, _)| {
+            routes
+                .get(pattern)
+                .expect("session action route")
+                .route_id
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    expected_scope.push(derivation.route_id.as_str());
+    assert_eq!(
+        runtime_scope, expected_scope,
+        "runtime derivation scope must match the exact package's action and creation routes"
+    );
+    let builder_order_route = routes
+        .get(SESSION_BUILDER_ORDER_ROUTE.0)
+        .expect("session builder-order route")
+        .route_id
+        .as_str();
+    assert_eq!(
+        runtime_builder_route,
+        [builder_order_route],
+        "a builder-bound session key must be scoped to the exact package's session builder-order route"
+    );
+
     let mut derived_classes = operation_classes(derivation);
     derived_classes.sort_unstable();
     assert_eq!(derived_classes, [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]);

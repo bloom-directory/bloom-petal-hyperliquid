@@ -1022,8 +1022,16 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+/// Shared across every wallet account, so the global `settings/` route and
+/// the account-scoped `approve_builder_fee.json` see the same value. The SDK
+/// adds the `state` namespace itself, so this key must not repeat it: the
+/// host's canonical key must equal the `[store].shared_keys` entry in
+/// petal.toml, `state/settings/builder-address`, or each account would read
+/// its own (empty) copy.
+const BUILDER_ADDRESS_OVERRIDE_KEY: &str = "settings/builder-address";
+
 fn builder_address_override_key() -> String {
-    state_key(&["settings", "builder-address"])
+    BUILDER_ADDRESS_OVERRIDE_KEY.to_owned()
 }
 
 /// Reads the operator-set builder-address override, if any. Stored as plain
@@ -1050,30 +1058,38 @@ pub fn builder_address_status() -> Result<settings::BuilderAddressStatus, Dispat
 /// `settings/builder-address`. An empty body clears the override, reverting
 /// to this release's default, if any.
 pub fn set_builder_address_override(body: &[u8]) -> DispatchResponse {
-    let text = match std::str::from_utf8(body) {
-        Ok(x) => x.trim(),
-        Err(_) => return invalid("builder address must be UTF-8"),
-    };
     let key = builder_address_override_key();
-    if text.is_empty() {
-        return match petal::sdk::store_del(&key) {
+    match parse_builder_address_override(body) {
+        Ok(None) => match petal::sdk::store_del(&key) {
             Ok(()) => ok_write(),
             Err(e) => backend(e.message()),
-        };
+        },
+        Ok(Some(address)) => match petal::sdk::store_put(&key, address.as_bytes(), false) {
+            Ok(()) => ok_write(),
+            Err(e) => backend(e.message()),
+        },
+        Err(e) => invalid(e),
     }
-    if let Err(e) = protocol::parse_address(text) {
-        return invalid(e);
+}
+
+/// The address a `settings/builder-address` write stores, or `None` to clear
+/// the override. Surrounding whitespace is trimmed (so `echo addr >` works);
+/// anything else that is not a lowercase 0x address is refused.
+fn parse_builder_address_override(body: &[u8]) -> Result<Option<&str>, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "builder address must be UTF-8".to_owned())?
+        .trim();
+    if text.is_empty() {
+        return Ok(None);
     }
+    protocol::parse_address(text)?;
     // Required lowercase for the same reason as the per-order and approval
     // builder fields: a stored override must match what orders will send
     // byte-for-byte, never silently normalized.
     if text != text.to_ascii_lowercase() {
-        return invalid("builder address must be lowercase");
+        return Err("builder address must be lowercase".into());
     }
-    match petal::sdk::store_put(&key, text.as_bytes(), false) {
-        Ok(()) => ok_write(),
-        Err(e) => backend(e.message()),
-    }
+    Ok(Some(text))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1085,6 +1101,17 @@ struct ApproveBuilderFee {
     #[serde(default)]
     nonce: Option<u64>,
 }
+/// What a repeated `approve_builder_fee.json` write is matched on. A body that
+/// omits `builder` resolves it from the override or the release default, so
+/// the same body can mean a different builder later; matching on the body
+/// alone would report a new builder's approval as already done.
+fn approve_builder_fee_identity(body: &[u8], resolved_builder: &str) -> Vec<u8> {
+    let mut identity = body.to_vec();
+    identity.extend_from_slice(b"\0builder=");
+    identity.extend_from_slice(resolved_builder.as_bytes());
+    identity
+}
+
 /// Approves a maximum builder fee for a builder address. Hyperliquid requires
 /// this to be signed by the main wallet, so — like `usd_class_transfer` — it
 /// is deliberately absent from the delegated agent session surface: it is
@@ -1129,12 +1156,14 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
     }
     if req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS {
         return invalid(format!(
-            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval",
-            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS
+            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval. One approval covers perp and spot orders, so it is bounded by the venue's spot ceiling; each perp order is still capped at {}",
+            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS,
+            protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
         ));
     }
+    let identity = approve_builder_fee_identity(body, &resolved_builder);
     let (nonce, pending_nonce_key, completed) =
-        match owner_nonce(n, &w, "approve_builder_fee.json", body, req.nonce) {
+        match owner_nonce(n, &w, "approve_builder_fee.json", &identity, req.nonce) {
             Ok(x) => x,
             Err(e) => return e,
         };
@@ -3280,6 +3309,71 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_builder_address_override_is_stored_under_its_declared_shared_key() {
+        // The host stores `<namespace>/<key>` and shares only keys declared in
+        // petal.toml; the SDK supplies the `state` namespace. Anything else
+        // leaves the override invisible to account-scoped routes.
+        let manifest = include_str!("../../petal.toml");
+        let shared = format!("state/{}", builder_address_override_key());
+        assert!(
+            manifest.contains(&format!("shared_keys = [\"{shared}\"]")),
+            "petal.toml must share {shared}"
+        );
+        assert!(!builder_address_override_key().starts_with("state/"));
+    }
+
+    #[test]
+    fn a_changed_default_builder_is_not_mistaken_for_a_repeat_approval() {
+        // The same body resolves to builder A, then (after the override
+        // changes) to builder B: each must get its own approval record.
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        let a = "0x00000000000000000000000000000000000000aa";
+        let b = "0x00000000000000000000000000000000000000bb";
+        let key = |builder| {
+            owner_nonce_key(
+                Network::Testnet,
+                "main",
+                "approve_builder_fee.json",
+                &approve_builder_fee_identity(body, builder),
+            )
+        };
+        assert_ne!(key(a), key(b));
+        // An exact repeat for the same builder still matches its record.
+        assert_eq!(key(a), key(a));
+    }
+
+    #[test]
+    fn builder_address_override_writes_are_validated() {
+        let addr = "0x00000000000000000000000000000000000000aa";
+        assert_eq!(
+            parse_builder_address_override(addr.as_bytes()),
+            Ok(Some(addr))
+        );
+        // Surrounding whitespace, as `echo addr > settings/builder-address`
+        // writes, is trimmed rather than refused.
+        assert_eq!(
+            parse_builder_address_override(format!("  {addr}\n").as_bytes()),
+            Ok(Some(addr))
+        );
+        // Empty or whitespace-only clears the override.
+        assert_eq!(parse_builder_address_override(b""), Ok(None));
+        assert_eq!(parse_builder_address_override(b" \n"), Ok(None));
+        for garbage in [
+            &addr[..41],                                   // 39 hex digits
+            "0x00000000000000000000000000000000000000aaa", // 41 hex digits
+            "00000000000000000000000000000000000000aa",    // no 0x
+            "0x00000000000000000000000000000000000000zz",  // not hex
+            "0x00000000000000000000000000000000000000AA",  // not lowercase
+        ] {
+            assert!(
+                parse_builder_address_override(garbage.as_bytes()).is_err(),
+                "{garbage}"
+            );
+        }
+        assert!(parse_builder_address_override(&[0xff, 0xfe]).is_err());
+    }
     use super::*;
 
     #[test]

@@ -9,11 +9,11 @@ petal::route_file!(
                     "type": "order",
                     "orders": [{
                         "a": "unsigned integer asset id",
-                        "b": "boolean; true buys and false sells",
+                        "b": "boolean; true buys and false sells. A sell must use tif Alo (post-only)",
                         "p": "positive decimal price string",
                         "s": "positive decimal size string",
                         "r": "boolean reduce-only flag",
-                        "t": {"limit": {"tif": "Alo, Gtc, or Ioc"}},
+                        "t": {"limit": {"tif": "Alo, Gtc, or Ioc for a buy; Alo only for a sell, because a sell that crosses the book fills above its limit and its builder fee cannot be bounded"}},
                         "c": "optional 16-byte 0x client order id"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
