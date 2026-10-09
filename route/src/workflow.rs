@@ -1048,8 +1048,16 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+/// Shared across every wallet account, so the global `settings/` route and
+/// the account-scoped `approve_builder_fee.json` see the same value. The SDK
+/// adds the `state` namespace itself, so this key must not repeat it: the
+/// host's canonical key must equal the `[store].shared_keys` entry in
+/// petal.toml, `state/settings/builder-address`, or each account would read
+/// its own (empty) copy.
+const BUILDER_ADDRESS_OVERRIDE_KEY: &str = "settings/builder-address";
+
 fn builder_address_override_key() -> String {
-    state_key(&["settings", "builder-address"])
+    BUILDER_ADDRESS_OVERRIDE_KEY.to_owned()
 }
 
 /// Reads the operator-set builder-address override, if any. Stored as plain
@@ -3327,6 +3335,20 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_builder_address_override_is_stored_under_its_declared_shared_key() {
+        // The host stores `<namespace>/<key>` and shares only keys declared in
+        // petal.toml; the SDK supplies the `state` namespace. Anything else
+        // leaves the override invisible to account-scoped routes.
+        let manifest = include_str!("../../petal.toml");
+        let shared = format!("state/{}", builder_address_override_key());
+        assert!(
+            manifest.contains(&format!("shared_keys = [\"{shared}\"]")),
+            "petal.toml must share {shared}"
+        );
+        assert!(!builder_address_override_key().starts_with("state/"));
+    }
 
     #[test]
     fn a_changed_default_builder_is_not_mistaken_for_a_repeat_approval() {
