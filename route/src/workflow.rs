@@ -215,7 +215,7 @@ fn sign_payload(
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
         claim_assurance_evidence: None,
         approval_hint,
-        action: None,
+        action: Some(payload.review.clone()),
         advisory,
         selector: if key_ref_jcs.is_some() {
             SignSelector::Reusable

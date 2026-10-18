@@ -8,6 +8,7 @@ use sha3::{Digest, Keccak256};
 pub struct SigningPayload {
     pub preimage: Vec<u8>,
     pub hash: B256,
+    pub review: Vec<u8>,
 }
 
 fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
@@ -16,7 +17,15 @@ fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
     preimage.extend_from_slice(td.domain().separator().as_slice());
     preimage.extend_from_slice(td.hash_struct().map_err(|e| e.to_string())?.as_slice());
     let hash = B256::from_slice(&Keccak256::digest(&preimage));
-    Ok(SigningPayload { preimage, hash })
+    let review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"eip712", "typed_data":td
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(SigningPayload {
+        preimage,
+        hash,
+        review,
+    })
 }
 
 pub const MAINNET_URL: &str = "https://api.hyperliquid.xyz";
@@ -415,10 +424,18 @@ pub fn l1_signing_payload(
     vault: Option<Address>,
     expires: Option<u64>,
 ) -> Result<SigningPayload, String> {
-    typed_signing_payload(&typed_agent(
+    let mut payload = typed_signing_payload(&typed_agent(
         network,
         action_hash(action, nonce, vault, expires)?,
-    )?)
+    )?)?;
+    payload.review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"hyperliquid_l1",
+        "network":match network { Network::Mainnet => "mainnet", Network::Testnet => "testnet" },
+        "action":action, "nonce":nonce,
+        "vault_address":vault.map(|address| format!("{address:#x}")), "expires_after":expires
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(payload)
 }
 fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData, String> {
     let (type_name, type_fields) = match kind {
@@ -1137,6 +1154,11 @@ mod tests {
         let (_, expected) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
         let (_, payload) =
             approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        let review: Value = serde_json::from_slice(&payload.review).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["kind"], "eip712");
+        let typed: TypedData = serde_json::from_value(review["typed_data"].clone()).unwrap();
+        assert_eq!(typed.eip712_signing_hash().unwrap(), payload.hash);
         assert_eq!(payload.hash, expected);
         assert_eq!(
             B256::from_slice(&Keccak256::digest(&payload.preimage)),
@@ -1146,6 +1168,11 @@ mod tests {
         let action = cancel();
         let expected = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
         let payload = l1_signing_payload(Network::Mainnet, &action, 123, None, None).unwrap();
+        let review: Value = serde_json::from_slice(&payload.review).unwrap();
+        assert_eq!(review["kind"], "hyperliquid_l1");
+        assert_eq!(review["action"], serde_json::to_value(&action).unwrap());
+        assert_eq!(review["nonce"], 123);
+        assert_eq!(review["network"], "mainnet");
         assert_eq!(payload.hash, expected);
         assert_eq!(
             B256::from_slice(&Keccak256::digest(&payload.preimage)),

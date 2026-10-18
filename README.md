@@ -69,6 +69,14 @@ submitted.
 
 ## Build
 
+Owner signature requests carry the full typed message or the exact exchange
+action, nonce, environment, vault and expiry to Broker for independent review.
+The exchange action's ordered MessagePack commitment is rebuilt before its
+hash is approved. Unknown market IDs remain explicitly unverified rather than
+borrowing a token name or logo. A venue agent authorization includes no
+spending ceiling or duration: Petal session limits are local controls, and
+the existing delegated-action approval covers later session actions.
+
 ```sh
 scripts/check-route-architecture.sh
 scripts/build.sh
