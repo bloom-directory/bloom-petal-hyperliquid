@@ -77,6 +77,13 @@ borrowing a token name or logo. A venue agent authorization includes no
 spending ceiling or duration: Petal session limits are local controls, and
 the existing delegated-action approval covers later session actions.
 
+Delegated actions also carry the complete ordered action witness to Broker
+on every signing use. Broker rebuilds its exact preimage before permitting
+the signature, without adding an owner ceremony per trade. This does not
+promote local session limits to venue-enforced constraints or establish market
+identity, fills or settlement. Publish this package with the matching Broker;
+older hash-only agent callers cannot satisfy the use-time verification.
+
 ```sh
 scripts/check-route-architecture.sh
 scripts/build.sh

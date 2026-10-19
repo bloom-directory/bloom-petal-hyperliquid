@@ -213,7 +213,10 @@ fn sign_payload(
         signature_algorithm: "secp256k1-keccak256-recoverable".into(),
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
-        claim_assurance_evidence: None,
+        // Delegated actions have no new ceremony. Carry the full public
+        // action witness on the existing use-time evidence channel so Broker
+        // can still rebuild the signed bytes before releasing a signature.
+        claim_assurance_evidence: key_ref_jcs.as_ref().map(|_| payload.review.clone()),
         approval_hint,
         action: Some(payload.review.clone()),
         advisory,
