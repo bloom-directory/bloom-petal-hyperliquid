@@ -172,6 +172,42 @@ mod tests {
         assert!(source.contains("bloom:key.derive"));
     }
 
+    /// Only a builder-bearing sell is forced post-only, so a buy may be
+    /// immediate-or-cancel or a marketable good-till-cancelled and the venue
+    /// answers with `filled.oid` rather than `resting.oid`. Guidance that
+    /// demanded a resting status left an agent polling a filled order until
+    /// its timeout, so both routes must accept either and stop on rejection.
+    #[test]
+    fn session_order_success_evidence_accepts_a_rest_or_an_immediate_fill() {
+        let sources = [
+            include_str!(
+                "../files/[network]/agent_sessions/[wallet]/[index]/[session]/order.json.rs"
+            ),
+            include_str!(
+                "../files/[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json.rs"
+            ),
+        ];
+        for source in sources {
+            let predicate = source
+                .split("\"predicate\": \"")
+                .nth(1)
+                .expect("session help declares a success predicate")
+                .split('\"')
+                .next()
+                .unwrap();
+            assert!(predicate.contains("resting.oid"), "{predicate}");
+            assert!(predicate.contains("filled.oid"), "{predicate}");
+            assert!(
+                !predicate.contains("resting.oid exists"),
+                "predicate still demands a resting status: {predicate}"
+            );
+            assert!(
+                source.contains("is terminal: stop polling"),
+                "notes must tell an agent to stop on a rejection rather than wait out timeout_ms"
+            );
+        }
+    }
+
     #[test]
     fn session_success_evidence_resolves_to_public_user_routes() {
         let sources = [

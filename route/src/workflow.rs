@@ -1131,11 +1131,45 @@ struct ApproveBuilderFee {
 /// omits `builder` resolves it from the override or the release default, so
 /// the same body can mean a different builder later; matching on the body
 /// alone would report a new builder's approval as already done.
-fn approve_builder_fee_identity(body: &[u8], resolved_builder: &str) -> Vec<u8> {
+///
+/// The generation is what lets a cap come back to a value it already held.
+/// Body and builder alone are not unique over time: approving 10, revoking
+/// with 0, then approving 10 again produces the first write's identity a
+/// second time, and its completed pending record would answer the venue call
+/// with a bare success while the cap stayed revoked. The generation advances
+/// on each completed approval, so a changed cap gets its own record while a
+/// retry of the cap in flight keeps the one it started.
+fn approve_builder_fee_identity(body: &[u8], resolved_builder: &str, generation: u64) -> Vec<u8> {
     let mut identity = body.to_vec();
     identity.extend_from_slice(b"\0builder=");
     identity.extend_from_slice(resolved_builder.as_bytes());
+    identity.extend_from_slice(b"\0generation=");
+    identity.extend_from_slice(generation.to_string().as_bytes());
     identity
+}
+
+/// The last cap this Petal successfully approved for one builder, and the
+/// generation that keys its pending-nonce record. Stored per network, wallet
+/// and builder, so one builder's history cannot answer for another's.
+#[derive(Debug, Serialize, Deserialize)]
+struct BuilderFeeApproval {
+    approved_tenths_bps: u32,
+    generation: u64,
+}
+
+fn builder_fee_approval_key(n: Network, w: &str, resolved_builder: &str) -> String {
+    state_key(&[
+        "exchange",
+        "builder_fee_approvals",
+        if matches!(n, Network::Mainnet) {
+            "mainnet"
+        } else {
+            "testnet"
+        },
+        w,
+        resolved_builder,
+        "approval.json",
+    ])
 }
 
 /// Approves a maximum builder fee for a builder address. Hyperliquid requires
@@ -1187,12 +1221,30 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
         ));
     }
-    let identity = approve_builder_fee_identity(body, &resolved_builder);
+    // A completed approval for the cap already in force is genuinely done, so
+    // a lost response can be retried without submitting twice. A different cap
+    // is a change and must reach the venue even when an identical body once
+    // did, which is what the generation below keys apart.
+    let approval_key = builder_fee_approval_key(n, &w, &resolved_builder);
+    let approval = match load_json::<BuilderFeeApproval>(approval_key.clone()) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if approval
+        .as_ref()
+        .is_some_and(|state| state.approved_tenths_bps == req.max_fee_tenths_bps)
+    {
+        return ok_write();
+    }
+    let generation = approval.as_ref().map_or(0, |state| state.generation);
+    let identity = approve_builder_fee_identity(body, &resolved_builder, generation);
     let (nonce, pending_nonce_key, completed) =
         match owner_nonce(n, &w, "approve_builder_fee.json", &identity, req.nonce) {
             Ok(x) => x,
             Err(e) => return e,
         };
+    // Still the guard for the window between a venue success and the approval
+    // record below: the cap did land, so answering success is truthful.
     if completed {
         return ok_write();
     }
@@ -1246,6 +1298,16 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             if let Some(key) = pending_nonce_key
                 && let Err(e) = save_pending(&key, nonce, true)
             {
+                return e;
+            }
+            if let Err(e) = save_json(
+                approval_key,
+                &BuilderFeeApproval {
+                    approved_tenths_bps: req.max_fee_tenths_bps,
+                    generation: generation.saturating_add(1),
+                },
+                false,
+            ) {
                 return e;
             }
             ok_write()
@@ -3357,17 +3419,20 @@ mod tests {
         let body = br#"{"max_fee_tenths_bps":10}"#;
         let a = "0x00000000000000000000000000000000000000aa";
         let b = "0x00000000000000000000000000000000000000bb";
-        let key = |builder| {
+        let key = |builder, generation| {
             owner_nonce_key(
                 Network::Testnet,
                 "main",
                 "approve_builder_fee.json",
-                &approve_builder_fee_identity(body, builder),
+                &approve_builder_fee_identity(body, builder, generation),
             )
         };
-        assert_ne!(key(a), key(b));
+        assert_ne!(key(a, 0), key(b, 0));
         // An exact repeat for the same builder still matches its record.
-        assert_eq!(key(a), key(a));
+        assert_eq!(key(a, 0), key(a, 0));
+        // A later generation for the same builder and body does not, which is
+        // what lets a revoked cap be approved again.
+        assert_ne!(key(a, 0), key(a, 1));
     }
 
     #[test]
@@ -4692,6 +4757,58 @@ mod tests {
         let cancel_targets = receipt_targets(&cancel).unwrap();
         assert_eq!(cancel_targets[0].item_index, 0);
         assert_eq!(cancel_targets[0].cloid, targets[0].cloid);
+    }
+
+    /// Approving 10, revoking with 0, then approving 10 again presents the
+    /// first write's body a second time. Keyed on body and builder alone the
+    /// third write reused the first's completed pending record and answered
+    /// success without contacting the venue, leaving the cap revoked. The
+    /// generation separates the two while keeping a retry of the cap in
+    /// flight on the record it started.
+    #[test]
+    fn repeat_builder_fee_approval_is_keyed_apart_from_the_cap_it_replaces() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approve = br#"{"max_fee_tenths_bps":10}"#;
+        let revoke = br#"{"max_fee_tenths_bps":0}"#;
+
+        // Generation 0 approves, generation 1 revokes, generation 2 approves
+        // the same cap again: the third identity must not equal the first.
+        let first = approve_builder_fee_identity(approve, builder, 0);
+        let revoked = approve_builder_fee_identity(revoke, builder, 1);
+        let reapproved = approve_builder_fee_identity(approve, builder, 2);
+        assert_ne!(
+            first, reapproved,
+            "re-approving a revoked cap must key fresh"
+        );
+        assert_ne!(first, revoked);
+        assert_ne!(revoked, reapproved);
+
+        // A retry of the write in flight keeps its own record.
+        assert_eq!(first, approve_builder_fee_identity(approve, builder, 0));
+
+        // A different builder never answers for another's history.
+        let other = "0x0000000000000000000000000000000000000002";
+        assert_ne!(first, approve_builder_fee_identity(approve, other, 0));
+    }
+
+    #[test]
+    fn builder_fee_approval_key_is_scoped_by_network_wallet_and_builder() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let other = "0x0000000000000000000000000000000000000002";
+        let mainnet = builder_fee_approval_key(Network::Mainnet, "alice", builder);
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Testnet, "alice", builder)
+        );
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Mainnet, "bob", builder)
+        );
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Mainnet, "alice", other)
+        );
+        assert!(mainnet.contains("builder_fee_approvals"), "{mainnet}");
     }
 
     #[test]
