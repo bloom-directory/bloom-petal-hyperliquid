@@ -2,10 +2,21 @@ use serde::Serialize;
 
 /// This release's default builder **address**, used when an
 /// `approve_builder_fee.json` caller omits `builder` and no operator override
-/// is stored. It is public on-chain data, not a credential, so it lives here
-/// in source: a release can then be rebuilt byte for byte from its tag, and
-/// the package CI tests is the package that ships. Set it as a lowercase `0x`
-/// address; `release_default_if_set_is_a_lowercase_address` checks it.
+/// is stored. A release build embeds it from the `HYPERLIQUID_BUILDER_ADDRESS`
+/// build input; a local build sets nothing, so callers must name a builder.
+///
+/// The address is public on-chain data, not a credential. It is injected at
+/// build time rather than committed because this repository is public, and
+/// the cost is real: a tagged release cannot be rebuilt byte for byte from
+/// its source alone. What compensates is that the owner approves the address
+/// per use — every approval ceremony states the builder, the cap, and which
+/// source the address came from — so an unexpected or swapped builder is
+/// visible before a passkey tap, not discovered afterwards.
+///
+/// Set it as a lowercase `0x` address;
+/// `release_default_if_set_is_a_lowercase_address` checks whatever a build
+/// embeds, so a checksummed or padded value cannot make every call that omits
+/// `builder` fail.
 ///
 /// Hyperliquid identifies a builder by address and takes the fee per order,
 /// bounded by a cap the user approved on-chain for that address. That is a
@@ -13,7 +24,8 @@ use serde::Serialize;
 /// `bytes32` code whose rates live on the builder's profile with no per-user
 /// approval, so the two are named apart throughout: address and fee here,
 /// code there.
-pub const RELEASE_DEFAULT_BUILDER_ADDRESS: Option<&str> = None;
+pub const EMBEDDED_DEFAULT_BUILDER_ADDRESS: Option<&str> =
+    option_env!("HYPERLIQUID_BUILDER_ADDRESS");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,7 +78,7 @@ pub fn resolve_default_builder_address(
     explicit: Option<&str>,
     store_override: Option<&str>,
 ) -> Result<String, String> {
-    resolve_builder_address(explicit, RELEASE_DEFAULT_BUILDER_ADDRESS, store_override)
+    resolve_builder_address(explicit, EMBEDDED_DEFAULT_BUILDER_ADDRESS, store_override)
 }
 
 fn builder_address_status(
@@ -88,7 +100,7 @@ fn builder_address_status(
 }
 
 pub fn default_builder_address_status(store_override: Option<&str>) -> BuilderAddressStatus {
-    builder_address_status(RELEASE_DEFAULT_BUILDER_ADDRESS, store_override)
+    builder_address_status(EMBEDDED_DEFAULT_BUILDER_ADDRESS, store_override)
 }
 
 #[cfg(test)]
@@ -142,7 +154,7 @@ mod tests {
         // per-order and override fields get apply to it here: a checksummed
         // or padded value would make every call that omits `builder` fail
         // with "builder address must be lowercase".
-        if let Some(address) = RELEASE_DEFAULT_BUILDER_ADDRESS {
+        if let Some(address) = EMBEDDED_DEFAULT_BUILDER_ADDRESS {
             assert_eq!(address, address.to_ascii_lowercase());
             assert!(crate::parse_address(address).is_ok());
         }
@@ -157,7 +169,7 @@ mod tests {
         // explicit `None`, so setting a release default breaks no test.
         assert_eq!(
             resolve_default_builder_address(None, None).ok(),
-            RELEASE_DEFAULT_BUILDER_ADDRESS.map(str::to_owned)
+            EMBEDDED_DEFAULT_BUILDER_ADDRESS.map(str::to_owned)
         );
         assert_eq!(
             resolve_default_builder_address(

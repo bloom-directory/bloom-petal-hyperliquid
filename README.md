@@ -151,11 +151,15 @@ Petal SDK are locked in `route/Cargo.lock`.
 
 `approve_builder_fee.json` resolves its builder as: the request's explicit
 `builder`, else the operator override written to `settings/builder-address`,
-else this release's default, `RELEASE_DEFAULT_BUILDER_ADDRESS` in
-`route/src/settings.rs`. The default is public on-chain data and is declared
-in source, never injected at build time, so a tagged release rebuilds byte for
-byte and the package CI checks is the package that ships. With no default
-declared and no override stored, callers must supply `builder` explicitly.
+else this release's default, `EMBEDDED_DEFAULT_BUILDER_ADDRESS` in
+`route/src/settings.rs`. A release build embeds that from the
+`HYPERLIQUID_BUILDER_ADDRESS` repository secret, passed to the pinned release
+workflow as its generic `compile-time-secret` input and re-exported by
+`scripts/build.sh`. The address is public on-chain data rather than a
+credential; it is a build input only because this repository is public, and
+the cost is that a tagged release cannot be rebuilt byte for byte from source
+alone. With no default embedded and no override stored, callers must supply
+`builder` explicitly.
 Every approval ceremony states the builder address, the fee cap, and which of
 those three sources the address came from, so the owner never approves a
 recipient they cannot see.
