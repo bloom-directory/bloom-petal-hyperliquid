@@ -1,5 +1,12 @@
 # Hyperliquid Petal
 
+The compiled producer regression lives in Bloom's
+`crates/bloom-petals/tests/explicit_account_packages.rs`:
+`real_signing_producers_reach_the_host_with_selected_account_and_full_witness`.
+It runs the actual component against Machine's host boundary with a nonzero
+account, retained delegated KeyRef, exact preimage/hash and complete action
+witness. It uses fixture host outcomes and proves no live venue execution.
+
 This package moves Bloom's Hyperliquid HyperCore surface into a standalone
 local Petal. It exposes read-only market/account files, signed exchange
 actions, owner-approved USDC transfers, and bounded API-agent sessions under
