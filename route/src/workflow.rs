@@ -178,6 +178,31 @@ fn sign_payload(
     advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
+    sign_payload_using(
+        ctx,
+        wallet,
+        payload,
+        operation_class,
+        approval_hint,
+        key_ref_jcs,
+        advisory,
+        effects,
+        petal::sdk::sign_payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_payload_using(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    operation_class: &str,
+    approval_hint: Option<String>,
+    key_ref_jcs: Option<Vec<u8>>,
+    advisory: Option<Vec<u8>>,
+    effects: ClaimEffects,
+    send: impl FnOnce(&PayloadSignRequest) -> Result<SignOutcome, SdkError>,
+) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
@@ -206,7 +231,7 @@ fn sign_payload(
         "nonce": hex::encode(&nonce_digest[..16]),
         "claim_assurance": {"kind": "machine_asserted"}
     });
-    petal::sdk::sign_payload(&PayloadSignRequest {
+    send(&PayloadSignRequest {
         wallet: wallet.into(),
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
@@ -2625,6 +2650,64 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_workflow_emits_complete_witness_at_the_sdk_boundary() {
+        struct CancelRoute;
+        impl petal::RouteIdentity for CancelRoute {
+            const PATH: &'static str = "testnet/agent_sessions/[wallet]/[index]/[id]/cancel.json";
+            const CANONICAL_PATH: &'static str = Self::PATH;
+            const PARAMS: &'static [(&'static str, usize)] =
+                &[("wallet", 2), ("index", 3), ("id", 4)];
+        }
+        let ctx = Ctx::bind::<CancelRoute>(petal::RawCtx {
+            petal_root: "/petals/hyperliquid".into(),
+            package_hash: "ab".repeat(32),
+            path: "testnet/agent_sessions/alice/3/test/cancel.json".into(),
+            params: vec![
+                ("bloom.route_id".into(), "r000009".into()),
+                ("bloom.account".into(), "3".into()),
+            ],
+            actor: None,
+        });
+        for nonce in [123, 124] {
+            let action = ExchangeAction::Cancel {
+                cancels: vec![protocol::CancelWire { asset: 7, oid: 42 }],
+                fast: Some(true),
+            };
+            let payload =
+                protocol::l1_signing_payload(Network::Testnet, &action, nonce, None, None).unwrap();
+            let key = br#"{"account":3,"backend":"fixture"}"#.to_vec();
+            let result = sign_payload_using(
+                &ctx,
+                "alice",
+                &payload,
+                "hyperliquid.agent_action",
+                None,
+                Some(key.clone()),
+                None,
+                ClaimEffects::none(),
+                |request| {
+                    assert_eq!(request.wallet, "alice");
+                    assert_eq!(request.key_ref_jcs, Some(key));
+                    assert_eq!(request.preimage, payload.preimage);
+                    assert_eq!(request.claimed_hash, payload.hash);
+                    assert_eq!(request.selector, SignSelector::Reusable);
+                    assert_eq!(request.action.as_deref(), Some(payload.review.as_slice()));
+                    assert_eq!(
+                        request.claim_assurance_evidence.as_deref(),
+                        Some(payload.review.as_slice())
+                    );
+                    let claim: Value =
+                        serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+                    assert_eq!(claim["route"], "r000009");
+                    assert_eq!(claim["package_hash"], ctx.package_hash);
+                    Ok(SignOutcome::Signature(vec![1; 65]))
+                },
+            );
+            assert!(matches!(result, Ok(SignOutcome::Signature(_))));
+        }
+    }
 
     #[test]
     fn session_key_scope_includes_derivation_and_action_routes() {
