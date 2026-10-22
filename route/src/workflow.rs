@@ -213,9 +213,12 @@ fn sign_payload(
         signature_algorithm: "secp256k1-keccak256-recoverable".into(),
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
-        claim_assurance_evidence: None,
+        // Delegated actions have no new ceremony. Carry the full public
+        // action witness on the existing use-time evidence channel so Broker
+        // can still rebuild the signed bytes before releasing a signature.
+        claim_assurance_evidence: key_ref_jcs.as_ref().map(|_| payload.review.clone()),
         approval_hint,
-        action: None,
+        action: Some(payload.review.clone()),
         advisory,
         selector: if key_ref_jcs.is_some() {
             SignSelector::Reusable
@@ -374,6 +377,9 @@ pub fn owner_action_write(
     req: SignSubmit,
 ) -> DispatchResponse {
     if let Err(error) = req.action.validate() {
+        return invalid(error);
+    }
+    if let Err(error) = req.action.validate_owner_review() {
         return invalid(error);
     }
     let (nonce, pending_nonce_key, completed) = match owner_nonce(n, &w, operation, body, req.nonce)
@@ -2622,6 +2628,37 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_owner_batch_is_rejected_before_any_host_call() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![],
+            actor: None,
+        });
+        let req = SignSubmit {
+            action: ExchangeAction::Cancel {
+                cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }; 126],
+                fast: None,
+            },
+            nonce: None,
+            vault_address: None,
+            expires_after: None,
+        };
+        let response =
+            owner_action_write(&ctx, Network::Testnet, "main".into(), "cancel", b"{}", req);
+        assert!(
+            matches!(response, DispatchResponse::Error { code: -3, message } if message.contains("split the batch"))
+        );
+    }
 
     #[test]
     fn session_key_scope_includes_derivation_and_action_routes() {

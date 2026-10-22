@@ -69,6 +69,21 @@ submitted.
 
 ## Build
 
+Owner signature requests carry the full typed message or the exact exchange
+action, nonce, environment, vault and expiry to Broker for independent review.
+The exchange action's ordered MessagePack commitment is rebuilt before its
+hash is approved. Unknown market IDs remain explicitly unverified rather than
+borrowing a token name or logo. A venue agent authorization includes no
+spending ceiling or duration: Petal session limits are local controls, and
+the existing delegated-action approval covers later session actions.
+
+Delegated actions also carry the complete ordered action witness to Broker
+on every signing use. Broker rebuilds its exact preimage before permitting
+the signature, without adding an owner ceremony per trade. This does not
+promote local session limits to venue-enforced constraints or establish market
+identity, fills or settlement. Publish this package with the matching Broker;
+older hash-only agent callers cannot satisfy the use-time verification.
+
 ```sh
 scripts/check-route-architecture.sh
 scripts/build.sh
@@ -80,6 +95,26 @@ Run the host-side test suites with:
 ```sh
 cargo test --manifest-path route/Cargo.toml --locked
 ```
+
+The shared signing vectors in `route/tests/fixtures/hyperliquid-signing.json`
+freeze ordered MessagePack bytes and EIP-712 hashes for both environments,
+all five action types, optional fields, vault and expiry. Broker's companion
+test consumes the same fixture; update both copies together. Regenerate with
+`uv run --with hyperliquid-python-sdk==0.24.0 python scripts/generate-signing-vectors.py`.
+
+Owner-approved exchange batches must fit Broker's 256-field review limit.
+Oversized batches are rejected before approval or nonce reservation with an
+instruction to split the batch. The limit counts actual fields, including
+trigger details and client order IDs; delegated sessions keep their separate
+use-time verification bounds.
+
+Bloom PR [#224](https://github.com/bloom-directory/bloom/pull/224) adds the
+compiled producer regression in
+`crates/bloom-petals/tests/explicit_account_packages.rs`:
+`real_signing_producers_reach_the_host_with_selected_account_and_full_witness`.
+It runs the actual component against Machine's host boundary with a nonzero
+account, retained delegated KeyRef, exact preimage/hash and complete action
+witness. It uses fixture host outcomes and proves no live venue execution.
 
 ## Installation
 
