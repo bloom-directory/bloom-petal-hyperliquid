@@ -379,6 +379,9 @@ pub fn owner_action_write(
     if let Err(error) = req.action.validate() {
         return invalid(error);
     }
+    if let Err(error) = req.action.validate_owner_review() {
+        return invalid(error);
+    }
     let (nonce, pending_nonce_key, completed) = match owner_nonce(n, &w, operation, body, req.nonce)
     {
         Ok(x) => x,
@@ -2625,6 +2628,37 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_owner_batch_is_rejected_before_any_host_call() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![],
+            actor: None,
+        });
+        let req = SignSubmit {
+            action: ExchangeAction::Cancel {
+                cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }; 126],
+                fast: None,
+            },
+            nonce: None,
+            vault_address: None,
+            expires_after: None,
+        };
+        let response =
+            owner_action_write(&ctx, Network::Testnet, "main".into(), "cancel", b"{}", req);
+        assert!(
+            matches!(response, DispatchResponse::Error { code: -3, message } if message.contains("split the batch"))
+        );
+    }
 
     #[test]
     fn session_key_scope_includes_derivation_and_action_routes() {
