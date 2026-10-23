@@ -8,10 +8,25 @@ use serde::Serialize;
 /// The address is public on-chain data, not a credential. It is injected at
 /// build time rather than committed because this repository is public, and
 /// the cost is real: a tagged release cannot be rebuilt byte for byte from
-/// its source alone. What compensates is that the owner approves the address
-/// per use — every approval ceremony states the builder, the cap, and which
-/// source the address came from — so an unexpected or swapped builder is
-/// visible before a passkey tap, not discovered afterwards.
+/// its source alone.
+///
+/// An earlier version of this comment said the compensating control was that
+/// "every approval ceremony states the builder, the cap, and which source the
+/// address came from". **That is not true end to end at the pinned Bloom and
+/// Broker revisions.** The advisory this Petal builds is reduced to
+/// `advisory_digest` in `bloom-daemon`, `sign_or_prepare_petal` in
+/// `bloom-vfs::exact_signing` takes no advisory at all, and the pinned
+/// `bloom-broker-api` has no field for one; the Broker's ceremony does have an
+/// `attributed_advisory_items` list, but nothing outside its tests populates
+/// it. The digest binds the advisory to the signing identity, so a changed
+/// advisory invalidates an approval — it is bound and not displayed.
+///
+/// So today the owner taps a passkey over an opaque preimage. For an
+/// `approveBuilderFee` action the typed message does carry the builder and the
+/// rate, but only `hashStruct` enters the preimage, so neither is recoverable
+/// from what is shown. Until the advisory is delivered, the builder address is
+/// effectively approved sight unseen, which is tracked as a pre-merge gate in
+/// the pull request rather than papered over here.
 ///
 /// Set it as a lowercase `0x` address;
 /// `release_default_if_set_is_a_lowercase_address` checks whatever a build

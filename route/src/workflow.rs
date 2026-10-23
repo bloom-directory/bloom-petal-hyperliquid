@@ -1157,6 +1157,22 @@ struct BuilderFeeApproval {
     generation: u64,
 }
 
+/// Whether a stored approval record may be corroborated and answered from,
+/// rather than the approval being submitted again.
+///
+/// Extracted so the rule is reachable by a test: the call site sits in a route
+/// with no store or venue double, where deleting the whole guard left the
+/// suite green.
+fn may_corroborate_from_record(requested: u32, record: Option<&BuilderFeeApproval>) -> bool {
+    // A revocation is never answered from stored state. See the call site: the
+    // caller's belief that the builder can no longer charge is the point of
+    // revoking, and every input this shortcut rests on is a store key.
+    if requested == 0 {
+        return false;
+    }
+    record.is_some_and(|state| state.approved_tenths_bps == requested)
+}
+
 fn builder_fee_approval_key(n: Network, w: &str, resolved_builder: &str) -> String {
     state_key(&[
         "exchange",
@@ -1230,19 +1246,31 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         Ok(x) => x,
         Err(e) => return e,
     };
-    if approval
-        .as_ref()
-        .is_some_and(|state| state.approved_tenths_bps == req.max_fee_tenths_bps)
-    {
+    // A revocation is never answered from stored state, and never from this
+    // shortcut at all. Everything it rests on — the approval record, the owner
+    // address it probes with — is a store key, so a caller who writes 0 and
+    // reads success would believe the builder can no longer charge while it
+    // still can. That belief is the whole point of revoking, so a revocation
+    // always reaches the venue, at the cost of a ceremony on an operation that
+    // is rare and deliberate.
+    //
+    // For a cap being raised or kept the same, a false success fails closed
+    // instead: the builder is not authorized, so the order preflight refuses
+    // the order rather than letting an undisclosed fee through.
+    if may_corroborate_from_record(req.max_fee_tenths_bps, approval.as_ref()) {
         // This record is ours, not the venue's. Another client approving a
         // different cap for the same wallet leaves it stale, and answering
-        // from it alone would report success while the old cap stayed in
-        // force — most damagingly for a revocation, where the caller writes 0,
-        // reads success, and the builder keeps the cap it already had.
+        // from it alone would report a cap that is not in force.
+        //
+        // What this is NOT: proof. `cached_owner_address` is a store key and
+        // `/info` is proxied by the same Machine, so both inputs are within
+        // what Sealed Approvals already concedes a compromised Machine may
+        // lie about. This closes honest staleness; it is an optimization with
+        // a corroboration check, not a control.
         //
         // The owner address is only known here from an earlier signature, so
         // when it is not cached the shortcut is simply not taken: the approval
-        // then reaches the venue, which costs a ceremony and tells the truth.
+        // then reaches the venue.
         match cached_owner_address(&w)
             .map(|account| live_builder_fee_cap(n, &account, &resolved_builder))
         {
@@ -1310,11 +1338,14 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
-            if let Some(key) = pending_nonce_key
-                && let Err(e) = save_pending(&key, nonce, true)
-            {
-                return e;
-            }
+            // Order matters, and it used to be the wrong way round. Marking
+            // the nonce completed first meant a failed approval-record write
+            // left the identity completed at an unchanged generation, so the
+            // `completed` guard above answered every later retry of that body
+            // with success without ever reaching the venue — even after
+            // another client had changed the cap. Writing the record first
+            // leaves the opposite partial state, where nothing claims success
+            // and a retry re-approves.
             if let Err(e) = save_json(
                 approval_key,
                 &BuilderFeeApproval {
@@ -1323,6 +1354,11 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
                 },
                 false,
             ) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
                 return e;
             }
             ok_write()
@@ -1480,8 +1516,14 @@ fn builder_order_advisory(
     .into_bytes()
 }
 
-/// What the owner sees when approving a session created with a builder
+/// What the owner *would* see when approving a session created with a builder
 /// bound: the one builder its orders may pay, and the most they may pay it.
+///
+/// Not displayed at the pinned Bloom and Broker revisions — see
+/// `settings::EMBEDDED_DEFAULT_BUILDER_ADDRESS` for the chain that drops it.
+/// Note also that the refusal this text promises is a check against
+/// `session.json`, a store record, and neither the bound address nor the cap
+/// enters the Signer-enforced key scope.
 fn session_builder_bound_advisory(builder: &str, cap_tenths_bps: u32) -> Vec<u8> {
     format!(
         "This session may submit builder-fee orders only to builder {builder}, at most {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional; an order naming another builder or a higher fee is refused before signing.",
@@ -3031,19 +3073,37 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
         .ok()
 }
 
-/// The cap Hyperliquid currently has in force for this wallet and builder.
+/// The cap Hyperliquid reports in force for this wallet and builder.
 ///
-/// The venue is the only authority on this. Our own approval record is a cache
-/// of what this Petal last submitted, and another client approving for the
-/// same wallet makes it stale without this Petal ever hearing about it.
+/// More current than our own approval record, which is only what this Petal
+/// last submitted and goes stale the moment another client approves for the
+/// same wallet. Not authoritative in the strong sense: the request is proxied
+/// by the Machine, which Sealed Approvals already treats as able to lie.
 fn live_builder_fee_cap(n: Network, account: &str, builder: &str) -> Result<u64, DispatchResponse> {
     http_json(
         n,
         "/info",
         json!({"type": "maxBuilderFee", "user": account, "builder": builder}),
-    )?
+    )
+    // Without this a caller retrying an approval during an outage reads a bare
+    // transport or status error from an approval route and cannot tell a
+    // failed submission from a failed check.
+    .map_err(unverified_builder_fee_cap)?
     .as_u64()
     .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))
+    .map_err(unverified_builder_fee_cap)
+}
+
+/// Says that the approval was not attempted, which the underlying transport or
+/// status error cannot say for itself.
+fn unverified_builder_fee_cap(e: DispatchResponse) -> DispatchResponse {
+    let cause = match &e {
+        DispatchResponse::Error { message, .. } => message.clone(),
+        _ => "unknown error".to_owned(),
+    };
+    backend(format!(
+        "could not check the builder's currently approved cap with Hyperliquid, so nothing was submitted; the existing cap is unchanged and this is safe to retry: {cause}"
+    ))
 }
 
 /// Hyperliquid silently rejects a builder-fee order unless the account has
@@ -3420,6 +3480,48 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+    /// A false "already revoked" is the one answer a caller acts on as a
+    /// safety property: they stop expecting the builder to charge. Every
+    /// input the corroboration rests on is a store key, so a revocation is
+    /// never answered from one.
+    #[test]
+    fn a_revocation_is_never_answered_from_a_stored_record() {
+        use super::{BuilderFeeApproval, may_corroborate_from_record};
+        let record = |approved_tenths_bps| BuilderFeeApproval {
+            approved_tenths_bps,
+            generation: 1,
+        };
+        assert!(
+            !may_corroborate_from_record(0, Some(&record(0))),
+            "a revocation must reach the venue even when the record agrees"
+        );
+        // A cap being kept the same still corroborates: a false success there
+        // fails closed, because an unapproved builder's orders are refused by
+        // the order preflight.
+        assert!(may_corroborate_from_record(10, Some(&record(10))));
+        // A changed cap is a change, and a first-ever call has nothing to
+        // corroborate against.
+        assert!(!may_corroborate_from_record(10, Some(&record(20))));
+        assert!(!may_corroborate_from_record(10, None));
+    }
+
+    /// A caller retrying an approval during an `/info` outage used to read a
+    /// bare transport or status error from an approval route, and could not
+    /// tell a failed submission from a failed check.
+    #[test]
+    fn a_failed_cap_check_says_nothing_was_submitted() {
+        use super::unverified_builder_fee_cap;
+        let petal::DispatchResponse::Error { code, message } =
+            unverified_builder_fee_cap(petal::error(-4, "Hyperliquid API status 503: upstream"))
+        else {
+            panic!("must stay an error");
+        };
+        assert_eq!(code, -4);
+        assert!(message.contains("nothing was submitted"), "{message}");
+        assert!(message.contains("safe to retry"), "{message}");
+        // The cause survives, or the operator cannot tell what went wrong.
+        assert!(message.contains("status 503"), "{message}");
+    }
 
     #[test]
     fn the_builder_address_override_is_stored_under_its_declared_shared_key() {

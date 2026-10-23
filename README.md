@@ -160,9 +160,21 @@ credential; it is a build input only because this repository is public, and
 the cost is that a tagged release cannot be rebuilt byte for byte from source
 alone. With no default embedded and no override stored, callers must supply
 `builder` explicitly.
-Every approval ceremony states the builder address, the fee cap, and which of
-those three sources the address came from, so the owner never approves a
-recipient they cannot see.
+**Known gap, tracked as a pre-merge gate.** This Petal builds an advisory for
+every builder ceremony naming the builder address, the fee cap and which of
+those three sources it came from — and at the pinned Bloom and Broker
+revisions that text reaches no screen. `bloom-daemon` reduces it to
+`advisory_digest`, `sign_or_prepare_petal` takes no advisory parameter, and
+the pinned `bloom-broker-api` has no field for one. The digest is bound into
+the signing identity, so changing the advisory invalidates an approval: it is
+committed and not shown, which is why it reads like a working control.
+
+Until that is delivered, treat the builder address as approved sight unseen.
+`settings/builder-address` is an ordinary write with no ceremony of its own
+and is shared across every account of a wallet, so an agent that can write it
+can choose the recipient; what still bounds the agent is the on-chain cap the
+owner approved for that address and the venue's own ceilings, not anything the
+owner reads at approval time.
 
 ## Account-scoped routes
 
