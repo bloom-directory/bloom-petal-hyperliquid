@@ -3,38 +3,44 @@ use std::{collections::BTreeMap, env};
 use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
+const BUILDER_ORDER_INTENT: &str = "hyperliquid.builder_order";
+const SESSION_BUILDER_ORDER_ROUTE: (&str, &str) = (
+    "[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json",
+    "r000008",
+);
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
-        "r000008",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
         "r000009",
     ),
     (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
         "r000010",
     ),
     (
+        "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+        "r000011",
+    ),
+    (
         "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
-        "r000013",
+        "r000014",
     ),
     (
         "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
-        "r000019",
+        "r000020",
     ),
     (
         "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
-        "r000023",
+        "r000024",
     ),
 ];
-const DERIVATION_ROUTE: (&str, &str) = (
-    "[network]/agent_sessions/[wallet]/[index]/new.json",
-    "r000025",
-);
+const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/[index]/new.json", "r000026");
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
+    (
+        "[network]/exchange/[wallet]/[index]/approve_builder_fee.json",
+        "hyperliquid.approve_builder_fee",
+    ),
     (
         "[network]/exchange/[wallet]/[index]/cancel.json",
         "hyperliquid.cancel",
@@ -42,6 +48,10 @@ const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/[index]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
+    ),
+    (
+        "[network]/exchange/[wallet]/[index]/builder_order.json",
+        BUILDER_ORDER_INTENT,
     ),
     (
         "[network]/exchange/[wallet]/[index]/order.json",
@@ -113,25 +123,29 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
 
     // Inspect the exact packaged runtime source, not a second manifest-only
-    // list: request_session_key passes this constant to derive_key.
+    // list: request_session_key passes session_key_scope(..) to derive_key,
+    // which builds the scope from these two constants.
     let workflow = package
         .files
         .iter()
         .find(|file| file.path == "route/src/workflow.rs")
         .expect("packaged session runtime source");
     let workflow = std::str::from_utf8(&workflow.bytes).expect("UTF-8 runtime source");
-    let runtime_scope = workflow
-        .split("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [")
-        .nth(1)
-        .expect("runtime key scope declaration")
-        .split("];")
-        .next()
-        .unwrap();
-    let runtime_scope = runtime_scope
-        .split('"')
-        .enumerate()
-        .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
-        .collect::<Vec<_>>();
+    let quoted = |declaration: &str, end: &str| {
+        workflow
+            .split(declaration)
+            .nth(1)
+            .unwrap_or_else(|| panic!("runtime declaration {declaration}"))
+            .split(end)
+            .next()
+            .unwrap()
+            .split('"')
+            .enumerate()
+            .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
+            .collect::<Vec<_>>()
+    };
+    let runtime_scope = quoted("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [", "];");
+    let runtime_builder_route = quoted("const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = ", ";");
     let request = workflow
         .split("fn request_session_key(")
         .nth(1)
@@ -139,7 +153,17 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .split("fn session_key_slot(")
         .next()
         .unwrap();
-    assert!(request.contains("allowed_routes: SESSION_KEY_ALLOWED_ROUTES"));
+    assert!(request.contains("session_key_scope(builder_bound)"));
+    assert!(request.contains("allowed_routes,"));
+    let scope_fn = workflow
+        .split("fn session_key_scope(")
+        .nth(1)
+        .expect("runtime session key scope")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(scope_fn.contains("SESSION_KEY_ALLOWED_ROUTES"));
+    assert!(scope_fn.contains("routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned())"));
     let mut expected_scope = SESSION_ACTION_ROUTES
         .iter()
         .map(|(pattern, _)| {
@@ -155,8 +179,20 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         runtime_scope, expected_scope,
         "runtime derivation scope must match the exact package's action and creation routes"
     );
+    let builder_order_route = routes
+        .get(SESSION_BUILDER_ORDER_ROUTE.0)
+        .expect("session builder-order route")
+        .route_id
+        .as_str();
+    assert_eq!(
+        runtime_builder_route,
+        [builder_order_route],
+        "a builder-bound session key must be scoped to the exact package's session builder-order route"
+    );
 
-    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
+    let mut derived_classes = operation_classes(derivation);
+    derived_classes.sort_unstable();
+    assert_eq!(derived_classes, [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
@@ -194,6 +230,17 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
 
+    let builder_order = routes
+        .get(SESSION_BUILDER_ORDER_ROUTE.0)
+        .expect("session builder-order route");
+    assert_eq!(builder_order.route_id, SESSION_BUILDER_ORDER_ROUTE.1);
+    assert_eq!(
+        builder_order.install_metadata.sign_intent.as_deref(),
+        Some(BUILDER_ORDER_INTENT)
+    );
+    assert_eq!(required_caps(builder_order), ACTION_CAPS);
+    assert!(builder_order.key_derive_operation_classes.is_empty());
+
     let agent_action_routes = package
         .route_index
         .routes
@@ -221,4 +268,34 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert_eq!(required_caps(route), ACTION_CAPS, "{pattern}");
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
+}
+
+/// The package's only fee-bearing class must be the one the pinned Bloom
+/// catalogues with a fee asset, on both of the Machine's enrollment paths.
+/// Bloom's exact-signing check refuses a `{"kind":"fee"}` claim under a class
+/// catalogued fee-free (`FEE_NOT_ALLOWED`), so a pin whose enrollment writes
+/// `fee_asset: None` for every class cannot sign a builder order at all. The
+/// catalogue is private to the `bloom` binary, so this reads the enrollment
+/// source the check script's Bloom checkout provides; it runs from
+/// `crates/bloom-petals` inside that checkout.
+#[test]
+fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
+    let enrollment = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../bloom/src/triad_enrollment.rs");
+    let source = std::fs::read_to_string(&enrollment)
+        .unwrap_or_else(|error| panic!("read {}: {error}", enrollment.display()));
+    assert!(
+        source.contains(&format!(
+            "const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = \"{BUILDER_ORDER_INTENT}\";"
+        )),
+        "the pinned Bloom does not catalogue {BUILDER_ORDER_INTENT} as a fee-bearing class"
+    );
+    assert!(
+        source.matches("fee_asset: catalogued_fee_asset(").count() >= 2,
+        "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
+    );
+    assert!(
+        !source.contains("fee_asset: None"),
+        "the pinned Bloom still enrolls a class with an unconditional fee_asset: None"
+    );
 }
