@@ -1234,7 +1234,22 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         .as_ref()
         .is_some_and(|state| state.approved_tenths_bps == req.max_fee_tenths_bps)
     {
-        return ok_write();
+        // This record is ours, not the venue's. Another client approving a
+        // different cap for the same wallet leaves it stale, and answering
+        // from it alone would report success while the old cap stayed in
+        // force — most damagingly for a revocation, where the caller writes 0,
+        // reads success, and the builder keeps the cap it already had.
+        //
+        // The owner address is only known here from an earlier signature, so
+        // when it is not cached the shortcut is simply not taken: the approval
+        // then reaches the venue, which costs a ceremony and tells the truth.
+        match cached_owner_address(&w)
+            .map(|account| live_builder_fee_cap(n, &account, &resolved_builder))
+        {
+            Some(Ok(live)) if live == u64::from(req.max_fee_tenths_bps) => return ok_write(),
+            Some(Err(e)) => return e,
+            Some(Ok(_)) | None => {}
+        }
     }
     let generation = approval.as_ref().map_or(0, |state| state.generation);
     let identity = approve_builder_fee_identity(body, &resolved_builder, generation);
@@ -3016,6 +3031,21 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
         .ok()
 }
 
+/// The cap Hyperliquid currently has in force for this wallet and builder.
+///
+/// The venue is the only authority on this. Our own approval record is a cache
+/// of what this Petal last submitted, and another client approving for the
+/// same wallet makes it stale without this Petal ever hearing about it.
+fn live_builder_fee_cap(n: Network, account: &str, builder: &str) -> Result<u64, DispatchResponse> {
+    http_json(
+        n,
+        "/info",
+        json!({"type": "maxBuilderFee", "user": account, "builder": builder}),
+    )?
+    .as_u64()
+    .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))
+}
+
 /// Hyperliquid silently rejects a builder-fee order unless the account has
 /// already signed a separate `approveBuilderFee` action authorizing at least
 /// the requested rate for that builder. Checking this ourselves turns that
@@ -3033,14 +3063,7 @@ fn ensure_builder_fee_is_approved(
     else {
         return Ok(());
     };
-    let response = http_json(
-        n,
-        "/info",
-        json!({"type": "maxBuilderFee", "user": account, "builder": builder.address}),
-    )?;
-    let approved = response
-        .as_u64()
-        .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))?;
+    let approved = live_builder_fee_cap(n, account, &builder.address)?;
     if approved < u64::from(builder.fee_tenths_bps) {
         return Err(invalid(format!(
             "builder {} is not yet approved for a fee of {} tenths of a basis point (currently approved up to {approved}); call approve_builder_fee.json for this builder before placing this order",

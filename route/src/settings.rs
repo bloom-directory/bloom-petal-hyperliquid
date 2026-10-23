@@ -25,7 +25,44 @@ use serde::Serialize;
 /// approval, so the two are named apart throughout: address and fee here,
 /// code there.
 pub const EMBEDDED_DEFAULT_BUILDER_ADDRESS: Option<&str> =
-    option_env!("HYPERLIQUID_BUILDER_ADDRESS");
+    checked_embedded_builder_address(option_env!("HYPERLIQUID_BUILDER_ADDRESS"));
+
+/// Rejects a malformed embedded builder address while compiling.
+///
+/// `option_env!` takes whatever the build environment holds, and this value
+/// used to be parsed only when an order was placed: a release built with
+/// `HYPERLIQUID_BUILDER_ADDRESS=abc` compiled every route and packaged
+/// cleanly, failing at runtime on a Petal nobody could use. The release
+/// workflow does not run the test that catches that, and the env var can be
+/// set without going through `scripts/build.sh` at all, so the check has to be
+/// the build itself.
+///
+/// Lowercase is required rather than normalized, for the same reason
+/// `approve_builder_fee` requires it: the per-order builder field must match
+/// an approval byte for byte, so the two can never drift.
+const fn checked_embedded_builder_address(value: Option<&str>) -> Option<&str> {
+    let Some(address) = value else {
+        return None;
+    };
+    let bytes = address.as_bytes();
+    // A build that sets nothing has no default; an empty value says the same.
+    if bytes.is_empty() {
+        return None;
+    }
+    assert!(
+        bytes.len() == 42 && bytes[0] == b'0' && bytes[1] == b'x',
+        "HYPERLIQUID_BUILDER_ADDRESS must be 0x followed by 40 lowercase hex digits"
+    );
+    let mut i = 2;
+    while i < 42 {
+        assert!(
+            matches!(bytes[i], b'0'..=b'9' | b'a'..=b'f'),
+            "HYPERLIQUID_BUILDER_ADDRESS must be 0x followed by 40 lowercase hex digits"
+        );
+        i += 1;
+    }
+    Some(address)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +142,39 @@ pub fn default_builder_address_status(store_override: Option<&str>) -> BuilderAd
 
 #[cfg(test)]
 mod tests {
+    /// A release built with a malformed address used to package cleanly and
+    /// fail only when an order was placed. These exercise the same `const fn`
+    /// the build evaluates; a bad value makes `cargo build` itself fail, which
+    /// a test in this crate cannot assert from the inside.
+    #[test]
+    fn an_embedded_builder_address_must_be_lowercase_hex() {
+        assert_eq!(
+            super::checked_embedded_builder_address(Some(
+                "0xabcdef0123456789abcdef0123456789abcdef01"
+            )),
+            Some("0xabcdef0123456789abcdef0123456789abcdef01")
+        );
+        // A build that sets nothing, or sets it empty, has no default.
+        assert_eq!(super::checked_embedded_builder_address(None), None);
+        assert_eq!(super::checked_embedded_builder_address(Some("")), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "40 lowercase hex digits")]
+    fn a_short_embedded_builder_address_is_refused() {
+        let _ = super::checked_embedded_builder_address(Some("abc"));
+    }
+
+    #[test]
+    #[should_panic(expected = "40 lowercase hex digits")]
+    fn an_uppercase_embedded_builder_address_is_refused() {
+        // Normalizing would let the embedded default drift from the per-order
+        // builder field, which must match an approval byte for byte.
+        let _ = super::checked_embedded_builder_address(Some(
+            "0xABCDEF0123456789ABCDEF0123456789ABCDEF01",
+        ));
+    }
+
     use super::*;
 
     #[test]

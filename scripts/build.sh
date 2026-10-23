@@ -14,6 +14,10 @@ if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
     echo "PETAL_COMPILE_TIME_SECRET is set but empty" >&2
     exit 1
   fi
+  if [[ ! "$PETAL_COMPILE_TIME_SECRET" =~ ^0x[0-9a-f]{40}$ ]]; then
+    echo "PETAL_COMPILE_TIME_SECRET must be a builder address: 0x followed by 40 lowercase hex digits" >&2
+    exit 1
+  fi
   export HYPERLIQUID_BUILDER_ADDRESS="$PETAL_COMPILE_TIME_SECRET"
   unset PETAL_COMPILE_TIME_SECRET
 fi
