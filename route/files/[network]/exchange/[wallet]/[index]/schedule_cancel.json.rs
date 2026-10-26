@@ -3,7 +3,18 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid schedule_cancel.json request; signed actions require Bloom approval"
+            "description": "schedule or clear Hyperliquid's dead-man's-switch cancellation as the wallet owner; the first write stages it for the owner's Bloom approval and fails with approval required; after the owner approves, write the exact same body again to submit it",
+            "request_schema": {
+                "action": {"type": "scheduleCancel", "time": "optional Unix timestamp in milliseconds; omit to clear the schedule"},
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds",
+                "vaultAddress": "optional 0x vault or subaccount address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "examples": {
+                "schedule": {"action": {"type": "scheduleCancel", "time": "<Unix ms at least 5 seconds from now>"}},
+                "clear": {"action": {"type": "scheduleCancel"}}
+            },
+            "success_evidence": "after the repeated write, last_response.json has status ok; it holds only the latest owner exchange response for this account"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

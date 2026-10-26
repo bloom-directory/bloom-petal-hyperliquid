@@ -3,7 +3,22 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid cancel_by_cloid.json request; signed actions require Bloom approval"
+            "description": "cancel orders as the wallet owner by client order id; the first write stages it for the owner's Bloom approval and fails with approval required; after the owner approves, write the exact same body again to submit it",
+            "request_schema": {
+                "action": {
+                    "type": "cancelByCloid",
+                    "cancels": [{"asset": "the order's asset index (see order.json)", "cloid": "16-byte 0x client order id"}]
+                },
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds",
+                "vaultAddress": "optional 0x vault or subaccount address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "example": {"action": {"type": "cancelByCloid", "cancels": [{"asset": 0, "cloid": "0x00112233445566778899aabbccddeeff"}]}},
+            "success_evidence": {
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "predicate": "no open order has the canceled cloid",
+                "notes": "Read owner_address from wallets/<wallet>/<index>/address.evm"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

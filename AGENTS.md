@@ -34,6 +34,14 @@ storage, idempotency, session policy, and multi-step exchange operations.
 Run `scripts/check-route-architecture.sh` after changing route files or shared
 route code.
 
+Use mainnet unless the user names testnet. Deposits to Hyperliquid come from
+Arbitrum; this Petal has no deposit route. Order and cancel bodies take an
+asset index, not a coin name: a perpetual's position in the `universe` array
+of `<network>/perp_meta.json`, which differs between mainnet and testnet.
+Omit `nonce` unless retrying an expired approval; an explicit nonce must be
+the current Unix time in milliseconds. `last_response.json` is `null` until
+the first venue response.
+
 Never infer that a staged transaction, approval challenge, or accepted route
 write means a broadcast or fill completed. Do not use mainnet with material
 funds without explicit authorization.
