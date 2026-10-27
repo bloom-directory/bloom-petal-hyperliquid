@@ -8,6 +8,7 @@ use sha3::{Digest, Keccak256};
 pub struct SigningPayload {
     pub preimage: Vec<u8>,
     pub hash: B256,
+    pub review: Vec<u8>,
 }
 
 fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
@@ -16,7 +17,15 @@ fn typed_signing_payload(td: &TypedData) -> Result<SigningPayload, String> {
     preimage.extend_from_slice(td.domain().separator().as_slice());
     preimage.extend_from_slice(td.hash_struct().map_err(|e| e.to_string())?.as_slice());
     let hash = B256::from_slice(&Keccak256::digest(&preimage));
-    Ok(SigningPayload { preimage, hash })
+    let review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"eip712", "typed_data":td
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(SigningPayload {
+        preimage,
+        hash,
+        review,
+    })
 }
 
 pub const MAINNET_URL: &str = "https://api.hyperliquid.xyz";
@@ -139,6 +148,24 @@ pub enum ExchangeAction {
     },
 }
 impl ExchangeAction {
+    /// Broker reserves four fields for network, nonce, vault and expiry.
+    /// Count the serialized leaves so optional client IDs and trigger fields
+    /// consume the same budget as they do in the owner review.
+    pub fn validate_owner_review(&self) -> Result<(), String> {
+        fn leaves(value: &Value) -> usize {
+            match value {
+                Value::Object(values) => values.values().map(leaves).sum::<usize>().max(1),
+                Value::Array(values) => values.iter().map(leaves).sum::<usize>().max(1),
+                _ => 1,
+            }
+        }
+        let action = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        if 4 + leaves(&action) > 256 {
+            return Err("action exceeds Broker's 256-field owner review limit; split the batch into smaller requests".into());
+        }
+        Ok(())
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Order { .. } => "order",
@@ -511,10 +538,18 @@ pub fn l1_signing_payload(
     vault: Option<Address>,
     expires: Option<u64>,
 ) -> Result<SigningPayload, String> {
-    typed_signing_payload(&typed_agent(
+    let mut payload = typed_signing_payload(&typed_agent(
         network,
         action_hash(action, nonce, vault, expires)?,
-    )?)
+    )?)?;
+    payload.review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"hyperliquid_l1",
+        "network":match network { Network::Mainnet => "mainnet", Network::Testnet => "testnet" },
+        "action":action, "nonce":nonce,
+        "vault_address":vault.map(|address| format!("{address:#x}")), "expires_after":expires
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(payload)
 }
 fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData, String> {
     let (type_name, type_fields) = match kind {
@@ -911,6 +946,95 @@ mod tests {
         ExchangeAction::Cancel {
             cancels: vec![CancelWire { asset: 0, oid: 42 }],
             fast: None,
+        }
+    }
+
+    #[test]
+    fn shared_signing_vectors_freeze_ordered_bytes_and_hashes() {
+        let vectors: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/hyperliquid-signing.json"))
+                .unwrap();
+        assert_eq!(vectors.len(), 40);
+        for vector in vectors {
+            let action: ExchangeAction = serde_json::from_value(vector["action"].clone()).unwrap();
+            let nonce = vector["nonce"].as_u64().unwrap();
+            let vault = vector["vault_address"]
+                .as_str()
+                .map(|s| parse_address(s).unwrap());
+            let expires = vector["expires_after"].as_u64();
+            assert_eq!(
+                hex::encode(rmp_serde::to_vec_named(&action).unwrap()),
+                vector["messagepack"],
+                "{vector}"
+            );
+            assert_eq!(
+                format!(
+                    "{:#x}",
+                    action_hash(&action, nonce, vault, expires).unwrap()
+                ),
+                vector["action_hash"],
+                "{vector}"
+            );
+            let payload = l1_signing_payload(
+                Network::parse(vector["network"].as_str().unwrap()).unwrap(),
+                &action,
+                nonce,
+                vault,
+                expires,
+            )
+            .unwrap();
+            assert_eq!(
+                hex::encode(payload.preimage),
+                vector["preimage"],
+                "{vector}"
+            );
+            assert_eq!(format!("{:#x}", payload.hash), vector["hash"], "{vector}");
+        }
+    }
+
+    #[test]
+    fn owner_review_rejects_batches_at_the_actual_field_boundary() {
+        for (item, accepted) in [
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}}}),
+                41,
+            ),
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"limit":{"tif":"Gtc"}},"c":"0x00000000000000000000000000000001"}),
+                35,
+            ),
+            (
+                json!({"a":0,"b":true,"p":"100","s":"0.01","r":false,"t":{"trigger":{"isMarket":true,"triggerPx":"110","tpsl":"tp"}},"c":"0x00000000000000000000000000000001"}),
+                27,
+            ),
+        ] {
+            for count in [accepted, accepted + 1] {
+                let action: ExchangeAction = serde_json::from_value(
+                    json!({"type":"order","orders":vec![item.clone(); count],"grouping":"na"}),
+                )
+                .unwrap();
+                action.validate().unwrap();
+                let result = action.validate_owner_review();
+                if count == accepted {
+                    result.unwrap();
+                } else {
+                    assert!(result.unwrap_err().contains("split the batch"));
+                }
+            }
+        }
+        // Four context fields + type + 125 two-field cancellations + fast = 256.
+        for fast in [None, Some(true)] {
+            let mut action = ExchangeAction::Cancel {
+                cancels: vec![CancelWire { asset: 0, oid: 42 }; 125],
+                fast,
+            };
+            action.validate_owner_review().unwrap();
+            if let ExchangeAction::Cancel { cancels, .. } = &mut action {
+                cancels.push(CancelWire { asset: 0, oid: 43 });
+            }
+            assert!(action.validate_owner_review().is_err());
+            // Display validation must not impose the owner limit on delegated uses.
+            action.validate().unwrap();
         }
     }
 
@@ -1572,6 +1696,11 @@ mod tests {
         let (_, expected) = approve_agent_hash(Network::Testnet, agent, "bloom-test", 99).unwrap();
         let (_, payload) =
             approve_agent_payload(Network::Testnet, agent, "bloom-test", 99).unwrap();
+        let review: Value = serde_json::from_slice(&payload.review).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["kind"], "eip712");
+        let typed: TypedData = serde_json::from_value(review["typed_data"].clone()).unwrap();
+        assert_eq!(typed.eip712_signing_hash().unwrap(), payload.hash);
         assert_eq!(payload.hash, expected);
         assert_eq!(
             B256::from_slice(&Keccak256::digest(&payload.preimage)),
@@ -1581,6 +1710,11 @@ mod tests {
         let action = cancel();
         let expected = l1_signing_hash(Network::Mainnet, &action, 123, None, None).unwrap();
         let payload = l1_signing_payload(Network::Mainnet, &action, 123, None, None).unwrap();
+        let review: Value = serde_json::from_slice(&payload.review).unwrap();
+        assert_eq!(review["kind"], "hyperliquid_l1");
+        assert_eq!(review["action"], serde_json::to_value(&action).unwrap());
+        assert_eq!(review["nonce"], 123);
+        assert_eq!(review["network"], "mainnet");
         assert_eq!(payload.hash, expected);
         assert_eq!(
             B256::from_slice(&Keccak256::digest(&payload.preimage)),

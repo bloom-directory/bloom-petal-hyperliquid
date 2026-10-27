@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PETAL_REV="864a80b407387871bae06aabe77b91865e55f7bc"
+PETAL_REV="2beed2ff344ce2b0c112e07096027e1ae0404007"
 
 # A release build embeds this release's default builder address. The release
 # workflow passes it as the generic PETAL_COMPILE_TIME_SECRET; re-export it

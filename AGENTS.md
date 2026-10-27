@@ -15,25 +15,16 @@ implement Hyperliquid's generalized `sendAsset` action. An order carrying a
 per-order `builder` fee is written to `builder_order.json` (owner-signed, or
 through the session route of the same name), which signs under
 `hyperliquid.builder_order`, the Petal's only fee-bearing operation class;
-`order.json` refuses a builder. Its authorization claim declares the fee asset
-(Hyperliquid USDC) and an upper bound on the amount the venue will charge; the
-builder address and rate are committed in the signed order payload and shown
-in the owner's approval advisory, not carried in the claim. The bound uses
-each leg's limit price. A buy fills at or below its limit; a builder-bearing
-sell must be post-only (`Alo`), since a crossing sell fills at the resting bid,
-which no order price caps, while a post-only sell fills at exactly its limit.
-Spot buys pay no builder fee and add nothing, and an order of only spot buys
-is refused. A builder-bearing trigger order is refused, since it fills at the
-market once triggered. Hyperliquid collects the builder fee in the market's
-quote or collateral asset and the claim declares USDC, so a builder-bearing
-leg is accepted only where the fee is known to be USDC: core perps, and spot
-sells on pairs quoted in USDC (read from `spotMeta`; a spot buy pays no fee).
-A spot sell on a pair quoted in another token is refused. HIP-3 perps and
-outcome markets are refused too: this Petal does not look up their fee asset,
-which for HIP-3 depends on the dex. A delegated session may use a builder fee only
-if it was created with a matching `builder_address`/`max_builder_fee_tenths_bps`
-bound, which is also what adds the builder-order route and class to that
-session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
+`order.json` refuses a builder. What is refused, and why the bound is what it
+is, is set out in README.md; the rules that decide whether
+a call succeeds are: a builder-bearing sell must be post-only (`Alo`); a
+builder-bearing trigger order is refused; an order of only spot buys is
+refused; and a builder-bearing leg is accepted only where the fee is known to
+be USDC, meaning core perps and spot sells on USDC-quoted pairs, so HIP-3
+perps, outcome markets and spot sells quoted in another token are refused. A
+delegated session may use a builder fee only if it was created with a matching
+`builder_address`/`max_builder_fee_tenths_bps` bound, which is also what adds
+the fee-bearing class to that session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
 settlement proof. Operation records are listed at `withdrawals/` and readable

@@ -20,8 +20,8 @@ fee-bearing operation class, so Bloom can enroll that class with a fee asset
 while every other class stays fee-free. Its authorization claim declares the
 fee asset (Hyperliquid USDC) and an upper bound on the amount the venue will
 charge, never a claim that declares no fee; the builder address and rate are
-committed in the signed order payload and shown in the owner's approval
-advisory, not carried in the claim. The bound uses each leg's limit price. A buy fills at or below its limit; a
+committed in the signed order payload, which is forwarded for owner review as
+a `bloom.message.review.v1` envelope rather than carried in the claim. The bound uses each leg's limit price. A buy fills at or below its limit; a
 builder-bearing sell must be post-only (`Alo`), since a crossing sell fills at
 the resting bid, which no order price caps, while a post-only sell fills at
 exactly its limit. Spot buys pay no builder fee and add nothing, and an order
@@ -38,7 +38,7 @@ fee asset, which for HIP-3 depends on the dex.
 deliberately absent from the delegated agent session surface. A delegated
 session may use a builder fee only if it was created with a matching
 `builder_address`/`max_builder_fee_tenths_bps` bound. Agent sessions provide
-owner-approved creation, bounded Signer-owned agent-key actions, stop,
+owner-approved creation, bounded Signer-owned agent-key actions,
 cancel-all, close-all, audit, and immutable action receipts keyed by client
 order ID under
 `receipts/<cloid>/{order,cancel}.json`. These receipts correlate a specific
@@ -77,9 +77,25 @@ agent-session key scopes.
 
 Session actions that accept structured request bodies use JSON leaves, including
 `order.json`, `cancel.json`, and `update_leverage.json`. Lifecycle cleanup uses
-extensionless command leaves: `cancel_all`, `close_all`, and `stop`. Read each
-leaf before writing and use its exact path; do not append `.json` to a command
+extensionless command leaves: `cancel_all` and `close_all`. Read each leaf
+before writing and use its exact path; do not append `.json` to a command
 leaf.
+
+There is no local `stop` leaf: stopping a session is the core
+`wallets/<w>/<index>/sessions/hyperliquid/<key-slot>/stop` write, which revokes the
+session's approvals through Broker. `cancel_all` and `close_all` survive a
+stop or expiry: when the session's delegated key is refused, or the session
+has already expired, they submit as the wallet owner with a fresh
+payload-specific Exact approval, which the stop does not revoke, so a stopped
+session cannot strand open orders. Retry the same write after completing that
+ceremony: a pending `close_all` replays the order the owner is approving until
+that approval expires, rather than repricing it from new mids.
+
+The Petal receives only a bare denial, so any refused delegated attempt, not
+only a stop, moves cleanup to owner approval. A core stop also leaves this
+Petal's `status.json` at `stopped: false`; the core
+`wallets/<w>/<index>/sessions/hyperliquid/<key-slot>/session.json` `stop` record is
+authoritative.
 
 Session key provisioning remains pending through two Bloom authority steps:
 the key-derivation custody ceremony and one reusable Sealed Approval covering
@@ -102,7 +118,27 @@ rotating its agent key. A successful write means the route completed; inspect
 the durable response, status, and error files before treating an action as
 submitted.
 
+The session key's usable routes are declared by canonical patterns in
+`petal.toml`. Bloom resolves them to package-local route IDs while packaging;
+route code does not hardcode generated IDs, so adding or reordering routes
+cannot silently change the key scope.
+
 ## Build
+
+Owner signature requests carry the full typed message or the exact exchange
+action, nonce, environment, vault and expiry to Broker for independent review.
+The exchange action's ordered MessagePack commitment is rebuilt before its
+hash is approved. Unknown market IDs remain explicitly unverified rather than
+borrowing a token name or logo. A venue agent authorization includes no
+spending ceiling or duration: Petal session limits are local controls, and
+the existing delegated-action approval covers later session actions.
+
+Delegated actions also carry the complete ordered action witness to Broker
+on every signing use. Broker rebuilds its exact preimage before permitting
+the signature, without adding an owner ceremony per trade. This does not
+promote local session limits to venue-enforced constraints or establish market
+identity, fills or settlement. Publish this package with the matching Broker;
+older hash-only agent callers cannot satisfy the use-time verification.
 
 ```sh
 scripts/check-route-architecture.sh
@@ -115,6 +151,26 @@ Run the host-side test suites with:
 ```sh
 cargo test --manifest-path route/Cargo.toml --locked
 ```
+
+The shared signing vectors in `route/tests/fixtures/hyperliquid-signing.json`
+freeze ordered MessagePack bytes and EIP-712 hashes for both environments,
+all five action types, optional fields, vault and expiry. Broker's companion
+test consumes the same fixture; update both copies together. Regenerate with
+`uv run --with hyperliquid-python-sdk==0.24.0 python scripts/generate-signing-vectors.py`.
+
+Owner-approved exchange batches must fit Broker's 256-field review limit.
+Oversized batches are rejected before approval or nonce reservation with an
+instruction to split the batch. The limit counts actual fields, including
+trigger details and client order IDs; delegated sessions keep their separate
+use-time verification bounds.
+
+Bloom PR [#224](https://github.com/bloom-directory/bloom/pull/224) adds the
+compiled producer regression in
+`crates/bloom-petals/tests/explicit_account_packages.rs`:
+`real_signing_producers_reach_the_host_with_selected_account_and_full_witness`.
+It runs the actual component against Machine's host boundary with a nonzero
+account, retained delegated KeyRef, exact preimage/hash and complete action
+witness. It uses fixture host outcomes and proves no live venue execution.
 
 ## Installation
 
@@ -150,31 +206,38 @@ Petal SDK are locked in `route/Cargo.lock`.
 ## Default builder address
 
 `approve_builder_fee.json` resolves its builder as: the request's explicit
-`builder`, else the operator override written to `settings/builder-address`,
-else this release's default, `EMBEDDED_DEFAULT_BUILDER_ADDRESS` in
+`builder`, else this release's default, `EMBEDDED_DEFAULT_BUILDER_ADDRESS` in
 `route/src/settings.rs`. A release build embeds that from the
 `HYPERLIQUID_BUILDER_ADDRESS` repository secret, passed to the pinned release
 workflow as its generic `compile-time-secret` input and re-exported by
 `scripts/build.sh`. The address is public on-chain data rather than a
 credential; it is a build input only because this repository is public, and
 the cost is that a tagged release cannot be rebuilt byte for byte from source
-alone. With no default embedded and no override stored, callers must supply
-`builder` explicitly.
-**Known gap, tracked as a pre-merge gate.** This Petal builds an advisory for
-every builder ceremony naming the builder address, the fee cap and which of
-those three sources it came from — and at the pinned Bloom and Broker
-revisions that text reaches no screen. `bloom-daemon` reduces it to
-`advisory_digest`, `sign_or_prepare_petal` takes no advisory parameter, and
-the pinned `bloom-broker-api` has no field for one. The digest is bound into
-the signing identity, so changing the advisory invalidates an approval: it is
-committed and not shown, which is why it reads like a working control.
+alone. With no default embedded, callers must supply `builder` explicitly.
 
-Until that is delivered, treat the builder address as approved sight unseen.
-`settings/builder-address` is an ordinary write with no ceremony of its own
-and is shared across every account of a wallet, so an agent that can write it
-can choose the recipient; what still bounds the agent is the on-chain cap the
-owner approved for that address and the venue's own ceilings, not anything the
-owner reads at approval time.
+There is deliberately no operator override. One existed and was removed: it
+only changed which builder a `builder`-omitting `approve_builder_fee.json`
+call named, which any caller can already choose explicitly, so it added no
+capability — while adding a ceremony-free write, shared across every account
+of the wallet, that silently changed what later default approvals would name.
+
+**Pre-merge gate: Bloom #224 and Broker #103.** What makes the builder address
+and rate visible to the owner is the signed typed data, not an advisory. Every
+signing payload now carries a `bloom.message.review.v1` envelope — the EIP-712
+typed data for `approveBuilderFee`, and the `hyperliquid_l1` action for orders
+— which `sign_payload` forwards. Broker #103's `message_review` decodes that
+envelope, checks it against the exact preimage hash and renders each typed
+leaf, labelling `action.builder.b` and `action.builder.f` as the builder fee
+recipient and rate. Until #224 and #103 land, those leaves are not rendered.
+
+The envelope is also why this branch must stay merged with `main`: Bloom #224's
+`petal_review_payload` refuses any secp256k1 payload beginning with `0x19` that
+carries no envelope, so `approve_builder_fee.json` and the owner
+`builder_order.json` would both be refused without it.
+
+The Petal's own advisory text remains undelivered at the pinned revisions and
+is a weaker, separate concern: it is asserted prose, whereas the envelope is
+checked against the hash that gets signed.
 
 ## Account-scoped routes
 

@@ -33,8 +33,18 @@ allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyp
 [[key.derive]]
 route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["hyperliquid.agent_action", "hyperliquid.builder_order"]
+allowed_routes = [
+  "[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+  "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
+]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 86400000
 
 [store]
 namespaces = ["state"]
-shared_keys = ["state/settings/builder-address"]
 secret_namespaces = ["secrets"] # approval reconciliation only; never key material

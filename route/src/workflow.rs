@@ -13,19 +13,6 @@ use petal::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const CLOSE_SLIPPAGE: f64 = 0.05;
-// r000026 is the session-creation route that invokes derive_key. The Machine
-// host requires the executing route to be part of the immutable derived-key
-// scope, alongside the routes that later use the session key. Machine derives
-// one route-specific reusable Sealed Approval from this installer-verified set
-// before it reports the key ready; action routes reuse it by KeyRef.
-const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [
-    "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
-];
-/// `[session]/builder_order.json`. Added to a session key's scope, together
-/// with `BUILDER_ORDER_INTENT`, only when the session was created with a
-/// builder bound; a session without one has no builder fee to authorize.
-const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = "r000008";
-
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimEffects {
     declared_debits: Vec<Value>,
@@ -347,17 +334,15 @@ fn network(ctx: &Ctx) -> Result<Network, DispatchResponse> {
     Network::parse(p(ctx, "network")?).map_err(invalid)
 }
 fn wallet(ctx: &Ctx) -> Result<String, DispatchResponse> {
-    parse_wallet_id(p(ctx, "wallet")?).map_err(invalid)
+    petal::wallet_param(ctx).map(str::to_owned)
 }
 pub fn parse_wallet_id(raw: &str) -> Result<String, String> {
-    if raw.is_empty() || raw.len() > 128 || raw.chars().any(|c| c.is_control() || c == '/') {
-        return Err("wallet id must be 1-128 characters without '/' or control characters".into());
-    }
-    Ok(raw.to_owned())
+    petal::validate_wallet_id(raw).map(str::to_owned)
 }
 fn state_key(parts: &[&str]) -> String {
     format!("state/{}", parts.join("/"))
 }
+
 fn save_json(
     key: String,
     v: &(impl Serialize + ?Sized),
@@ -471,9 +456,12 @@ fn sign_payload(
         signature_algorithm: "secp256k1-keccak256-recoverable".into(),
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
-        claim_assurance_evidence: None,
+        // Delegated actions have no new ceremony. Carry the full public
+        // action witness on the existing use-time evidence channel so Broker
+        // can still rebuild the signed bytes before releasing a signature.
+        claim_assurance_evidence: key_ref_jcs.as_ref().map(|_| payload.review.clone()),
         approval_hint,
-        action: None,
+        action: Some(payload.review.clone()),
         advisory,
         selector: if key_ref_jcs.is_some() {
             SignSelector::Reusable
@@ -652,6 +640,9 @@ pub fn owner_action_write(
     if let Err(error) = req.action.validate() {
         return invalid(error);
     }
+    if let Err(error) = req.action.validate_owner_review() {
+        return invalid(error);
+    }
     let (nonce, pending_nonce_key, completed) = match owner_nonce(n, &w, operation, body, req.nonce)
     {
         Ok(x) => x,
@@ -820,6 +811,29 @@ struct PendingNonce {
     action_id: Option<String>,
     #[serde(default)]
     completed: bool,
+}
+/// A cleanup action waiting on the owner's Exact approval. The approval covers
+/// one payload, and `close_all` prices from live mids, so rebuilding on the
+/// retry would sign a different order and open another ceremony. The retry
+/// replays this action instead until the approval expires or it is submitted.
+#[derive(Debug, Serialize, Deserialize)]
+struct CleanupReplay {
+    action: ExchangeAction,
+    expires_ms: u64,
+}
+fn live_cleanup_replay(pending: Option<CleanupReplay>, now_ms: u64) -> Option<ExchangeAction> {
+    pending
+        .filter(|pending| pending.expires_ms > now_ms)
+        .map(|pending| pending.action)
+}
+fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    match petal::sdk::store_del(key) {
+        Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
+        Err(e) => Err(backend(e.message())),
+    }
 }
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     let now = petal::sdk::now_ms();
@@ -1048,74 +1062,10 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
-/// Shared across every wallet account, so the global `settings/` route and
-/// the account-scoped `approve_builder_fee.json` see the same value. The SDK
-/// adds the `state` namespace itself, so this key must not repeat it: the
-/// host's canonical key must equal the `[store].shared_keys` entry in
-/// petal.toml, `state/settings/builder-address`, or each account would read
-/// its own (empty) copy.
-const BUILDER_ADDRESS_OVERRIDE_KEY: &str = "settings/builder-address";
-
-fn builder_address_override_key() -> String {
-    BUILDER_ADDRESS_OVERRIDE_KEY.to_owned()
-}
-
-/// Reads the operator-set builder-address override, if any. Stored as plain
-/// UTF-8 bytes, not JSON, in the "state" namespace — a builder address is
-/// public data, not a credential, so it does not belong in the secret store.
-fn builder_address_override() -> Result<Option<String>, DispatchResponse> {
-    let bytes = load_bytes(&builder_address_override_key())?;
-    Ok(bytes
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty()))
-}
-
 /// Reports which builder address `approve_builder_fee.json` would use as its
 /// default today, and why, for `settings/status.json`.
-pub fn builder_address_status() -> Result<settings::BuilderAddressStatus, DispatchResponse> {
-    let store_override = builder_address_override()?;
-    Ok(settings::default_builder_address_status(
-        store_override.as_deref(),
-    ))
-}
-
-/// Sets or clears the operator-set builder-address override for
-/// `settings/builder-address`. An empty body clears the override, reverting
-/// to this release's default, if any.
-pub fn set_builder_address_override(body: &[u8]) -> DispatchResponse {
-    let key = builder_address_override_key();
-    match parse_builder_address_override(body) {
-        Ok(None) => match petal::sdk::store_del(&key) {
-            Ok(()) => ok_write(),
-            Err(e) => backend(e.message()),
-        },
-        Ok(Some(address)) => match petal::sdk::store_put(&key, address.as_bytes(), false) {
-            Ok(()) => ok_write(),
-            Err(e) => backend(e.message()),
-        },
-        Err(e) => invalid(e),
-    }
-}
-
-/// The address a `settings/builder-address` write stores, or `None` to clear
-/// the override. Surrounding whitespace is trimmed (so `echo addr >` works);
-/// anything else that is not a lowercase 0x address is refused.
-fn parse_builder_address_override(body: &[u8]) -> Result<Option<&str>, String> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| "builder address must be UTF-8".to_owned())?
-        .trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    protocol::parse_address(text)?;
-    // Required lowercase for the same reason as the per-order and approval
-    // builder fields: a stored override must match what orders will send
-    // byte-for-byte, never silently normalized.
-    if text != text.to_ascii_lowercase() {
-        return Err("builder address must be lowercase".into());
-    }
-    Ok(Some(text))
+pub fn builder_address_status() -> settings::BuilderAddressStatus {
+    settings::default_builder_address_status()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1198,24 +1148,14 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid approve_builder_fee body: {e}")),
     };
-    let store_override = match builder_address_override() {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    let resolved_builder = match settings::resolve_default_builder_address(
-        req.builder.as_deref(),
-        store_override.as_deref(),
-    ) {
+    let resolved_builder = match settings::resolve_default_builder_address(req.builder.as_deref()) {
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
     let builder_source = if req.builder.is_some() {
         "explicit in this request"
     } else {
-        match settings::default_builder_address_status(store_override.as_deref()).source {
-            settings::BuilderAddressSource::StoreOverride => {
-                "operator override in settings/builder-address"
-            }
+        match settings::default_builder_address_status().source {
             settings::BuilderAddressSource::ReleaseDefault => "this release's default",
             settings::BuilderAddressSource::Unconfigured => "unconfigured",
         }
@@ -1338,14 +1278,12 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
-            // Order matters, and it used to be the wrong way round. Marking
-            // the nonce completed first meant a failed approval-record write
-            // left the identity completed at an unchanged generation, so the
-            // `completed` guard above answered every later retry of that body
-            // with success without ever reaching the venue — even after
-            // another client had changed the cap. Writing the record first
-            // leaves the opposite partial state, where nothing claims success
-            // and a retry re-approves.
+            // The approval record must land before the nonce is marked
+            // completed. The `completed` guard above answers a retry without
+            // reaching the venue, so of the two possible partial failures the
+            // reachable one must be the one where nothing claims success: a
+            // failed record write leaves the nonce incomplete, and the retry
+            // re-approves.
             if let Err(e) = save_json(
                 approval_key,
                 &BuilderFeeApproval {
@@ -1893,38 +1831,44 @@ struct Pending {
 }
 
 fn request_session_key(
-    wallet: &str,
+    n: Network,
+    w: &str,
     session_id: &str,
     lifetime_ms: u64,
     builder_bound: bool,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
-    let (allowed_routes, allowed_operation_classes) = session_key_scope(builder_bound);
     petal::sdk::derive_key(&petal::PetalKeyRequest {
-        wallet_id: wallet.into(),
-        key_slot: session_key_slot(session_id),
-        allowed_routes,
-        allowed_operation_classes,
+        wallet_id: w.to_owned(),
+        key_slot: session_key_slot(n, session_id),
+        // The host replaces this legacy field with the package-authenticated
+        // canonical route scope declared in [[key.derive]].
+        allowed_routes: Vec::new(),
+        allowed_operation_classes: session_key_classes(builder_bound),
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
 }
 
-/// The routes and operation classes a session key may sign for. A session
-/// created with a builder bound additionally gets the builder-order route and
-/// its fee-bearing class; every other session is scoped to the fee-free
-/// `hyperliquid.agent_action` surface only.
-fn session_key_scope(builder_bound: bool) -> (Vec<String>, Vec<String>) {
-    let mut routes = SESSION_KEY_ALLOWED_ROUTES
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+/// The operation classes a session key may sign under.
+///
+/// A session created with a builder bound also gets the fee-bearing
+/// builder-order class; every other session is scoped to the fee-free
+/// `hyperliquid.agent_action` surface only, so it cannot sign an order that
+/// declares a fee however its stored record is later edited.
+///
+/// Routes are deliberately not scoped here. The host overwrites the request's
+/// route list with the package-authenticated set from `[[key.derive]]`
+/// (`bloom-petals/src/vm.rs`), so every session key carries the whole session
+/// route surface and the class is what separates a builder-bound session from
+/// a plain one. The host does honour this list, requiring it to be a non-empty
+/// subset of the manifest's classes.
+fn session_key_classes(builder_bound: bool) -> Vec<String> {
     let mut classes = vec!["hyperliquid.agent_action".to_owned()];
     if builder_bound {
-        routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned());
         classes.push(protocol::BUILDER_ORDER_INTENT.to_owned());
     }
-    (routes, classes)
+    classes
 }
 
 /// The class a session-signed action is authorized under. A builder-bearing
@@ -1938,10 +1882,16 @@ fn session_operation_class(action: &ExchangeAction) -> &'static str {
     }
 }
 
-fn session_key_slot(session_id: &str) -> String {
+fn session_key_slot(n: Network, session_id: &str) -> String {
+    let network = match n {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+    };
     let digest = Sha256::digest(
         [
-            b"bloom-hyperliquid-session-key/v1\0".as_slice(),
+            b"bloom-hyperliquid-session-key/v2\0".as_slice(),
+            network.as_bytes(),
+            b"\0",
             session_id.as_bytes(),
         ]
         .concat(),
@@ -2039,6 +1989,7 @@ fn session_key(n: Network, w: &str, id: &str, file: &str) -> String {
         file,
     ])
 }
+
 pub fn load_session(n: Network, w: &str, id: &str) -> Result<Option<Session>, DispatchResponse> {
     load_json(session_key(n, w, id, "session.json"))
 }
@@ -2402,38 +2353,65 @@ fn active_session(n: Network, w: &str, id: &str) -> Result<Session, DispatchResp
     Ok(session)
 }
 
-pub fn stop_session(n: Network, w: &str, id: &str) -> DispatchResponse {
-    let Some(mut session) = (match load_session(n, w, id) {
-        Ok(session) => session,
-        Err(response) => return response,
-    }) else {
-        return petal::error(-1, "session not found");
-    };
-    session.stopped = true;
-    session.last_error = None;
-    if let Err(response) = retire_session_key(n, w, id, &session) {
-        return response;
-    }
-    match save_json(session_key(n, w, id, "session.json"), &session, false) {
-        Ok(()) => ok_write(),
-        Err(response) => response,
-    }
-}
-
 pub fn cancel_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let mut session = match active_session(n, w, id) {
-        Ok(session) => session,
+    let (mut session, signing) = match cleanup_session(n, w, id) {
+        Ok(target) => target,
         Err(response) => return response,
     };
-    session_cancel_all(ctx, n, w, id, &mut session)
+    session_cancel_all(ctx, n, w, id, &mut session, signing)
 }
 
 pub fn close_all_session(ctx: &Ctx, n: Network, w: &str, id: &str) -> DispatchResponse {
-    let mut session = match active_session(n, w, id) {
-        Ok(session) => session,
+    let (mut session, signing) = match cleanup_session(n, w, id) {
+        Ok(target) => target,
         Err(response) => return response,
     };
-    session_close_all(ctx, n, w, id, &mut session)
+    session_close_all(ctx, n, w, id, &mut session, signing)
+}
+
+/// How a session action is signed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SessionSigning {
+    /// Trading actions: the session's delegated key and nothing else.
+    Delegated,
+    /// Cleanup on a session this Petal still records as live: the delegated
+    /// key, then the owner if the host refuses that key. Bloom's core stop
+    /// revokes the key's reusable approval without touching this Petal's
+    /// record, so that refusal is the only stop signal the Petal receives.
+    DelegatedThenOwner,
+    /// Cleanup on a session already stopped or expired: the owner, with a
+    /// payload-specific Exact approval.
+    Owner,
+}
+
+impl SessionSigning {
+    /// Whether a delegated signing attempt should be retried as the owner.
+    /// Only a host denial qualifies; any other failure is reported as is
+    /// rather than turned into an owner approval ceremony.
+    fn retry_as_owner(self, delegated: &Result<SignOutcome, String>) -> bool {
+        self == Self::DelegatedThenOwner
+            && matches!(delegated, Err(error) if *error == SdkError::Host(HostStatus::Denied).message())
+    }
+}
+
+/// A cancel/close target. Cleanup must survive a stop: the owner's Exact
+/// approval for the cleanup payload is not revoked with the session's
+/// reusable one, so a stopped session can never strand open orders.
+fn cleanup_session(
+    n: Network,
+    w: &str,
+    id: &str,
+) -> Result<(Session, SessionSigning), DispatchResponse> {
+    if let Ok(session) = active_session(n, w, id) {
+        return Ok((session, SessionSigning::DelegatedThenOwner));
+    }
+    match load_session(n, w, id) {
+        Ok(Some(session)) if session.stopped || session.expires_ms <= petal::sdk::now_ms() => {
+            Ok((session, SessionSigning::Owner))
+        }
+        // An unloadable or still-live session keeps the original denial.
+        _ => Err(petal::error(-1, "session not found")),
+    }
 }
 
 fn record_session_error(
@@ -2468,6 +2446,8 @@ fn session_submit(
     vault_str: Option<String>,
     expires: Option<u64>,
     explicit_nonce: Option<u64>,
+    signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
     if let Err(e) = action.validate() {
         return invalid(e);
@@ -2505,6 +2485,9 @@ fn session_submit(
         Err(e) => return e,
     };
     if completed {
+        if let Err(e) = clear_cleanup_replay(replay_key) {
+            return e;
+        }
         return ok_write();
     }
     let action_kind = action.kind();
@@ -2542,16 +2525,26 @@ fn session_submit(
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let sig = match sign_payload(
-        ctx,
-        w,
-        &signing_payload,
-        session_operation_class(&action),
-        None,
-        Some(s.key_ref_jcs.clone()),
-        None,
-        effects,
-    ) {
+    let sign = |key_ref_jcs| {
+        sign_payload(
+            ctx,
+            w,
+            &signing_payload,
+            session_operation_class(&action),
+            None,
+            key_ref_jcs,
+            None,
+            effects.clone(),
+        )
+    };
+    let mut signed = sign(match signing {
+        SessionSigning::Owner => None,
+        _ => Some(s.key_ref_jcs.clone()),
+    });
+    if signing.retry_as_owner(&signed) {
+        signed = sign(None);
+    }
+    let sig = match signed {
         Ok(SignOutcome::Signature(x)) => match protocol::SignatureJson::from_raw(&x) {
             Ok(v) => v,
             Err(e) => return backend(e),
@@ -2560,6 +2553,18 @@ fn session_submit(
             action_id,
             expires_ms,
         }) => {
+            if let Some(key) = replay_key
+                && let Err(e) = save_json(
+                    key.to_owned(),
+                    &CleanupReplay {
+                        action: action.clone(),
+                        expires_ms,
+                    },
+                    false,
+                )
+            {
+                return e;
+            }
             return approval(
                 "agent_action",
                 &json!({"action_id": action_id, "expires_ms": expires_ms, "session": id}),
@@ -2574,7 +2579,13 @@ fn session_submit(
     if let Err(e) = mark_session_receipt_submission(n, w, id, &receipt_reservations) {
         return e;
     }
-    match http_json(n, "/exchange", payload) {
+    let submitted = http_json(n, "/exchange", payload);
+    if submitted.is_ok()
+        && let Err(e) = clear_cleanup_replay(replay_key)
+    {
+        return e;
+    }
+    match submitted {
         Ok(v) => {
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 record_session_error(n, w, id, s, nonce, action_kind, &e);
@@ -2647,6 +2658,8 @@ pub fn session_action_write(
         req.vault_address,
         req.expires_after,
         req.nonce,
+        SessionSigning::Delegated,
+        None,
     )
 }
 
@@ -2698,6 +2711,7 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+#[allow(clippy::too_many_arguments)]
 fn session_agent_submit(
     ctx: &Ctx,
     n: Network,
@@ -2705,8 +2719,12 @@ fn session_agent_submit(
     id: &str,
     s: &mut Session,
     action: ExchangeAction,
+    signing: SessionSigning,
+    replay_key: Option<&str>,
 ) -> DispatchResponse {
-    session_submit(ctx, n, w, id, s, action, None, None, None, None)
+    session_submit(
+        ctx, n, w, id, s, action, None, None, None, None, signing, replay_key,
+    )
 }
 fn value_string(v: &Value) -> Option<String> {
     v.as_str()
@@ -2757,6 +2775,7 @@ fn session_cancel_all(
     w: &str,
     id: &str,
     s: &mut Session,
+    signing: SessionSigning,
 ) -> DispatchResponse {
     let open = match http_json(
         n,
@@ -2805,7 +2824,7 @@ fn session_cancel_all(
         Ok(v) => v,
         Err(e) => return invalid(e.to_string()),
     };
-    session_agent_submit(ctx, n, w, id, s, action)
+    session_agent_submit(ctx, n, w, id, s, action, signing, None)
 }
 fn close_price(raw: &str, buy: bool, sz_decimals: u32) -> Result<String, String> {
     let x: f64 = raw
@@ -2843,7 +2862,16 @@ fn session_close_all(
     w: &str,
     id: &str,
     s: &mut Session,
+    signing: SessionSigning,
 ) -> DispatchResponse {
+    let replay_key = session_key(n, w, id, "close_all_replay.json");
+    let pending = match load_json::<CleanupReplay>(replay_key.clone()) {
+        Ok(pending) => pending,
+        Err(e) => return e,
+    };
+    if let Some(action) = live_cleanup_replay(pending, petal::sdk::now_ms()) {
+        return session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()));
+    }
     let state = match http_json(
         n,
         "/info",
@@ -2914,7 +2942,7 @@ fn session_close_all(
         grouping: protocol::Grouping::Na,
         builder: None,
     };
-    session_agent_submit(ctx, n, w, id, s, action)
+    session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()))
 }
 fn canonical_abs_decimal(raw: &str) -> String {
     let mut value = raw.strip_prefix('-').unwrap_or(raw).to_owned();
@@ -3145,11 +3173,7 @@ fn ensure_builder_fee_is_approved(
 /// lowercase ASCII letter, so an on-chain address can never sign. Reject that
 /// here rather than several layers down as an unqualified permission error.
 fn session_wallet_id(w: &str) -> Result<String, String> {
-    let wallet_id = parse_wallet_id(w)?;
-    if !wallet_id.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err("session routes are addressed by wallet id, not by on-chain address".into());
-    }
-    Ok(wallet_id)
+    parse_wallet_id(w)
 }
 
 pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
@@ -3157,10 +3181,9 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(x) => x,
         Err(e) => return invalid(format!("invalid new session body: {e}")),
     };
-    let wallet_id = match session_wallet_id(&w) {
-        Ok(wallet_id) => wallet_id,
-        Err(error) => return invalid(error),
-    };
+    if let Err(error) = session_wallet_id(&w) {
+        return invalid(error);
+    }
     let agent_name = match session_preflight(&req) {
         Ok(agent_name) => agent_name,
         Err(error) => return invalid(error),
@@ -3227,41 +3250,37 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(
-        &wallet_id,
-        &req.id,
-        lifetime_ms,
-        req.builder_address.is_some(),
-    ) {
-        Ok(petal::PetalKeyOutcome::Pending {
-            operation_id,
-            scope_digest,
-        }) => {
-            return approval(
-                "derive_agent_key",
-                &json!({
-                    "operation_id": operation_id,
-                    "scope_digest": scope_digest,
-                    "session": req.id
-                }),
-            );
-        }
-        Ok(petal::PetalKeyOutcome::Ready {
-            operation_id: _,
-            scope_digest: _,
-            key_ref_jcs,
-            addresses,
-        }) => {
-            let Some(address) = addresses
-                .into_iter()
-                .find(|address| protocol::parse_address(address).is_ok())
-            else {
-                return backend("derived KeyRef has no EVM address");
-            };
-            (key_ref_jcs, address)
-        }
-        Err(response) => return response,
-    };
+    let derived =
+        match request_session_key(n, &w, &req.id, lifetime_ms, req.builder_address.is_some()) {
+            Ok(petal::PetalKeyOutcome::Pending {
+                operation_id,
+                scope_digest,
+            }) => {
+                return approval(
+                    "derive_agent_key",
+                    &json!({
+                        "operation_id": operation_id,
+                        "scope_digest": scope_digest,
+                        "session": req.id
+                    }),
+                );
+            }
+            Ok(petal::PetalKeyOutcome::Ready {
+                operation_id: _,
+                scope_digest: _,
+                key_ref_jcs,
+                addresses,
+            }) => {
+                let Some(address) = addresses
+                    .into_iter()
+                    .find(|address| protocol::parse_address(address).is_ok())
+                else {
+                    return backend("derived KeyRef has no EVM address");
+                };
+                (key_ref_jcs, address)
+            }
+            Err(response) => return response,
+        };
     let generated_session = Session {
         schema: "bloom.hyperliquid_agent_session.v1".into(),
         network: if matches!(n, Network::Mainnet) {
@@ -3480,10 +3499,10 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
-    /// A false "already revoked" is the one answer a caller acts on as a
-    /// safety property: they stop expecting the builder to charge. Every
-    /// input the corroboration rests on is a store key, so a revocation is
-    /// never answered from one.
+    /// A caller who reads "revoked" stops expecting the builder to charge, and
+    /// every input the corroboration rests on is a store key or a
+    /// Machine-proxied read. So a revocation is never answered from stored
+    /// state, however well corroborated.
     #[test]
     fn a_revocation_is_never_answered_from_a_stored_record() {
         use super::{BuilderFeeApproval, may_corroborate_from_record};
@@ -3524,23 +3543,9 @@ mod tests {
     }
 
     #[test]
-    fn the_builder_address_override_is_stored_under_its_declared_shared_key() {
-        // The host stores `<namespace>/<key>` and shares only keys declared in
-        // petal.toml; the SDK supplies the `state` namespace. Anything else
-        // leaves the override invisible to account-scoped routes.
-        let manifest = include_str!("../../petal.toml");
-        let shared = format!("state/{}", builder_address_override_key());
-        assert!(
-            manifest.contains(&format!("shared_keys = [\"{shared}\"]")),
-            "petal.toml must share {shared}"
-        );
-        assert!(!builder_address_override_key().starts_with("state/"));
-    }
-
-    #[test]
     fn a_changed_default_builder_is_not_mistaken_for_a_repeat_approval() {
-        // The same body resolves to builder A, then (after the override
-        // changes) to builder B: each must get its own approval record.
+        // The same body resolves to builder A, then to builder B when the
+        // release default differs: each must get its own approval record.
         let body = br#"{"max_fee_tenths_bps":10}"#;
         let a = "0x00000000000000000000000000000000000000aa";
         let b = "0x00000000000000000000000000000000000000bb";
@@ -3560,65 +3565,63 @@ mod tests {
         assert_ne!(key(a, 0), key(a, 1));
     }
 
-    #[test]
-    fn builder_address_override_writes_are_validated() {
-        let addr = "0x00000000000000000000000000000000000000aa";
-        assert_eq!(
-            parse_builder_address_override(addr.as_bytes()),
-            Ok(Some(addr))
-        );
-        // Surrounding whitespace, as `echo addr > settings/builder-address`
-        // writes, is trimmed rather than refused.
-        assert_eq!(
-            parse_builder_address_override(format!("  {addr}\n").as_bytes()),
-            Ok(Some(addr))
-        );
-        // Empty or whitespace-only clears the override.
-        assert_eq!(parse_builder_address_override(b""), Ok(None));
-        assert_eq!(parse_builder_address_override(b" \n"), Ok(None));
-        for garbage in [
-            &addr[..41],                                   // 39 hex digits
-            "0x00000000000000000000000000000000000000aaa", // 41 hex digits
-            "00000000000000000000000000000000000000aa",    // no 0x
-            "0x00000000000000000000000000000000000000zz",  // not hex
-            "0x00000000000000000000000000000000000000AA",  // not lowercase
-        ] {
-            assert!(
-                parse_builder_address_override(garbage.as_bytes()).is_err(),
-                "{garbage}"
-            );
-        }
-        assert!(parse_builder_address_override(&[0xff, 0xfe]).is_err());
-    }
     use super::*;
 
     #[test]
-    fn session_key_scope_includes_derivation_and_action_routes() {
-        assert_eq!(
-            SESSION_KEY_ALLOWED_ROUTES,
-            [
-                "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
-            ]
+    fn oversized_owner_batch_is_rejected_before_any_host_call() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![],
+            actor: None,
+        });
+        let req = SignSubmit {
+            action: ExchangeAction::Cancel {
+                cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }; 126],
+                fast: None,
+            },
+            nonce: None,
+            vault_address: None,
+            expires_after: None,
+        };
+        let response =
+            owner_action_write(&ctx, Network::Testnet, "main".into(), "cancel", b"{}", req);
+        assert!(
+            matches!(response, DispatchResponse::Error { code: -3, message } if message.contains("split the batch"))
         );
-        assert_eq!(SESSION_KEY_BUILDER_ORDER_ROUTE, "r000008");
     }
 
+    /// The class is the whole control. The host overwrites the request's route
+    /// list with the manifest's, so every session key carries the
+    /// builder-order route; only a session that bound a builder may sign
+    /// under the fee-bearing class, and signing checks the class.
     #[test]
-    fn session_key_scope_adds_the_builder_order_surface_only_with_a_bound() {
-        let (routes, classes) = session_key_scope(false);
-        assert_eq!(routes, SESSION_KEY_ALLOWED_ROUTES);
-        assert_eq!(classes, ["hyperliquid.agent_action"]);
-
-        let (routes, classes) = session_key_scope(true);
-        assert_eq!(routes.len(), SESSION_KEY_ALLOWED_ROUTES.len() + 1);
+    fn only_a_builder_bound_session_is_scoped_to_the_fee_bearing_class() {
+        assert_eq!(session_key_classes(false), ["hyperliquid.agent_action"]);
         assert_eq!(
-            routes.last().map(String::as_str),
-            Some(SESSION_KEY_BUILDER_ORDER_ROUTE)
-        );
-        assert_eq!(
-            classes,
+            session_key_classes(true),
             ["hyperliquid.agent_action", protocol::BUILDER_ORDER_INTENT]
         );
+        // Must stay a subset of the manifest's declared classes, or the host
+        // refuses the derivation outright.
+        let manifest = include_str!("../../petal.toml");
+        let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
+        let (declared, _) = derive
+            .split_once("operation_classes = [")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap();
+        for class in session_key_classes(true) {
+            assert!(declared.contains(&format!("\"{class}\"")), "{class}");
+        }
     }
 
     #[test]
@@ -3707,8 +3710,14 @@ mod tests {
 
     #[test]
     fn session_key_slots_are_lowercase_broker_tokens_for_timestamped_ids() {
-        let first = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef");
-        let second = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef");
+        let first = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let second = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814t150000z-0123456789abcdef",
+        );
 
         assert_eq!(first.len(), 64);
         assert!(first.starts_with("hyperliquid-"));
@@ -3718,6 +3727,64 @@ mod tests {
                 .all(|byte| { byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' })
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_key_slots_differ_across_networks_for_the_same_id() {
+        let mainnet = session_key_slot(
+            Network::Mainnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+        let testnet = session_key_slot(
+            Network::Testnet,
+            "bloom-eval-codex-20260814T150000Z-0123456789abcdef",
+        );
+
+        assert_ne!(mainnet, testnet);
+    }
+
+    #[test]
+    fn only_a_denied_cleanup_key_falls_back_to_owner_signing() {
+        let denied = Err(SdkError::Host(HostStatus::Denied).message());
+        let backend = Err(SdkError::Host(HostStatus::Backend).message());
+        let pending = Ok(SignOutcome::ApprovalPending {
+            action_id: "a".into(),
+            expires_ms: 1,
+        });
+        assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&denied));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&backend));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&pending));
+        // Trading never escalates to the owner, and owner signing has no
+        // delegated attempt to retry.
+        assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
+        assert!(!SessionSigning::Owner.retry_as_owner(&denied));
+    }
+
+    #[test]
+    fn close_all_replays_the_pending_order_until_its_approval_expires() {
+        let order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": false, "p": "90250", "s": "0.01", "r": true,
+                "t": {"limit": {"tif": "Ioc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        let stored = serde_json::to_vec(&CleanupReplay {
+            action: order.clone(),
+            expires_ms: 2_000,
+        })
+        .unwrap();
+        let pending = || serde_json::from_slice::<CleanupReplay>(&stored).ok();
+        // The replayed order signs to the same payload the owner approved.
+        let replayed = live_cleanup_replay(pending(), 1_999).unwrap();
+        assert_eq!(
+            session_operation_digest(&replayed, None, None).unwrap(),
+            session_operation_digest(&order, None, None).unwrap()
+        );
+        assert!(live_cleanup_replay(pending(), 2_000).is_none());
+        assert!(live_cleanup_replay(None, 0).is_none());
     }
 
     #[test]
@@ -4233,17 +4300,25 @@ mod tests {
 
     #[test]
     fn withdrawal_is_outside_the_delegated_session_scope() {
-        // The withdrawal route leaves sort after every session route, so its
-        // ids must never appear in the derived-key scope; if a route file is
-        // ever inserted ahead of them, this pins the authority boundary.
-        assert!(
-            SESSION_KEY_ALLOWED_ROUTES.iter().all(|id| *id < "r000049"),
-            "session scope must stay below the withdrawal routes"
-        );
-        let expected = [
-            "r000009", "r000010", "r000011", "r000014", "r000020", "r000024", "r000026",
-        ];
-        assert_eq!(SESSION_KEY_ALLOWED_ROUTES, expected);
+        // The derived-key scope is declared by route pattern in petal.toml;
+        // no owner-only exchange route, withdrawals included, may enter it.
+        let manifest = include_str!("../../petal.toml");
+        let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
+        let (_, routes) = derive.split_once("allowed_routes = [").unwrap();
+        let (routes, _) = routes.split_once("\n]").unwrap();
+        let routes = routes
+            .split(',')
+            .map(|route| route.trim().trim_matches('"'))
+            .filter(|route| !route.is_empty())
+            .collect::<Vec<_>>();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert!(
+                route.starts_with("[network]/agent_sessions/[wallet]/[index]/[session]/"),
+                "{route}"
+            );
+            assert!(!route.contains("withdraw"), "{route}");
+        }
     }
 
     #[test]
@@ -4745,7 +4820,7 @@ mod tests {
                 "an address-shaped wallet must be rejected: {address}"
             );
             assert!(
-                rejected.unwrap_err().contains("addressed by wallet id"),
+                rejected.unwrap_err().contains("Bloom wallet id"),
                 "the error must say which identifier belongs where"
             );
         }

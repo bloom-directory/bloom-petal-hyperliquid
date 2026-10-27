@@ -9,33 +9,15 @@ const SESSION_BUILDER_ORDER_ROUTE: (&str, &str) = (
     "r000008",
 );
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
-const SESSION_ACTION_ROUTES: &[(&str, &str)] = &[
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
-        "r000009",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
-        "r000010",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
-        "r000011",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
-        "r000014",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
-        "r000020",
-    ),
-    (
-        "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
-        "r000024",
-    ),
+const SESSION_ACTION_ROUTES: &[&str] = &[
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
 ];
-const DERIVATION_ROUTE: (&str, &str) = ("[network]/agent_sessions/[wallet]/[index]/new.json", "r000026");
+const DERIVATION_ROUTE: &str = "[network]/agent_sessions/[wallet]/[index]/new.json";
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
         "[network]/exchange/[wallet]/[index]/approve_builder_fee.json",
@@ -118,81 +100,9 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let routes = routes_by_pattern(&package);
 
     let derivation = routes
-        .get(DERIVATION_ROUTE.0)
+        .get(DERIVATION_ROUTE)
         .expect("agent-session derivation route");
-    assert_eq!(derivation.route_id, DERIVATION_ROUTE.1);
-
-    // Inspect the exact packaged runtime source, not a second manifest-only
-    // list: request_session_key passes session_key_scope(..) to derive_key,
-    // which builds the scope from these two constants.
-    let workflow = package
-        .files
-        .iter()
-        .find(|file| file.path == "route/src/workflow.rs")
-        .expect("packaged session runtime source");
-    let workflow = std::str::from_utf8(&workflow.bytes).expect("UTF-8 runtime source");
-    let quoted = |declaration: &str, end: &str| {
-        workflow
-            .split(declaration)
-            .nth(1)
-            .unwrap_or_else(|| panic!("runtime declaration {declaration}"))
-            .split(end)
-            .next()
-            .unwrap()
-            .split('"')
-            .enumerate()
-            .filter_map(|(index, value)| (index % 2 == 1).then_some(value))
-            .collect::<Vec<_>>()
-    };
-    let runtime_scope = quoted("const SESSION_KEY_ALLOWED_ROUTES: [&str; 7] = [", "];");
-    let runtime_builder_route = quoted("const SESSION_KEY_BUILDER_ORDER_ROUTE: &str = ", ";");
-    let request = workflow
-        .split("fn request_session_key(")
-        .nth(1)
-        .expect("runtime derivation request")
-        .split("fn session_key_slot(")
-        .next()
-        .unwrap();
-    assert!(request.contains("session_key_scope(builder_bound)"));
-    assert!(request.contains("allowed_routes,"));
-    let scope_fn = workflow
-        .split("fn session_key_scope(")
-        .nth(1)
-        .expect("runtime session key scope")
-        .split("\n}\n")
-        .next()
-        .unwrap();
-    assert!(scope_fn.contains("SESSION_KEY_ALLOWED_ROUTES"));
-    assert!(scope_fn.contains("routes.push(SESSION_KEY_BUILDER_ORDER_ROUTE.to_owned())"));
-    let mut expected_scope = SESSION_ACTION_ROUTES
-        .iter()
-        .map(|(pattern, _)| {
-            routes
-                .get(pattern)
-                .expect("session action route")
-                .route_id
-                .as_str()
-        })
-        .collect::<Vec<_>>();
-    expected_scope.push(derivation.route_id.as_str());
-    assert_eq!(
-        runtime_scope, expected_scope,
-        "runtime derivation scope must match the exact package's action and creation routes"
-    );
-    let builder_order_route = routes
-        .get(SESSION_BUILDER_ORDER_ROUTE.0)
-        .expect("session builder-order route")
-        .route_id
-        .as_str();
-    assert_eq!(
-        runtime_builder_route,
-        [builder_order_route],
-        "a builder-bound session key must be scoped to the exact package's session builder-order route"
-    );
-
-    let mut derived_classes = operation_classes(derivation);
-    derived_classes.sort_unstable();
-    assert_eq!(derived_classes, [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]);
+    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
@@ -206,6 +116,34 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
             "bloom:store",
         ]
     );
+    // The builder-order route is scoped by the manifest like every other
+    // session route, but it signs under its own fee-bearing intent, so it is
+    // not part of the agent-action list above.
+    let mut expected_scope = SESSION_ACTION_ROUTES
+        .iter()
+        .copied()
+        .chain(std::iter::once(SESSION_BUILDER_ORDER_ROUTE.0))
+        .map(|pattern| routes[pattern].route_id.as_str())
+        .chain(std::iter::once(derivation.route_id.as_str()))
+        .collect::<Vec<_>>();
+    expected_scope.sort_unstable();
+    assert_eq!(
+        derivation
+            .key_derive_allowed_routes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected_scope
+    );
+    assert!(derivation.key_derive_scope_declared);
+    assert_eq!(
+        derivation.key_derive_allowed_crypto_suites,
+        ["secp256k1-keccak256-recoverable"]
+    );
+    assert_eq!(
+        derivation.key_derive_maximum_lifetime_ms,
+        Some(86_400_000)
+    );
 
     let delegated_routes = package
         .route_index
@@ -214,13 +152,12 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         .filter(|route| !route.key_derive_operation_classes.is_empty())
         .map(|route| route.pattern.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(delegated_routes, [DERIVATION_ROUTE.0]);
+    assert_eq!(delegated_routes, [DERIVATION_ROUTE]);
 
-    for (pattern, route_id) in SESSION_ACTION_ROUTES {
+    for pattern in SESSION_ACTION_ROUTES {
         let route = routes
             .get(pattern)
             .unwrap_or_else(|| panic!("missing {pattern}"));
-        assert_eq!(&route.route_id, route_id, "{pattern}");
         assert_eq!(
             route.install_metadata.sign_intent.as_deref(),
             Some(AGENT_ACTION_INTENT),
@@ -252,7 +189,7 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         agent_action_routes,
         SESSION_ACTION_ROUTES
             .iter()
-            .map(|(pattern, _)| *pattern)
+            .copied()
             .collect::<Vec<_>>()
     );
 

@@ -1,32 +1,23 @@
 use serde::Serialize;
 
 /// This release's default builder **address**, used when an
-/// `approve_builder_fee.json` caller omits `builder` and no operator override
-/// is stored. A release build embeds it from the `HYPERLIQUID_BUILDER_ADDRESS`
-/// build input; a local build sets nothing, so callers must name a builder.
+/// `approve_builder_fee.json` caller omits `builder`. A release build embeds
+/// it from the `HYPERLIQUID_BUILDER_ADDRESS` build input; a local build sets
+/// nothing, so callers must name a builder. There is no operator override:
+/// any caller wanting another builder passes `builder` explicitly.
 ///
 /// The address is public on-chain data, not a credential. It is injected at
 /// build time rather than committed because this repository is public, and
 /// the cost is real: a tagged release cannot be rebuilt byte for byte from
 /// its source alone.
 ///
-/// An earlier version of this comment said the compensating control was that
-/// "every approval ceremony states the builder, the cap, and which source the
-/// address came from". **That is not true end to end at the pinned Bloom and
-/// Broker revisions.** The advisory this Petal builds is reduced to
-/// `advisory_digest` in `bloom-daemon`, `sign_or_prepare_petal` in
-/// `bloom-vfs::exact_signing` takes no advisory at all, and the pinned
-/// `bloom-broker-api` has no field for one; the Broker's ceremony does have an
-/// `attributed_advisory_items` list, but nothing outside its tests populates
-/// it. The digest binds the advisory to the signing identity, so a changed
-/// advisory invalidates an approval — it is bound and not displayed.
-///
-/// So today the owner taps a passkey over an opaque preimage. For an
-/// `approveBuilderFee` action the typed message does carry the builder and the
-/// rate, but only `hashStruct` enters the preimage, so neither is recoverable
-/// from what is shown. Until the advisory is delivered, the builder address is
-/// effectively approved sight unseen, which is tracked as a pre-merge gate in
-/// the pull request rather than papered over here.
+/// What shows the owner which builder they are authorizing is the signed typed
+/// data, not an advisory: `approve_builder_fee` signs an `approveBuilderFee`
+/// message whose `builder` and `maxFeeRate` leaves travel in the payload's
+/// `bloom.message.review.v1` envelope, which Broker checks against the exact
+/// preimage hash before rendering. That rendering needs Bloom #224 and Broker
+/// #103; until they land the leaves are not displayed, which the README tracks
+/// as a pre-merge gate.
 ///
 /// Set it as a lowercase `0x` address;
 /// `release_default_if_set_is_a_lowercase_address` checks whatever a build
@@ -44,13 +35,11 @@ pub const EMBEDDED_DEFAULT_BUILDER_ADDRESS: Option<&str> =
 
 /// Rejects a malformed embedded builder address while compiling.
 ///
-/// `option_env!` takes whatever the build environment holds, and this value
-/// used to be parsed only when an order was placed: a release built with
-/// `HYPERLIQUID_BUILDER_ADDRESS=abc` compiled every route and packaged
-/// cleanly, failing at runtime on a Petal nobody could use. The release
-/// workflow does not run the test that catches that, and the env var can be
-/// set without going through `scripts/build.sh` at all, so the check has to be
-/// the build itself.
+/// `option_env!` takes whatever the build environment holds, so a malformed
+/// value would otherwise reach a release and fail only when an order was
+/// placed. The check is the build, not `scripts/build.sh`, because the
+/// variable can be set without going through that script, and not a test,
+/// because the release workflow does not run the suite.
 ///
 /// Lowercase is required rather than normalized, for the same reason
 /// `approve_builder_fee` requires it: the per-order builder field must match
@@ -82,7 +71,6 @@ const fn checked_embedded_builder_address(value: Option<&str>) -> Option<&str> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuilderAddressSource {
-    StoreOverride,
     ReleaseDefault,
     Unconfigured,
 }
@@ -94,17 +82,10 @@ pub struct BuilderAddressStatus {
     pub address: Option<String>,
 }
 
-/// Resolves the default builder address `approve_builder_fee.json` falls
-/// back to when the caller omits `builder`: an operator-set store override
-/// first, so the default can change without a release, then this release's
-/// source-declared default, else none.
-fn resolve_default(
-    release_default: Option<&str>,
-    store_override: Option<&str>,
-) -> Option<(String, BuilderAddressSource)> {
-    if let Some(address) = store_override {
-        return Some((address.to_owned(), BuilderAddressSource::StoreOverride));
-    }
+/// Resolves the default builder address `approve_builder_fee.json` falls back
+/// to when the caller omits `builder`: this release's embedded default, else
+/// none. A caller that wants any other builder passes `builder` explicitly.
+fn resolve_default(release_default: Option<&str>) -> Option<(String, BuilderAddressSource)> {
     release_default.map(|address| (address.to_owned(), BuilderAddressSource::ReleaseDefault))
 }
 
@@ -114,30 +95,23 @@ fn resolve_default(
 pub fn resolve_builder_address(
     explicit: Option<&str>,
     release_default: Option<&str>,
-    store_override: Option<&str>,
 ) -> Result<String, String> {
     if let Some(address) = explicit {
         return Ok(address.to_owned());
     }
-    resolve_default(release_default, store_override)
+    resolve_default(release_default)
         .map(|(address, _)| address)
         .ok_or_else(|| "builder address is required; no default builder is configured".into())
 }
 
 /// Convenience wrapper baking in this release's declared default so callers
-/// only need to supply the caller-explicit value and the store override.
-pub fn resolve_default_builder_address(
-    explicit: Option<&str>,
-    store_override: Option<&str>,
-) -> Result<String, String> {
-    resolve_builder_address(explicit, EMBEDDED_DEFAULT_BUILDER_ADDRESS, store_override)
+/// only need to supply the caller-explicit value.
+pub fn resolve_default_builder_address(explicit: Option<&str>) -> Result<String, String> {
+    resolve_builder_address(explicit, EMBEDDED_DEFAULT_BUILDER_ADDRESS)
 }
 
-fn builder_address_status(
-    release_default: Option<&str>,
-    store_override: Option<&str>,
-) -> BuilderAddressStatus {
-    match resolve_default(release_default, store_override) {
+fn builder_address_status(release_default: Option<&str>) -> BuilderAddressStatus {
+    match resolve_default(release_default) {
         Some((address, source)) => BuilderAddressStatus {
             configured: true,
             source,
@@ -151,8 +125,8 @@ fn builder_address_status(
     }
 }
 
-pub fn default_builder_address_status(store_override: Option<&str>) -> BuilderAddressStatus {
-    builder_address_status(EMBEDDED_DEFAULT_BUILDER_ADDRESS, store_override)
+pub fn default_builder_address_status() -> BuilderAddressStatus {
+    builder_address_status(EMBEDDED_DEFAULT_BUILDER_ADDRESS)
 }
 
 #[cfg(test)]
@@ -193,52 +167,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_address_always_wins_over_store_override_and_release_default() {
+    fn an_explicit_address_always_wins_over_the_release_default() {
         assert_eq!(
             resolve_builder_address(
                 Some("0x0000000000000000000000000000000000000001"),
                 Some("0x0000000000000000000000000000000000000002"),
-                Some("0x0000000000000000000000000000000000000003"),
             ),
             Ok("0x0000000000000000000000000000000000000001".into())
         );
     }
 
     #[test]
-    fn store_override_wins_over_release_default() {
+    fn the_release_default_is_used_when_the_caller_is_silent() {
         assert_eq!(
-            resolve_builder_address(
-                None,
-                Some("0x0000000000000000000000000000000000000002"),
-                Some("0x0000000000000000000000000000000000000003"),
-            ),
-            Ok("0x0000000000000000000000000000000000000003".into())
-        );
-    }
-
-    #[test]
-    fn release_default_used_when_no_override_is_stored() {
-        assert_eq!(
-            resolve_builder_address(
-                None,
-                Some("0x0000000000000000000000000000000000000002"),
-                None,
-            ),
+            resolve_builder_address(None, Some("0x0000000000000000000000000000000000000002")),
             Ok("0x0000000000000000000000000000000000000002".into())
         );
     }
 
     #[test]
     fn nothing_configured_is_an_explicit_error() {
-        assert!(resolve_builder_address(None, None, None).is_err());
+        assert!(resolve_builder_address(None, None).is_err());
     }
 
     #[test]
     fn release_default_if_set_is_a_lowercase_address() {
-        // The default is public data declared in source, so the checks the
-        // per-order and override fields get apply to it here: a checksummed
-        // or padded value would make every call that omits `builder` fail
-        // with "builder address must be lowercase".
+        // The default is public data embedded at build time, so the check the
+        // per-order field gets applies to it here too: a checksummed or padded
+        // value would make every call that omits `builder` fail with
+        // "builder address must be lowercase".
         if let Some(address) = EMBEDDED_DEFAULT_BUILDER_ADDRESS {
             assert_eq!(address, address.to_ascii_lowercase());
             assert!(crate::parse_address(address).is_ok());
@@ -247,49 +204,30 @@ mod tests {
 
     #[test]
     fn the_release_wrapper_resolves_exactly_this_release_default() {
-        // Whatever this release declares (including nothing), the wrapper
-        // resolves exactly that when the caller and the store are silent,
-        // and a store override still wins over it. The no-default case
-        // itself is `nothing_configured_is_an_explicit_error`, with an
-        // explicit `None`, so setting a release default breaks no test.
+        // Whatever this release declares, including nothing, the wrapper
+        // resolves exactly that when the caller is silent. The no-default case
+        // is `nothing_configured_is_an_explicit_error`, with an explicit
+        // `None`, so embedding a default breaks no test.
         assert_eq!(
-            resolve_default_builder_address(None, None).ok(),
+            resolve_default_builder_address(None).ok(),
             EMBEDDED_DEFAULT_BUILDER_ADDRESS.map(str::to_owned)
-        );
-        assert_eq!(
-            resolve_default_builder_address(
-                None,
-                Some("0x0000000000000000000000000000000000000003")
-            ),
-            Ok("0x0000000000000000000000000000000000000003".into())
         );
     }
 
     #[test]
     fn status_reports_the_resolved_source_and_address() {
-        let unconfigured = builder_address_status(None, None);
+        let unconfigured = builder_address_status(None);
         assert!(!unconfigured.configured);
         assert_eq!(unconfigured.source, BuilderAddressSource::Unconfigured);
         assert_eq!(unconfigured.address, None);
 
         let release_default =
-            builder_address_status(Some("0x0000000000000000000000000000000000000002"), None);
+            builder_address_status(Some("0x0000000000000000000000000000000000000002"));
         assert!(release_default.configured);
         assert_eq!(release_default.source, BuilderAddressSource::ReleaseDefault);
         assert_eq!(
             release_default.address,
             Some("0x0000000000000000000000000000000000000002".into())
-        );
-
-        let overridden = builder_address_status(
-            Some("0x0000000000000000000000000000000000000002"),
-            Some("0x0000000000000000000000000000000000000003"),
-        );
-        assert!(overridden.configured);
-        assert_eq!(overridden.source, BuilderAddressSource::StoreOverride);
-        assert_eq!(
-            overridden.address,
-            Some("0x0000000000000000000000000000000000000003".into())
         );
     }
 }
