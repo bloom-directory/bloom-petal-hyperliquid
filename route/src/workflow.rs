@@ -3524,9 +3524,9 @@ mod tests {
         assert!(!may_corroborate_from_record(10, None));
     }
 
-    /// A caller retrying an approval during an `/info` outage used to read a
-    /// bare transport or status error from an approval route, and could not
-    /// tell a failed submission from a failed check.
+    /// A caller retrying an approval during an `/info` outage must be able to
+    /// tell a failed submission from a failed check, so the error says the
+    /// approval was never sent and names the cause.
     #[test]
     fn a_failed_cap_check_says_nothing_was_submitted() {
         use super::unverified_builder_fee_cap;

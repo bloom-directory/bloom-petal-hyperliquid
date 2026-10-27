@@ -131,10 +131,9 @@ pub fn default_builder_address_status() -> BuilderAddressStatus {
 
 #[cfg(test)]
 mod tests {
-    /// A release built with a malformed address used to package cleanly and
-    /// fail only when an order was placed. These exercise the same `const fn`
-    /// the build evaluates; a bad value makes `cargo build` itself fail, which
-    /// a test in this crate cannot assert from the inside.
+    /// These exercise the same `const fn` the build evaluates. A malformed
+    /// value makes `cargo build` itself fail, which a test inside this crate
+    /// cannot assert, so these cover the validator rather than the build.
     #[test]
     fn an_embedded_builder_address_must_be_lowercase_hex() {
         assert_eq!(

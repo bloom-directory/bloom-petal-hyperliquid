@@ -102,7 +102,15 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let derivation = routes
         .get(DERIVATION_ROUTE)
         .expect("agent-session derivation route");
-    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
+    // The manifest declares both classes because the host takes the derived
+    // key's route scope from `[[key.derive]]` and validates the requested
+    // classes as a subset of these. A session created without a builder bound
+    // requests `agent_action` alone, so only a builder-bound session can sign
+    // under the fee-bearing class.
+    assert_eq!(
+        operation_classes(derivation),
+        [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]
+    );
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
