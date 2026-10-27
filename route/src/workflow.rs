@@ -167,6 +167,29 @@ fn sign_payload(
     advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
+    let request = sign_request(
+        ctx,
+        wallet,
+        payload,
+        operation_class,
+        approval_hint,
+        key_ref_jcs,
+        advisory,
+        effects,
+    )?;
+    petal::sdk::sign_payload(&request).map_err(|e| e.message())
+}
+#[allow(clippy::too_many_arguments)]
+fn sign_request(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    operation_class: &str,
+    approval_hint: Option<String>,
+    key_ref_jcs: Option<Vec<u8>>,
+    advisory: Option<Vec<u8>>,
+    effects: ClaimEffects,
+) -> Result<PayloadSignRequest, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
@@ -195,17 +218,17 @@ fn sign_payload(
         "nonce": hex::encode(&nonce_digest[..16]),
         "claim_assurance": {"kind": "machine_asserted"}
     });
-    petal::sdk::sign_payload(&PayloadSignRequest {
+    Ok(PayloadSignRequest {
         wallet: wallet.into(),
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
         signature_algorithm: "secp256k1-keccak256-recoverable".into(),
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
-        // Delegated actions have no new ceremony. Carry the full public
-        // action witness on the existing use-time evidence channel so Broker
-        // can still rebuild the signed bytes before releasing a signature.
-        claim_assurance_evidence: key_ref_jcs.as_ref().map(|_| payload.review.clone()),
+        // Broker rebuilds the signed bytes from this public action witness
+        // before releasing an agent action, whether a delegated key or the
+        // owner (cleanup after a stop) signs it.
+        claim_assurance_evidence: Some(payload.review.clone()),
         approval_hint,
         action: Some(payload.review.clone()),
         advisory,
@@ -216,7 +239,6 @@ fn sign_payload(
         },
         key_ref_jcs,
     })
-    .map_err(|e| e.message())
 }
 pub fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchResponse> {
     let (status, raw) = http_raw(net, path, body)?;
@@ -1711,7 +1733,11 @@ impl SessionSigning {
     /// rather than turned into an owner approval ceremony.
     fn retry_as_owner(self, delegated: &Result<SignOutcome, String>) -> bool {
         self == Self::DelegatedThenOwner
-            && matches!(delegated, Err(error) if *error == SdkError::Host(HostStatus::Denied).message())
+            && matches!(delegated, Err(error) if {
+                // Hosts may append a reason: "denied: <reason>".
+                let denied = SdkError::Host(HostStatus::Denied).message();
+                *error == denied || error.starts_with(&format!("{denied}: "))
+            })
     }
 }
 
@@ -2076,6 +2102,11 @@ fn asset_ids(n: Network) -> Result<std::collections::BTreeMap<String, u32>, Disp
             .collect()
     })
 }
+/// Cleanup may fall back to the owner, whose approval Broker can only display
+/// up to 256 fields: 125 cancels or 41 closing orders. Each cleanup write
+/// therefore covers at most one such batch; writing it again does the rest.
+const CLEANUP_CANCELS: usize = 125;
+const CLEANUP_CLOSES: usize = 41;
 fn session_cancel_all(
     ctx: &Ctx,
     n: Network,
@@ -2125,6 +2156,7 @@ fn session_cancel_all(
     if cancels.is_empty() {
         return ok_write();
     }
+    cancels.truncate(CLEANUP_CANCELS);
     let action = match serde_json::from_value::<ExchangeAction>(
         json!({"type":"cancel","cancels":cancels}),
     ) {
@@ -2244,6 +2276,7 @@ fn session_close_all(
     if orders.is_empty() {
         return ok_write();
     }
+    orders.truncate(CLEANUP_CLOSES);
     let action = ExchangeAction::Order {
         orders,
         grouping: protocol::Grouping::Na,
@@ -2846,13 +2879,91 @@ mod tests {
             action_id: "a".into(),
             expires_ms: 1,
         });
+        let reasoned = Err("denied: SELECTOR_MISMATCH: approval revoked".to_owned());
+        let lookalike = Err("deniedx".to_owned());
         assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&denied));
+        assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&reasoned));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&lookalike));
         assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&backend));
         assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&pending));
         // Trading never escalates to the owner, and owner signing has no
         // delegated attempt to retry.
         assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
         assert!(!SessionSigning::Owner.retry_as_owner(&denied));
+    }
+
+    #[test]
+    fn full_cleanup_batches_fit_one_owner_review() {
+        let cancels: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancel",
+            "cancels": vec![json!({"a": 9999, "o": u64::MAX}); CLEANUP_CANCELS + 1]
+        }))
+        .unwrap();
+        // Same shape session_close_all builds: reduce-only IOC, no client id.
+        let closes: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": vec![json!({
+                "a": 9999, "b": true, "p": "123456.7", "s": "1234.5678", "r": true,
+                "t": {"limit": {"tif": "Ioc"}}
+            }); CLEANUP_CLOSES + 1],
+            "grouping": "na"
+        }))
+        .unwrap();
+        for mut action in [cancels, closes] {
+            assert!(action.validate_owner_review().is_err());
+            match &mut action {
+                ExchangeAction::Cancel { cancels, .. } => {
+                    cancels.pop();
+                }
+                ExchangeAction::Order { orders, .. } => {
+                    orders.pop();
+                }
+                _ => unreachable!(),
+            }
+            action.validate_owner_review().unwrap();
+        }
+    }
+
+    #[test]
+    fn owner_signed_agent_action_carries_its_use_time_witness() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![("bloom.route_id".into(), "cancel_all".into())],
+            actor: None,
+        });
+        let action = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+            fast: None,
+        };
+        let payload =
+            protocol::l1_signing_payload(Network::Testnet, &action, 1, None, None).unwrap();
+        // Broker refuses any hyperliquid.agent_action without the witness,
+        // including the owner fallback that cleans up a stopped session.
+        for key_ref_jcs in [None, Some(b"{}".to_vec())] {
+            let request = sign_request(
+                &ctx,
+                "main",
+                &payload,
+                "hyperliquid.agent_action",
+                None,
+                key_ref_jcs,
+                None,
+                ClaimEffects::none(),
+            )
+            .unwrap();
+            assert_eq!(
+                request.claim_assurance_evidence,
+                Some(payload.review.clone())
+            );
+        }
     }
 
     #[test]
