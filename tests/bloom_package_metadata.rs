@@ -3,6 +3,11 @@ use std::{collections::BTreeMap, env};
 use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
+const BUILDER_ORDER_INTENT: &str = "hyperliquid.builder_order";
+const SESSION_BUILDER_ORDER_ROUTE: (&str, &str) = (
+    "[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json",
+    "r000008",
+);
 const ACTION_CAPS: &[&str] = &["bloom:http", "bloom:sign", "bloom:store"];
 const SESSION_ACTION_ROUTES: &[&str] = &[
     "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
@@ -15,12 +20,20 @@ const SESSION_ACTION_ROUTES: &[&str] = &[
 const DERIVATION_ROUTE: &str = "[network]/agent_sessions/[wallet]/[index]/new.json";
 const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
     (
+        "[network]/exchange/[wallet]/[index]/approve_builder_fee.json",
+        "hyperliquid.approve_builder_fee",
+    ),
+    (
         "[network]/exchange/[wallet]/[index]/cancel.json",
         "hyperliquid.cancel",
     ),
     (
         "[network]/exchange/[wallet]/[index]/cancel_by_cloid.json",
         "hyperliquid.cancel_by_cloid",
+    ),
+    (
+        "[network]/exchange/[wallet]/[index]/builder_order.json",
+        BUILDER_ORDER_INTENT,
     ),
     (
         "[network]/exchange/[wallet]/[index]/order.json",
@@ -89,7 +102,15 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let derivation = routes
         .get(DERIVATION_ROUTE)
         .expect("agent-session derivation route");
-    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
+    // The manifest declares both classes because the host takes the derived
+    // key's route scope from `[[key.derive]]` and validates the requested
+    // classes as a subset of these. A session created without a builder bound
+    // requests `agent_action` alone, so only a builder-bound session can sign
+    // under the fee-bearing class.
+    assert_eq!(
+        operation_classes(derivation),
+        [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]
+    );
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
@@ -103,9 +124,14 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
             "bloom:store",
         ]
     );
+    // The builder-order route is scoped by the manifest like every other
+    // session route, but it signs under its own fee-bearing intent, so it is
+    // not part of the agent-action list above.
     let mut expected_scope = SESSION_ACTION_ROUTES
         .iter()
-        .map(|pattern| routes[*pattern].route_id.as_str())
+        .copied()
+        .chain(std::iter::once(SESSION_BUILDER_ORDER_ROUTE.0))
+        .map(|pattern| routes[pattern].route_id.as_str())
         .chain(std::iter::once(derivation.route_id.as_str()))
         .collect::<Vec<_>>();
     expected_scope.sort_unstable();
@@ -149,6 +175,17 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
 
+    let builder_order = routes
+        .get(SESSION_BUILDER_ORDER_ROUTE.0)
+        .expect("session builder-order route");
+    assert_eq!(builder_order.route_id, SESSION_BUILDER_ORDER_ROUTE.1);
+    assert_eq!(
+        builder_order.install_metadata.sign_intent.as_deref(),
+        Some(BUILDER_ORDER_INTENT)
+    );
+    assert_eq!(required_caps(builder_order), ACTION_CAPS);
+    assert!(builder_order.key_derive_operation_classes.is_empty());
+
     let agent_action_routes = package
         .route_index
         .routes
@@ -176,4 +213,34 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
         assert_eq!(required_caps(route), ACTION_CAPS, "{pattern}");
         assert!(route.key_derive_operation_classes.is_empty(), "{pattern}");
     }
+}
+
+/// The package's only fee-bearing class must be the one the pinned Bloom
+/// catalogues with a fee asset, on both of the Machine's enrollment paths.
+/// Bloom's exact-signing check refuses a `{"kind":"fee"}` claim under a class
+/// catalogued fee-free (`FEE_NOT_ALLOWED`), so a pin whose enrollment writes
+/// `fee_asset: None` for every class cannot sign a builder order at all. The
+/// catalogue is private to the `bloom` binary, so this reads the enrollment
+/// source the check script's Bloom checkout provides; it runs from
+/// `crates/bloom-petals` inside that checkout.
+#[test]
+fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
+    let enrollment = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../bloom/src/triad_enrollment.rs");
+    let source = std::fs::read_to_string(&enrollment)
+        .unwrap_or_else(|error| panic!("read {}: {error}", enrollment.display()));
+    assert!(
+        source.contains(&format!(
+            "const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = \"{BUILDER_ORDER_INTENT}\";"
+        )),
+        "the pinned Bloom does not catalogue {BUILDER_ORDER_INTENT} as a fee-bearing class"
+    );
+    assert!(
+        source.matches("fee_asset: catalogued_fee_asset(").count() >= 2,
+        "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
+    );
+    assert!(
+        !source.contains("fee_asset: None"),
+        "the pinned Bloom still enrolls a class with an unconditional fee_asset: None"
+    );
 }

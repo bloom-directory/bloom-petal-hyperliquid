@@ -5,13 +5,26 @@ account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
-`raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`, and
-`withdraw.json`.
+`raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`,
+`approve_builder_fee.json`, `builder_order.json`, and `withdraw.json`.
 `usd_class_transfer.json` moves USDC between the wallet's own spot and perp
-engines and is owner-only; it is deliberately absent from the delegated agent
-session surface. `send_asset.json` is a deprecated alias
-for `usd_send.json`; it does not implement Hyperliquid's generalized
-`sendAsset` action. `withdraw.json` submits Hyperliquid's `withdraw3`
+engines; it and `approve_builder_fee.json` are owner-only, signed by the main
+wallet, and deliberately absent from the delegated agent session surface.
+`send_asset.json` is a deprecated alias for `usd_send.json`; it does not
+implement Hyperliquid's generalized `sendAsset` action. An order carrying a
+per-order `builder` fee is written to `builder_order.json` (owner-signed, or
+through the session route of the same name), which signs under
+`hyperliquid.builder_order`, the Petal's only fee-bearing operation class;
+`order.json` refuses a builder. What is refused, and why the bound is what it
+is, is set out in README.md; the rules that decide whether
+a call succeeds are: a builder-bearing sell must be post-only (`Alo`); a
+builder-bearing trigger order is refused; an order of only spot buys is
+refused; and a builder-bearing leg is accepted only where the fee is known to
+be USDC, meaning core perps and spot sells on USDC-quoted pairs, so HIP-3
+perps, outcome markets and spot sells quoted in another token are refused. A
+delegated session may use a builder fee only if it was created with a matching
+`builder_address`/`max_builder_fee_tenths_bps` bound, which is also what adds
+the fee-bearing class to that session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
 settlement proof. Operation records are listed at `withdrawals/` and readable
