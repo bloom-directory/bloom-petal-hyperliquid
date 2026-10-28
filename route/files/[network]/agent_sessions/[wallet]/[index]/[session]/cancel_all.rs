@@ -3,7 +3,7 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write anything to invoke session cancel_all"
+            "description": "write anything to invoke session cancel_all; one write cancels at most 125 orders, so repeat until no session orders remain"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
