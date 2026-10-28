@@ -7,8 +7,10 @@ petal::route_file!(
             "body": {
                 "destination": "0x-prefixed account address",
                 "amount": "positive USDC decimal with at most 6 decimal places",
-                "nonce": "optional timestamp in milliseconds"
-            }
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds"
+            },
+            "example": {"destination": "<0x recipient address>", "amount": "1"},
+            "success_evidence": "after the owner approves and the same body is written again, last_response.json has status ok; it holds only the latest owner exchange response for this account"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

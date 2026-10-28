@@ -3,7 +3,46 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid order.json request; signed actions require Bloom approval"
+            "description": "write a Hyperliquid order as the wallet owner; the first write stages it for the owner's Bloom approval and fails with approval required; after the owner approves, write the exact same body again to submit it",
+            "request_schema": {
+                "action": {
+                    "type": "order",
+                    "orders": [{
+                        "a": "unsigned integer asset index: a perpetual's position in the universe array of <network>/perp_meta.json for the same network (mainnet and testnet differ), or 10000 + its index in <network>/spot_meta.json for spot",
+                        "b": "boolean; true buys and false sells",
+                        "p": "positive decimal price string",
+                        "s": "positive decimal size string",
+                        "r": "boolean reduce-only flag",
+                        "t": {"limit": {"tif": "Alo (post-only), Gtc, or Ioc"}},
+                        "c": "optional 16-byte 0x client order id"
+                    }],
+                    "grouping": "na, normalTpsl, or positionTpsl"
+                },
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds",
+                "vaultAddress": "optional 0x vault or subaccount address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "example": {
+                "action": {
+                    "type": "order",
+                    "orders": [{
+                        "a": "<replace with the coin's index in <network>/perp_meta.json>",
+                        "b": true,
+                        "p": "95000",
+                        "s": "0.0002",
+                        "r": false,
+                        "t": {"limit": {"tif": "Alo"}},
+                        "c": "0x00112233445566778899aabbccddeeff"
+                    }],
+                    "grouping": "na"
+                }
+            },
+            "success_evidence": {
+                "staged": "the first write fails with permission denied naming approval required for exchange: the order waits for the owner and is not submitted",
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/open_orders.json",
+                "predicate": "after approval and the repeated write, an open order has the submitted cloid, or the submitted coin, side, limitPx and sz",
+                "notes": "Read owner_address from wallets/<wallet>/<index>/address.evm. last_response.json holds only the latest owner exchange response for this account"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

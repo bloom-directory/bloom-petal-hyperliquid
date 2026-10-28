@@ -283,7 +283,7 @@ fn safe_json(v: &Value) -> String {
 pub fn exchange_last_response(n: Network, w: &str) -> DispatchResponse {
     match load_bytes(&last_response_key(n, w)) {
         Ok(Some(bytes)) => DispatchResponse::Read(bytes),
-        Ok(None) => invalid("no exchange response has been recorded"),
+        Ok(None) => petal::read_json_value(&Value::Null),
         Err(response) => response,
     }
 }
@@ -477,6 +477,7 @@ fn owner_nonce(
     explicit: Option<u64>,
 ) -> Result<(u64, Option<String>, bool), DispatchResponse> {
     if let Some(nonce) = explicit {
+        fresh_nonce(nonce, petal::sdk::now_ms())?;
         return Ok((nonce, None, false));
     }
     let key = owner_nonce_key(n, w, leaf, body);
@@ -487,7 +488,7 @@ fn owner_nonce(
         }
         if pending.expires_ms <= now {
             return Err(invalid(
-                "approval expired; retry with an explicit fresh nonce",
+                "approval expired; retry with nonce set to the current Unix time in milliseconds",
             ));
         }
         return Ok((pending.nonce, Some(key), false));
@@ -553,6 +554,16 @@ fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
         Err(e) => Err(backend(e.message())),
     }
 }
+/// Hyperliquid accepts a nonce only within (now - 2 days, now + 1 day).
+fn fresh_nonce(nonce: u64, now_ms: u64) -> Result<(), DispatchResponse> {
+    const DAY_MS: u64 = 86_400_000;
+    if nonce <= now_ms.saturating_sub(2 * DAY_MS) || nonce >= now_ms.saturating_add(DAY_MS) {
+        return Err(invalid(format!(
+            "nonce {nonce} is outside Hyperliquid's accepted window around the current time {now_ms} ms; omit nonce or set it to the current Unix time in milliseconds"
+        )));
+    }
+    Ok(())
+}
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     let now = petal::sdk::now_ms();
     for offset in 0..1024_u64 {
@@ -579,6 +590,7 @@ fn session_nonce(
     explicit: Option<u64>,
 ) -> Result<(u64, Option<String>, bool), DispatchResponse> {
     if let Some(nonce) = explicit {
+        fresh_nonce(nonce, petal::sdk::now_ms())?;
         return Ok((nonce, None, false));
     }
     let digest = session_operation_digest(action, vault, expires)?;
@@ -2583,7 +2595,14 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             }
             (p.session, p.nonce)
         }
-        None => (generated_session, req.nonce.unwrap_or(now)),
+        None => {
+            if let Some(nonce) = req.nonce
+                && let Err(response) = fresh_nonce(nonce, now)
+            {
+                return response;
+            }
+            (generated_session, req.nonce.unwrap_or(now))
+        }
     };
     if session.key_ref_jcs != derived.0 || session.agent_address != derived.1 {
         return backend("pending session does not match the Signer-owned KeyRef");
@@ -3589,6 +3608,28 @@ mod tests {
             read_json_response(200, raw.clone()),
             DispatchResponse::Read(raw)
         );
+    }
+
+    #[test]
+    fn explicit_nonces_must_fall_inside_the_venue_window() {
+        const DAY_MS: u64 = 86_400_000;
+        let now = 1_793_000_000_000; // 2026-10-26
+        for nonce in [now, now - 2 * DAY_MS + 1, now + DAY_MS - 1] {
+            assert!(fresh_nonce(nonce, now).is_ok(), "{nonce}");
+        }
+        // 1730000000000 is October 2024: an agent-supplied nonce the venue would reject.
+        for nonce in [
+            1_730_000_000_000,
+            now - 2 * DAY_MS,
+            now + DAY_MS,
+            0,
+            u64::MAX,
+        ] {
+            assert!(
+                matches!(fresh_nonce(nonce, now), Err(DispatchResponse::Error { code: -3, message }) if message.contains("omit nonce")),
+                "{nonce}"
+            );
+        }
     }
 
     #[test]

@@ -7,8 +7,9 @@ petal::route_file!(
             "body": {
                 "destination": "non-zero 0x-prefixed destination address on Arbitrum",
                 "amount": "positive USDC decimal with at most 6 decimal places that exceeds the venue withdrawal fee",
-                "nonce": "optional timestamp in milliseconds; retries of the same body reuse the recorded operation"
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds; retries of the same body reuse the recorded operation"
             },
+            "example": {"destination": "<0x Arbitrum destination address>", "amount": "5"},
             "records": "withdrawals/ lists every recorded withdrawal; withdrawals/<nonce>.json is the durable operation record (action, nonce, status approval_pending/submitted/accepted/rejected, venue response). status accepted means venue acceptance, never settlement proof"
         }))
     },
