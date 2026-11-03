@@ -309,9 +309,22 @@ fn last_response_key(n: Network, w: &str) -> String {
     ])
 }
 
+/// Created before the first send and never rewritten or removed. The nonce
+/// record is rewritten whole by concurrent approval writes, so its own
+/// `submitted` field can be reset by a stale writer; this marker cannot.
+fn sent_marker_key(key: &str) -> String {
+    format!("{}.sent.json", key.trim_end_matches(".json"))
+}
+
 /// Every caller saves right before sending to Hyperliquid or after it
 /// accepted, so the record is marked submitted from here on.
 fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
+    let marker = sent_marker_key(key);
+    if let Err(first_error) = save_json_new(marker.clone(), &true, false)
+        && load_bytes(&marker)?.is_none()
+    {
+        return Err(first_error);
+    }
     let existing = load_json::<PendingNonce>(key.to_owned())?;
     save_json(
         key.to_owned(),
@@ -487,7 +500,8 @@ fn owner_nonce(
     let key = owner_nonce_key(n, w, leaf, body);
     let now = petal::sdk::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        return resume_pending(&pending, now)
+        let sent = load_bytes(&sent_marker_key(&key))?.is_some();
+        return resume_pending(&pending, sent, now)
             .map(|completed| (pending.nonce, Some(key), completed))
             .map_err(invalid);
     }
@@ -523,15 +537,16 @@ fn owner_nonce(
 
 /// Whether a stored owner nonce may be reused (`Ok(completed)`). Resending
 /// the same nonce is safe: Hyperliquid never accepts a nonce twice. A fresh
-/// nonce is a new action, so it is only advised when nothing was sent.
-fn resume_pending(pending: &PendingNonce, now_ms: u64) -> Result<bool, String> {
+/// nonce is a new action, so it is only advised when nothing was sent:
+/// no sent marker and a record that says it was never submitted.
+fn resume_pending(pending: &PendingNonce, sent: bool, now_ms: u64) -> Result<bool, String> {
     if pending.completed {
         return Ok(true);
     }
     if pending.expires_ms > now_ms {
         return Ok(false);
     }
-    if pending.submitted == Some(false) {
+    if !sent && pending.submitted == Some(false) {
         return Err(
             "approval expired before anything was sent; retry with an explicit fresh nonce".into(),
         );
@@ -2818,22 +2833,27 @@ mod tests {
     #[test]
     fn expired_approval_never_advises_a_fresh_nonce_after_a_send() {
         // Accepted by the venue, response lost: completed stays false.
-        for submitted in [Some(true), None] {
-            let error = resume_pending(&pending(10, false, submitted), 10).unwrap_err();
+        // A stale approval write can reset `submitted` to false after the
+        // send began; the sent marker still records the send.
+        for (submitted, sent) in [(Some(true), false), (None, false), (Some(false), true)] {
+            let error = resume_pending(&pending(10, false, submitted), sent, 10).unwrap_err();
             assert!(error.contains("may have reached Hyperliquid"), "{error}");
             assert!(error.contains("reconcile"), "{error}");
         }
-        let error = resume_pending(&pending(10, false, Some(false)), 10).unwrap_err();
+        let error = resume_pending(&pending(10, false, Some(false)), false, 10).unwrap_err();
         assert!(error.contains("before anything was sent"), "{error}");
     }
 
     #[test]
     fn live_or_completed_records_reuse_their_nonce() {
         assert_eq!(
-            resume_pending(&pending(11, false, Some(true)), 10),
+            resume_pending(&pending(11, false, Some(true)), true, 10),
             Ok(false)
         );
-        assert_eq!(resume_pending(&pending(0, true, Some(true)), 10), Ok(true));
+        assert_eq!(
+            resume_pending(&pending(0, true, Some(true)), true, 10),
+            Ok(true)
+        );
     }
 
     #[test]

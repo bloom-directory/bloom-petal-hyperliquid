@@ -25,7 +25,7 @@ petal::route_file!(
                 "s": "required size in the coin (not USD) as a decimal string with at most szDecimals decimals, from perp_meta.json or spot_meta.json",
                 "r": "required reduce-only flag",
                 "t": "required, exactly one of {\"limit\":{\"tif\":\"Gtc\"|\"Ioc\"|\"Alo\"}} or {\"trigger\":{\"isMarket\":bool,\"triggerPx\":decimal string,\"tpsl\":\"tp\"|\"sl\"}}. Gtc fills what crosses now and rests the remainder; Ioc fills what it can now and cancels the rest; Alo only rests and is rejected if it would cross",
-                "c": "required client order id: 0x plus 32 hex digits, unique per order. Use it to find the order in users/<account>/frontend_open_orders.json and fills.json"
+                "c": "required client order id: 0x plus 32 hex digits, new for every order; never reuse one, even across batches. Use it to find the order in users/<account>/frontend_open_orders.json and fills.json"
             },
             "uncertain_outcome": "If a write fails after approval, the order may still have reached Hyperliquid. Write the same body again (the same nonce can never execute twice), or reconcile by c before writing anything with a new nonce: a new nonce is a new order."
         }))
@@ -64,6 +64,9 @@ petal::route_file!(
                 -3,
                 "every order needs c, a unique client order id (0x plus 32 hex digits), so an uncertain submission can be reconciled",
             );
+        }
+        if crate::shares_cloid(orders) {
+            return petal::error(-3, "two orders share c; give each order its own client order id");
         }
         crate::owner_action_write(ctx, network, wallet, "order.json", body, request)
     }
