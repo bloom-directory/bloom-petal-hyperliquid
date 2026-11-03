@@ -309,6 +309,8 @@ fn last_response_key(n: Network, w: &str) -> String {
     ])
 }
 
+/// Every caller saves right before sending to Hyperliquid or after it
+/// accepted, so the record is marked submitted from here on.
 fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
     let existing = load_json::<PendingNonce>(key.to_owned())?;
     save_json(
@@ -318,6 +320,7 @@ fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchRe
             expires_ms: existing.as_ref().map_or(u64::MAX, |state| state.expires_ms),
             action_id: existing.and_then(|state| state.action_id),
             completed,
+            submitted: Some(true),
         },
         false,
     )
@@ -356,19 +359,21 @@ fn owner_sign_or_approval(
             action_id,
             expires_ms,
         }) => {
-            if let Some(key) = approval_ctx.pending_nonce_key
-                && let Err(e) = save_json(
+            if let Some(key) = approval_ctx.pending_nonce_key {
+                // A new approval for an already-sent nonce must not hide that send.
+                let submitted = load_json::<PendingNonce>(key.to_owned())?
+                    .map_or(Some(false), |state| state.submitted);
+                save_json(
                     key.to_owned(),
                     &PendingNonce {
                         nonce: approval_ctx.nonce,
                         expires_ms,
                         action_id: Some(action_id.clone()),
                         completed: false,
+                        submitted,
                     },
                     false,
-                )
-            {
-                return Err(e);
+                )?;
             }
             Err(approval(
                 approval_ctx.kind,
@@ -482,15 +487,9 @@ fn owner_nonce(
     let key = owner_nonce_key(n, w, leaf, body);
     let now = petal::sdk::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        if pending.completed {
-            return Ok((pending.nonce, Some(key), true));
-        }
-        if pending.expires_ms <= now {
-            return Err(invalid(
-                "approval expired; retry with an explicit fresh nonce",
-            ));
-        }
-        return Ok((pending.nonce, Some(key), false));
+        return resume_pending(&pending, now)
+            .map(|completed| (pending.nonce, Some(key), completed))
+            .map_err(invalid);
     }
     let marker = hex::encode(sha3::Keccak256::digest(body));
     let nonce = reserve_nonce(
@@ -511,6 +510,7 @@ fn owner_nonce(
         expires_ms: u64::MAX,
         action_id: None,
         completed: false,
+        submitted: Some(false),
     };
     match save_json_new(key.clone(), &candidate, false) {
         Ok(()) => Ok((candidate.nonce, Some(key), false)),
@@ -521,6 +521,31 @@ fn owner_nonce(
     }
 }
 
+/// Whether a stored owner nonce may be reused (`Ok(completed)`). Resending
+/// the same nonce is safe: Hyperliquid never accepts a nonce twice. A fresh
+/// nonce is a new action, so it is only advised when nothing was sent.
+fn resume_pending(pending: &PendingNonce, now_ms: u64) -> Result<bool, String> {
+    if pending.completed {
+        return Ok(true);
+    }
+    if pending.expires_ms > now_ms {
+        return Ok(false);
+    }
+    if pending.submitted == Some(false) {
+        return Err(
+            "approval expired before anything was sent; retry with an explicit fresh nonce".into(),
+        );
+    }
+    Err(format!(
+        "approval expired after nonce {} may have reached Hyperliquid; its outcome is unknown. \
+         A fresh nonce is a new action and can duplicate it. First reconcile through \
+         last_response.json and the account's venue reads (for orders, \
+         users/<account>/frontend_open_orders.json and fills.json matched by c), then retry \
+         with an explicit fresh nonce only if it did not execute",
+        pending.nonce
+    ))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingNonce {
     nonce: u64,
@@ -529,6 +554,10 @@ struct PendingNonce {
     action_id: Option<String>,
     #[serde(default)]
     completed: bool,
+    /// `Some(true)` once sent to Hyperliquid; `None` for records written
+    /// before this field existed, which are treated as possibly sent.
+    #[serde(default)]
+    submitted: Option<bool>,
 }
 /// A cleanup action waiting on the owner's Exact approval. The approval covers
 /// one payload, and `close_all` prices from live mids, so rebuilding on the
@@ -592,6 +621,7 @@ fn session_nonce(
         expires_ms: u64::MAX,
         action_id: None,
         completed: false,
+        submitted: Some(false),
     };
     match save_json_new(key.clone(), &candidate, false) {
         Ok(()) => Ok((candidate.nonce, Some(key), false)),
@@ -2752,6 +2782,59 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNER_ORDER_HELP: &str =
+        include_str!("../files/[network]/exchange/[wallet]/[index]/order.json.rs");
+
+    #[test]
+    fn owner_order_help_examples_pass_the_request_parser() {
+        let examples: Vec<&str> = OWNER_ORDER_HELP
+            .split("r#\"")
+            .skip(1)
+            .map(|rest| rest.split("\"#").next().unwrap())
+            .collect();
+        assert_eq!(examples.len(), 2);
+        for raw in examples {
+            let request: SignSubmit = serde_json::from_str(raw).expect(raw);
+            request.action.validate().expect(raw);
+            request.action.validate_owner_review().expect(raw);
+            let ExchangeAction::Order { orders, .. } = &request.action else {
+                panic!("help example is not an order: {raw}");
+            };
+            assert!(orders.iter().all(|order| order.cloid.is_some()), "{raw}");
+        }
+    }
+
+    fn pending(expires_ms: u64, completed: bool, submitted: Option<bool>) -> PendingNonce {
+        PendingNonce {
+            nonce: 7,
+            expires_ms,
+            action_id: Some("a".into()),
+            completed,
+            submitted,
+        }
+    }
+
+    #[test]
+    fn expired_approval_never_advises_a_fresh_nonce_after_a_send() {
+        // Accepted by the venue, response lost: completed stays false.
+        for submitted in [Some(true), None] {
+            let error = resume_pending(&pending(10, false, submitted), 10).unwrap_err();
+            assert!(error.contains("may have reached Hyperliquid"), "{error}");
+            assert!(error.contains("reconcile"), "{error}");
+        }
+        let error = resume_pending(&pending(10, false, Some(false)), 10).unwrap_err();
+        assert!(error.contains("before anything was sent"), "{error}");
+    }
+
+    #[test]
+    fn live_or_completed_records_reuse_their_nonce() {
+        assert_eq!(
+            resume_pending(&pending(11, false, Some(true)), 10),
+            Ok(false)
+        );
+        assert_eq!(resume_pending(&pending(0, true, Some(true)), 10), Ok(true));
+    }
 
     #[test]
     fn oversized_owner_batch_is_rejected_before_any_host_call() {
