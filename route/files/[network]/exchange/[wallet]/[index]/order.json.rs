@@ -68,6 +68,12 @@ petal::route_file!(
         if crate::shares_cloid(orders) {
             return petal::error(-3, "two orders share c; give each order its own client order id");
         }
+        if request.action.carries_builder() {
+            return petal::error(
+                -3,
+                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
+            );
+        }
         crate::owner_action_write(ctx, network, wallet, "order.json", body, request)
     }
 );
