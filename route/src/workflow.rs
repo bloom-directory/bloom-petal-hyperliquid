@@ -317,7 +317,10 @@ fn sent_marker_key(key: &str) -> String {
 }
 
 /// Every caller saves right before sending to Hyperliquid or after it
-/// accepted, so the record is marked submitted from here on.
+/// accepted, so the record is marked submitted from here on. It also stops
+/// expiring: a released reader that ignores `submitted` and the sent marker
+/// then reuses this nonce, which can execute once, instead of advising a
+/// fresh one. A later approval for the same nonce sets a new expiry.
 fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
     let marker = sent_marker_key(key);
     if let Err(first_error) = save_json_new(marker.clone(), &true, false)
@@ -328,15 +331,19 @@ fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchRe
     let existing = load_json::<PendingNonce>(key.to_owned())?;
     save_json(
         key.to_owned(),
-        &PendingNonce {
-            nonce,
-            expires_ms: existing.as_ref().map_or(u64::MAX, |state| state.expires_ms),
-            action_id: existing.and_then(|state| state.action_id),
-            completed,
-            submitted: Some(true),
-        },
+        &submitted_record(existing, nonce, completed),
         false,
     )
+}
+
+fn submitted_record(existing: Option<PendingNonce>, nonce: u64, completed: bool) -> PendingNonce {
+    PendingNonce {
+        nonce,
+        expires_ms: u64::MAX,
+        action_id: existing.and_then(|state| state.action_id),
+        completed,
+        submitted: Some(true),
+    }
 }
 
 struct OwnerApproval<'a> {
@@ -2870,6 +2877,17 @@ mod tests {
         let error =
             resume_pending(&pending(10, false, Some(false)), "order.json", false, 10).unwrap_err();
         assert!(error.contains("before anything was sent"), "{error}");
+    }
+
+    /// v0.1.9 reads only `expires_ms` and advises a fresh nonce once it has
+    /// passed. A sent record must never look expired to it.
+    #[test]
+    fn a_sent_record_never_looks_expired_to_a_released_reader() {
+        let record = submitted_record(Some(pending(10, false, Some(false))), 7, false);
+        assert_eq!(record.expires_ms, u64::MAX);
+        assert_eq!(record.action_id.as_deref(), Some("a"));
+        let released: serde_json::Value = serde_json::to_value(&record).unwrap();
+        assert!(released["expires_ms"].as_u64().unwrap() > 4_102_444_800_000);
     }
 
     #[test]
