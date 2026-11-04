@@ -585,6 +585,9 @@ fn reconcile_reads(leaf: &str) -> &'static str {
         "update_leverage.json" => {
             "users/<account>/clearinghouse.json, to see the asset's current leverage"
         }
+        // Normally refused earlier by `withdraw_resume`; a record left by
+        // v0.1.9 can still reach this message.
+        "withdraw.json" => "withdrawals/<nonce>.json and the destination's balance on Arbitrum",
         _ => {
             "the balances in users/<account>/clearinghouse.json and spot_state.json for both sides of the transfer"
         }
@@ -2898,6 +2901,16 @@ mod tests {
             assert!(error.contains("spot_state.json"), "{error}");
             assert!(!error.contains("fills.json"), "{error}");
         }
+    }
+
+    /// A v0.1.9 withdrawal record (no `submitted`, real expiry) that expired
+    /// is pointed at the withdrawal record, not at balance or order reads.
+    #[test]
+    fn an_expired_v019_withdrawal_points_at_its_withdrawal_record() {
+        let error =
+            resume_pending(&pending(10, false, None), "withdraw.json", true, 10).unwrap_err();
+        assert!(error.contains("withdrawals/<nonce>.json"), "{error}");
+        assert!(!error.contains("spot_state.json"), "{error}");
     }
 
     #[test]
