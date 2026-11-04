@@ -25,9 +25,9 @@ petal::route_file!(
                 "s": "required size in the coin (not USD) as a decimal string with at most szDecimals decimals, from perp_meta.json or spot_meta.json",
                 "r": "required reduce-only flag",
                 "t": "required, exactly one of {\"limit\":{\"tif\":\"Gtc\"|\"Ioc\"|\"Alo\"}} or {\"trigger\":{\"isMarket\":bool,\"triggerPx\":decimal string,\"tpsl\":\"tp\"|\"sl\"}}. Gtc fills what crosses now and rests the remainder; Ioc fills what it can now and cancels the rest; Alo only rests and is rejected if it would cross",
-                "c": "required client order id: 0x plus 32 hex digits, new for every order; never reuse one, even across batches. Use it to find the order in users/<account>/frontend_open_orders.json and fills.json"
+                "c": "required client order id: 0x plus 32 hex digits, new for every order. The Petal refuses a repeat only within one request; reusing one from an earlier request is accepted, and then c no longer identifies this order. Use it to find the order in users/<account>/frontend_open_orders.json and fills.json"
             },
-            "uncertain_outcome": "If a write fails after approval, the order may still have reached Hyperliquid. Write the same body again (the same nonce can never execute twice), or reconcile by c before writing anything with a new nonce: a new nonce is a new order."
+            "uncertain_outcome": "If a write fails after approval, the order may still have reached Hyperliquid. Write the same body again (the same nonce can never execute twice), or reconcile by c before writing anything with a new nonce: a new nonce is a new order. Reconciling by c is only reliable if no earlier request used the same c."
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

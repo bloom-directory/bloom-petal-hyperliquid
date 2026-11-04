@@ -501,7 +501,7 @@ fn owner_nonce(
     let now = petal::sdk::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
         let sent = load_bytes(&sent_marker_key(&key))?.is_some();
-        return resume_pending(&pending, sent, now)
+        return resume_pending(&pending, leaf, sent, now)
             .map(|completed| (pending.nonce, Some(key), completed))
             .map_err(invalid);
     }
@@ -539,7 +539,12 @@ fn owner_nonce(
 /// the same nonce is safe: Hyperliquid never accepts a nonce twice. A fresh
 /// nonce is a new action, so it is only advised when nothing was sent:
 /// no sent marker and a record that says it was never submitted.
-fn resume_pending(pending: &PendingNonce, sent: bool, now_ms: u64) -> Result<bool, String> {
+fn resume_pending(
+    pending: &PendingNonce,
+    leaf: &str,
+    sent: bool,
+    now_ms: u64,
+) -> Result<bool, String> {
     if pending.completed {
         return Ok(true);
     }
@@ -554,11 +559,29 @@ fn resume_pending(pending: &PendingNonce, sent: bool, now_ms: u64) -> Result<boo
     Err(format!(
         "approval expired after nonce {} may have reached Hyperliquid; its outcome is unknown. \
          A fresh nonce is a new action and can duplicate it. First reconcile through \
-         last_response.json and the account's venue reads (for orders, \
-         users/<account>/frontend_open_orders.json and fills.json matched by c), then retry \
-         with an explicit fresh nonce only if it did not execute",
-        pending.nonce
+         last_response.json and {}, then retry with an explicit fresh nonce only if it did \
+         not execute",
+        pending.nonce,
+        reconcile_reads(leaf)
     ))
+}
+
+/// Where an owner can see whether an uncertain action of this route executed.
+fn reconcile_reads(leaf: &str) -> &'static str {
+    match leaf {
+        "order.json" => {
+            "users/<account>/frontend_open_orders.json and fills.json, matched by each order's c"
+        }
+        "cancel.json" | "cancel_by_cloid.json" | "schedule_cancel.json" => {
+            "users/<account>/frontend_open_orders.json, to see whether the orders are still open"
+        }
+        "update_leverage.json" => {
+            "users/<account>/clearinghouse.json, to see the asset's current leverage"
+        }
+        _ => {
+            "the balances in users/<account>/clearinghouse.json and spot_state.json for both sides of the transfer"
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2836,22 +2859,37 @@ mod tests {
         // A stale approval write can reset `submitted` to false after the
         // send began; the sent marker still records the send.
         for (submitted, sent) in [(Some(true), false), (None, false), (Some(false), true)] {
-            let error = resume_pending(&pending(10, false, submitted), sent, 10).unwrap_err();
+            let error =
+                resume_pending(&pending(10, false, submitted), "order.json", sent, 10).unwrap_err();
             assert!(error.contains("may have reached Hyperliquid"), "{error}");
-            assert!(error.contains("reconcile"), "{error}");
+            assert!(
+                error.contains("fills.json, matched by each order's c"),
+                "{error}"
+            );
         }
-        let error = resume_pending(&pending(10, false, Some(false)), false, 10).unwrap_err();
+        let error =
+            resume_pending(&pending(10, false, Some(false)), "order.json", false, 10).unwrap_err();
         assert!(error.contains("before anything was sent"), "{error}");
+    }
+
+    #[test]
+    fn uncertain_transfers_are_not_reconciled_by_order_reads() {
+        for leaf in ["send_asset.json", "usd_class_transfer.json"] {
+            let error =
+                resume_pending(&pending(10, false, Some(true)), leaf, true, 10).unwrap_err();
+            assert!(error.contains("spot_state.json"), "{error}");
+            assert!(!error.contains("fills.json"), "{error}");
+        }
     }
 
     #[test]
     fn live_or_completed_records_reuse_their_nonce() {
         assert_eq!(
-            resume_pending(&pending(11, false, Some(true)), true, 10),
+            resume_pending(&pending(11, false, Some(true)), "order.json", true, 10),
             Ok(false)
         );
         assert_eq!(
-            resume_pending(&pending(0, true, Some(true)), true, 10),
+            resume_pending(&pending(0, true, Some(true)), "order.json", true, 10),
             Ok(true)
         );
     }
