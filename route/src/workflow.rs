@@ -258,11 +258,16 @@ fn freeze_owner_attempt(
     let action = prepared_owner_action(payload, class)
         .map_err(invalid)?
         .ok_or_else(|| invalid("unsupported prepared review"))?;
-    petal::signing::Attempt::open(&mut petal::signing::CtxHost(ctx), &scope, || {
-        Ok((action, ()))
-    })
+    petal::signing::prepare(
+        &mut petal::signing::CtxHost(ctx),
+        wallet,
+        &scope,
+        petal::signing::PrepareMode::Resume,
+        || Ok((action.clone(), ())),
+        |attempt| attempt.check_action(&action),
+    )
     .map(|_| ())
-    .map_err(|e| backend(e.to_string()))
+    .map_err(Into::into)
 }
 
 fn prepared_owner_sign_with_host(
@@ -272,24 +277,21 @@ fn prepared_owner_sign_with_host(
     action: petal::signing::PreparedAction,
     legacy_pending: bool,
 ) -> Result<SignOutcome, String> {
-    use petal::signing::{Attempt, AttemptState, sign_or_resume};
-    let existing = Attempt::<()>::load(host, scope).map_err(|e| e.to_string())?;
-    if existing.is_none() && legacy_pending {
-        return Err(
-            "legacy approval pending; reconcile using the installed previous package".into(),
-        );
-    }
-    let attempt = match existing {
-        Some(attempt) => attempt,
-        None => {
-            Attempt::open(host, scope, || Ok((action.clone(), ()))).map_err(|e| e.to_string())?
-        }
+    use petal::signing::{AttemptState, PrepareMode};
+    let mode = if legacy_pending {
+        PrepareMode::ExistingOnly
+    } else {
+        PrepareMode::Resume
     };
-    if attempt.action() != &action {
-        return Err("prepared action conflict; reconcile the original operation".into());
-    }
-    match sign_or_resume(host, wallet, &attempt) {
-        Ok(signature) => Ok(SignOutcome::Signature(signature)),
+    match petal::prepared_sign!(
+        host: host,
+        wallet: wallet,
+        scope: scope,
+        mode: mode,
+        build: || Ok((action.clone(), ())),
+        validate: |attempt| attempt.check_action(&action),
+    ) {
+        Ok((_, signature)) => Ok(SignOutcome::Signature(signature)),
         Err(halt) => match halt.state {
             Some(AttemptState::Pending {
                 action_id,
@@ -298,6 +300,9 @@ fn prepared_owner_sign_with_host(
                 action_id,
                 expires_ms,
             }),
+            _ if legacy_pending && halt.message == "no existing signing attempt" => Err(
+                "legacy approval pending; reconcile using the installed previous package".into(),
+            ),
             _ => Err(halt.message),
         },
     }
@@ -3195,7 +3200,7 @@ mod tests {
         assert!(
             prepared_owner_sign_with_host(&mut host, "main", "scope", changed, true)
                 .unwrap_err()
-                .contains("conflict")
+                .contains("signing inputs changed")
         );
         assert_eq!(host.calls.len(), 3);
     }

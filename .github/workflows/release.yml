@@ -14,10 +14,10 @@ concurrency:
 
 jobs:
   release:
-    uses: bloom-directory/petal/.github/workflows/release-petal.yml@465d6f2464a6a87910128f5448d1543ccb2aeb2a
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37
     with:
       petal-name: hyperliquid
-      petal-tooling-ref: "465d6f2464a6a87910128f5448d1543ccb2aeb2a"
+      petal-tooling-ref: "66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37"
       build-command: scripts/build.sh
       package-root: .
       expected-route-count: 73
