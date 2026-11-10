@@ -54,7 +54,9 @@ has already expired, they submit as the wallet owner with a fresh
 payload-specific Exact approval, which the stop does not revoke, so a stopped
 session cannot strand open orders. Retry the same write after completing that
 ceremony: a pending `close_all` replays the order the owner is approving until
-that approval expires, rather than repricing it from new mids.
+that approval expires, rather than repricing it from new mids. One write
+cancels at most 125 orders or closes at most 41 positions, the most one owner
+approval can display; write it again until no orders or positions remain.
 
 The Petal receives only a bare denial, so any refused delegated attempt, not
 only a stop, moves cleanup to owner approval. A core stop also leaves this
