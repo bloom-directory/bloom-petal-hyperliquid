@@ -167,6 +167,14 @@ fn sign_payload(
     advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
+    // The generic prepared host verifies complete EIP-712 messages. Its
+    // review contract cannot yet verify Hyperliquid's ordered L1 witness.
+    // Legacy effects/advisories below are not prepared debit declarations:
+    // venue assets have no supported prepared Asset identity. Fee disclosure
+    // remains in withdrawal help and its durable operation record.
+    if key_ref_jcs.is_none() && prepared_owner_action(payload, operation_class)?.is_some() {
+        return prepared_owner_sign(ctx, wallet, payload, operation_class, approval_hint);
+    }
     let request = sign_request(
         ctx,
         wallet,
@@ -179,6 +187,127 @@ fn sign_payload(
     )?;
     petal::sdk::sign_payload(&request).map_err(|e| e.message())
 }
+// Venue USDC and an unbounded agent authorization are not ERC-20 debits.
+// Unspecified deliberately requires exact approval rather than claiming a zero
+// or bounded persona spend. Preserve the original protocol preimage and review.
+fn prepared_owner_action(
+    payload: &protocol::SigningPayload,
+    class: &str,
+) -> Result<Option<petal::signing::PreparedAction>, String> {
+    use petal::signing::{PreparedAction, ReviewArtifact, SigningPayload, Spend};
+    let review: Value = serde_json::from_slice(&payload.review).map_err(|e| e.to_string())?;
+    if review["kind"] != "eip712" {
+        return Ok(None);
+    }
+    let signing = SigningPayload::keccak256(payload.preimage.clone()).map_err(|e| e.to_string())?;
+    if signing.hash != payload.hash.0 {
+        return Err("prepared payload differs from protocol hash".into());
+    }
+    PreparedAction::new(
+        class,
+        signing,
+        ReviewArtifact::new("bloom.message.review", 1, payload.review.clone())
+            .map_err(|e| e.to_string())?,
+    )
+    .map(|action| Some(action.with_spend(Spend::Unspecified)))
+    .map_err(|e| e.to_string())
+}
+
+fn prepared_route_scope(ctx: &Ctx, wallet: &str) -> Result<String, String> {
+    let network = petal::param(ctx, "network").map_err(|_| "missing network")?;
+    let account = petal::param(ctx, "index").map_err(|_| "missing account index")?;
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(route_id(ctx)?, network, wallet, account))
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(format!("state/prepared/{}/", hex::encode(digest)))
+}
+
+fn prepared_scope(ctx: &Ctx, wallet: &str, class: &str, hash: &[u8]) -> Result<String, String> {
+    let digest =
+        Sha256::digest(serde_json::to_vec(&(class, hex::encode(hash))).map_err(|e| e.to_string())?);
+    Ok(format!(
+        "{}{}",
+        prepared_route_scope(ctx, wallet)?,
+        hex::encode(digest)
+    ))
+}
+
+fn prepared_owner_sign(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    class: &str,
+    legacy_hint: Option<String>,
+) -> Result<SignOutcome, String> {
+    let scope = prepared_scope(ctx, wallet, class, payload.hash.as_slice())?;
+    let mut host = petal::signing::CtxHost(ctx);
+    let action = prepared_owner_action(payload, class)?.ok_or("unsupported prepared review")?;
+    prepared_owner_sign_with_host(&mut host, wallet, &scope, action, legacy_hint.is_some())
+}
+
+// Freeze before creating the protocol record, so a crash between these writes
+// remains resumable without confusing this build's record with a legacy one.
+fn freeze_owner_attempt(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    class: &str,
+) -> Result<(), DispatchResponse> {
+    let scope = prepared_scope(ctx, wallet, class, payload.hash.as_slice()).map_err(invalid)?;
+    let action = prepared_owner_action(payload, class)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("unsupported prepared review"))?;
+    petal::signing::prepare(
+        &mut petal::signing::CtxHost(ctx),
+        wallet,
+        &scope,
+        petal::signing::PrepareMode::Resume,
+        || Ok((action.clone(), ())),
+        |attempt| attempt.check_action(&action),
+    )
+    .map(|_| ())
+    .map_err(Into::into)
+}
+
+fn prepared_owner_sign_with_host(
+    host: &mut impl petal::signing::SigningHost,
+    wallet: &str,
+    scope: &str,
+    action: petal::signing::PreparedAction,
+    legacy_pending: bool,
+) -> Result<SignOutcome, String> {
+    use petal::signing::{AttemptState, PrepareMode};
+    let mode = if legacy_pending {
+        PrepareMode::ExistingOnly
+    } else {
+        PrepareMode::Resume
+    };
+    match petal::prepared_sign!(
+        host: host,
+        wallet: wallet,
+        scope: scope,
+        mode: mode,
+        build: || Ok((action.clone(), ())),
+        validate: |attempt| attempt.check_action(&action),
+    ) {
+        Ok((_, signature)) => Ok(SignOutcome::Signature(signature)),
+        Err(halt) => match halt.state {
+            Some(AttemptState::Pending {
+                action_id,
+                expires_ms,
+            }) => Ok(SignOutcome::ApprovalPending {
+                action_id,
+                expires_ms,
+            }),
+            _ if legacy_pending && halt.message == "no existing signing attempt" => Err(
+                "legacy approval pending; reconcile using the installed previous package".into(),
+            ),
+            _ => Err(halt.message),
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sign_request(
     ctx: &Ctx,
@@ -361,6 +490,24 @@ fn owner_sign_or_approval(
     intent: &str,
     approval_ctx: OwnerApproval<'_>,
 ) -> Result<protocol::SignatureJson, DispatchResponse> {
+    let prepared = prepared_owner_action(payload, intent)
+        .map_err(invalid)?
+        .is_some();
+    if prepared
+        && let Some(key) = approval_ctx.pending_nonce_key
+        && let Some(pending) = load_json::<PendingNonce>(key.to_owned())?
+        && (pending.action_id.is_some() || pending.submitted != Some(false))
+    {
+        let scope = prepared_scope(ctx, w, intent, payload.hash.as_slice()).map_err(invalid)?;
+        if petal::signing::Attempt::<()>::load(&mut petal::signing::CtxHost(ctx), &scope)
+            .map_err(|e| backend(e.to_string()))?
+            .is_none()
+        {
+            return Err(invalid(
+                "legacy approval pending; reconcile using the installed previous package",
+            ));
+        }
+    }
     match sign_payload(
         ctx,
         w,
@@ -395,12 +542,20 @@ fn owner_sign_or_approval(
                     false,
                 )?;
             }
-            Err(approval(
-                approval_ctx.kind,
-                &json!({"action_id":action_id,"expires_ms":expires_ms}),
-            ))
+            let details = json!({"action_id":action_id,"expires_ms":expires_ms});
+            Err(if prepared {
+                prepared_approval(approval_ctx.kind, &details)
+            } else {
+                approval(approval_ctx.kind, &details)
+            })
         }
-        Err(e) => Err(denied(format!("signing denied: {e}"))),
+        Err(e) => {
+            if prepared {
+                Err(invalid(e))
+            } else {
+                Err(denied(format!("signing denied: {e}")))
+            }
+        }
     }
 }
 
@@ -1114,6 +1269,24 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
     if completed {
         return ok_write();
     }
+    if record.is_some() {
+        let scope = match prepared_scope(ctx, &w, "hyperliquid.withdraw", payload.hash.as_slice()) {
+            Ok(scope) => scope,
+            Err(e) => return invalid(e),
+        };
+        match petal::signing::Attempt::<()>::load(&mut petal::signing::CtxHost(ctx), &scope) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return invalid(
+                    "legacy withdrawal record; reconcile using the installed previous package",
+                );
+            }
+            Err(e) => return backend(e.to_string()),
+        }
+    }
+    if let Err(response) = freeze_owner_attempt(ctx, &w, &payload, "hyperliquid.withdraw") {
+        return response;
+    }
     match save_json_new(op_key.clone(), &intent, false) {
         Ok(()) => {}
         Err(first_error) => {
@@ -1260,6 +1433,12 @@ pub fn withdraw_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRe
         .collect())
 }
 
+fn prepared_approval(kind: &str, value: &Value) -> DispatchResponse {
+    invalid(format!(
+        "approval required for {kind}: {}",
+        safe_json(value)
+    ))
+}
 fn approval(kind: &str, v: &Value) -> DispatchResponse {
     denied(format!("approval required for {kind}: {}", safe_json(v)))
 }
@@ -2675,6 +2854,29 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             Ok(x) => x,
             Err(e) => return invalid(e),
         };
+    if had_pending {
+        let scope = match prepared_scope(
+            ctx,
+            &w,
+            "hyperliquid.approve_agent",
+            payload.hash.as_slice(),
+        ) {
+            Ok(scope) => scope,
+            Err(e) => return invalid(e),
+        };
+        match petal::signing::Attempt::<()>::load(&mut petal::signing::CtxHost(ctx), &scope) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return invalid(
+                    "legacy session record; reconcile using the installed previous package",
+                );
+            }
+            Err(e) => return backend(e.to_string()),
+        }
+    }
+    if let Err(response) = freeze_owner_attempt(ctx, &w, &payload, "hyperliquid.approve_agent") {
+        return response;
+    }
     if !had_pending
         && let Err(e) = save_json_new(
             pending_key.clone(),
@@ -2732,12 +2934,12 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
             ) {
                 return e;
             }
-            return approval(
+            return prepared_approval(
                 "approve_agent",
                 &json!({"action_id":action_id,"expires_ms":expires_ms,"session":session.id}),
             );
         }
-        Err(e) => return denied(format!("signing denied: {e}")),
+        Err(e) => return invalid(e),
     };
     if let Err(e) = save_json(
         pending_key.clone(),
@@ -2830,6 +3032,217 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PreparedHost {
+        store: std::collections::BTreeMap<String, Vec<u8>>,
+        calls: Vec<(String, petal::signing::PreparedAction)>,
+        outcomes: std::collections::VecDeque<petal::signing::SigningOutcome>,
+        status_calls: usize,
+        writes: usize,
+    }
+    impl petal::signing::SigningHost for PreparedHost {
+        fn package_hash(&self) -> &str {
+            "package"
+        }
+        fn store_get(
+            &mut self,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, petal::signing::SigningError> {
+            Ok(self.store.get(key).cloned())
+        }
+        fn store_put_new(
+            &mut self,
+            key: &str,
+            value: &[u8],
+        ) -> Result<bool, petal::signing::SigningError> {
+            if self.store.contains_key(key) {
+                return Ok(false);
+            }
+            self.writes += 1;
+            self.store.insert(key.into(), value.into());
+            Ok(true)
+        }
+        fn sign(
+            &mut self,
+            _: &str,
+            action: &petal::signing::PreparedAction,
+            key: &str,
+        ) -> Result<petal::signing::SigningOutcome, petal::signing::SigningError> {
+            self.calls.push((key.into(), action.clone()));
+            Ok(self
+                .outcomes
+                .pop_front()
+                .expect("unexpected signing request"))
+        }
+        fn status(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<petal::signing::SigningOutcome, petal::signing::SigningError> {
+            self.status_calls += 1;
+            Ok(petal::signing::SigningOutcome::RecoveryRequired {
+                status: "submission_uncertain".into(),
+            })
+        }
+        fn now_ms(&mut self) -> Result<u64, petal::signing::SigningError> {
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn prepared_user_actions_preserve_protocol_preimages_review_and_unknown_venue_spend() {
+        let address =
+            protocol::parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+        for network in [Network::Mainnet, Network::Testnet] {
+            let cases = [
+                (
+                    "hyperliquid.approve_agent",
+                    protocol::approve_agent_payload(network, address, "agent", 42)
+                        .unwrap()
+                        .1,
+                ),
+                (
+                    "hyperliquid.usd_send",
+                    protocol::usd_send_payload(network, address, "10", 42)
+                        .unwrap()
+                        .1,
+                ),
+                (
+                    "hyperliquid.usd_class_transfer",
+                    protocol::usd_class_transfer_payload(network, "10", true, 42)
+                        .unwrap()
+                        .1,
+                ),
+                (
+                    "hyperliquid.withdraw",
+                    protocol::withdraw_payload(network, address, "10", 42)
+                        .unwrap()
+                        .1,
+                ),
+            ];
+            for (class, payload) in cases {
+                let action = prepared_owner_action(&payload, class).unwrap().unwrap();
+                assert_eq!(action.payload.preimage, payload.preimage);
+                assert_eq!(action.payload.hash, payload.hash.0);
+                assert_eq!(action.review.bytes, payload.review);
+                assert_eq!(action.spend, petal::signing::Spend::Unspecified);
+                action.validate().unwrap();
+            }
+        }
+        let action = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 1 }],
+            fast: None,
+        };
+        let payload =
+            protocol::l1_signing_payload(Network::Mainnet, &action, 42, None, None).unwrap();
+        assert!(
+            prepared_owner_action(&payload, "hyperliquid.cancel")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn prepared_test_action() -> petal::signing::PreparedAction {
+        let address =
+            protocol::parse_address("0x00000000000000000000000000000000000000aa").unwrap();
+        let payload = protocol::withdraw_payload(Network::Testnet, address, "10", 42)
+            .unwrap()
+            .1;
+        prepared_owner_action(&payload, "hyperliquid.withdraw")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn prepared_pending_and_uncertain_retries_keep_one_frozen_operation() {
+        use petal::signing::SigningOutcome;
+        let mut host = PreparedHost::default();
+        host.outcomes.extend([
+            SigningOutcome::ApprovalPending {
+                action_id: "approval".into(),
+                expires_ms: 100,
+            },
+            SigningOutcome::RecoveryRequired {
+                status: "submission_uncertain".into(),
+            },
+            SigningOutcome::Signed {
+                signature: vec![7; 65],
+            },
+        ]);
+        let action = prepared_test_action();
+        assert!(matches!(
+            prepared_owner_sign_with_host(&mut host, "main", "scope", action.clone(), false)
+                .unwrap(),
+            SignOutcome::ApprovalPending { .. }
+        ));
+        let uncertain =
+            prepared_owner_sign_with_host(&mut host, "main", "scope", action.clone(), true)
+                .unwrap_err();
+        assert!(uncertain.contains("submission_uncertain"));
+        assert!(matches!(
+            prepared_owner_sign_with_host(&mut host, "main", "scope", action.clone(), true)
+                .unwrap(),
+            SignOutcome::Signature(_)
+        ));
+        assert_eq!(host.writes, 1);
+        assert_eq!(host.calls.len(), 3);
+        assert!(
+            host.calls
+                .iter()
+                .all(|(key, frozen)| key == "scope#0" && frozen == &action)
+        );
+        // The Petal never invokes a venue submission inside this lifecycle.
+        // Once withdrawal submission is uncertain, its outer guard refuses
+        // before this signing helper is reached (decision-table tests below).
+        let mut changed = action;
+        changed.operation_class = "changed".into();
+        assert!(
+            prepared_owner_sign_with_host(&mut host, "main", "scope", changed, true)
+                .unwrap_err()
+                .contains("signing inputs changed")
+        );
+        assert_eq!(host.calls.len(), 3);
+    }
+
+    #[test]
+    fn legacy_pending_refuses_before_signing_but_new_crash_before_signing_resumes() {
+        let action = prepared_test_action();
+        let mut host = PreparedHost::default();
+        assert!(
+            prepared_owner_sign_with_host(&mut host, "main", "scope", action.clone(), true)
+                .unwrap_err()
+                .contains("legacy")
+        );
+        assert_eq!(host.writes, 0);
+        assert!(host.calls.is_empty());
+        // Production freezes first, then writes the protocol pending record.
+        // A crash after either write leaves an immutable attempt to resume.
+        petal::signing::Attempt::open(&mut host, "scope", || Ok((action.clone(), ()))).unwrap();
+        host.outcomes
+            .push_back(petal::signing::SigningOutcome::ApprovalPending {
+                action_id: "same".into(),
+                expires_ms: 10,
+            });
+        prepared_owner_sign_with_host(&mut host, "main", "scope", action, true).unwrap();
+        assert_eq!(host.writes, 1);
+        assert_eq!(host.calls[0].0, "scope#0");
+    }
+
+    #[test]
+    fn prepared_attempt_status_is_read_only_and_has_no_signature() {
+        let mut host = PreparedHost::default();
+        let attempt =
+            petal::signing::Attempt::open(&mut host, "scope", || Ok((prepared_test_action(), ())))
+                .unwrap();
+        let writes = host.writes;
+        let status = serde_json::to_value(attempt.state(&mut host, "main").unwrap()).unwrap();
+        assert_eq!(status["status"], "submission_uncertain");
+        assert!(status.get("signature").is_none());
+        assert_eq!(host.status_calls, 1);
+        assert!(host.calls.is_empty());
+        assert_eq!(host.writes, writes);
+    }
 
     const OWNER_ORDER_HELP: &str =
         include_str!("../files/[network]/exchange/[wallet]/[index]/order.json.rs");

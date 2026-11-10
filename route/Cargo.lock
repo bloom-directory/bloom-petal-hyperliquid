@@ -555,10 +555,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-contract"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/petal?rev=66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37#66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sha3 0.11.0",
+]
+
+[[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=2beed2ff344ce2b0c112e07096027e1ae0404007#2beed2ff344ce2b0c112e07096027e1ae0404007"
+source = "git+https://github.com/bloom-directory/petal?rev=66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37#66ac2b675aac7ea4f67ccf3b45c1d346b1f0ef37"
 dependencies = [
+ "bloom-petal-contract",
  "getrandom 0.2.17",
  "serde",
  "serde_jcs 0.2.0",

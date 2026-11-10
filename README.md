@@ -139,6 +139,52 @@ It runs the actual component against Machine's host boundary with a nonzero
 account, retained delegated KeyRef, exact preimage/hash and complete action
 witness. It uses fixture host outcomes and proves no live venue execution.
 
+## Prepared owner signing compatibility
+
+Owner `usd_send.json` (including its `send_asset.json` alias),
+`usd_class_transfer.json`, `withdraw.json`, and session `approveAgent` signatures
+use the shared SDK's immutable `Attempt` and `sign_or_resume` lifecycle. The
+original protocol preimage, hash, full EIP-712 message and nonce are preserved.
+Pending and recovery states retry the same Machine operation; the Petal never
+falls back to legacy signing after a prepared-signing refusal. Session owner
+identity is still recovered from the actual signature. Protocol submission and
+withdrawal reconciliation records remain separate from signing approval.
+
+This compatibility port adds **no automatic persona approval coverage**.
+Every migrated action declares `Spend::Unspecified`: Hyperliquid venue USDC is
+not the Arbitrum ERC-20, and the prepared Asset contract currently supports
+only EVM ERC-20/ERC-1155 identities. Agent authorization has no venue spending
+ceiling. Empty legacy debit lists therefore cannot establish zero spend.
+Exact review binds the typed message's amount/destination, where applicable;
+legacy debit declarations and withdrawal advisory fields are not passed as
+prepared budget authority. The withdrawal fee and expected net remain in its
+route help and durable withdrawal record; this does not assert that the
+generic approval UI displays or validates those fee fields.
+
+Owner L1 orders, leverage changes, cancels and cleanup keep the existing
+`hyperliquid_l1` review and signing path. The generic prepared host currently
+accepts EIP-712/personal-message reviews, and cannot independently verify that
+L1 action witness. Showing only the signed Agent connectionId would lose its
+exact action disclosure. Delegated KeyRef sessions likewise keep their
+existing signing path: the prepared SDK is currently owner-only.
+
+Use the pinned SDK/toolchain with a Machine supporting prepared signing and
+its installed-package provenance checks (the package contract test pins the
+compatible Machine revision). This port does not add installer effect
+certification or claim budget eligibility. Automatic persona coverage needs a
+generic review mechanism that preserves and verifies committed action
+witnesses, a truthful venue-asset identity and onboarding support, then
+installer-certified effects. It does not need protocol-specific Broker or
+Signer execution logic.
+
+Reconcile old pending approvals, withdrawals and session creation using their
+original installed package before upgrading. Existing pending/submitted
+records without the matching prepared attempt are refused; this build freezes
+new attempts before writing withdrawal/session protocol records so a crash
+between those writes remains recoverable. Reading existing status/withdrawal
+records never signs, renews or submits an action. Tests use local fixtures and
+host doubles, not live exchange writes.
+
 ## Installation
 
 Bloom provisions the pinned Hyperliquid release during `bloom init` when
