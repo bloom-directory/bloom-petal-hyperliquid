@@ -29,7 +29,7 @@ mod tests {
     }
 
     #[test]
-    fn session_success_evidence_resolves_to_public_user_routes() {
+    fn success_evidence_resolves_to_public_user_routes() {
         let sources = [
             include_str!(
                 "../files/[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json.rs"
@@ -37,12 +37,16 @@ mod tests {
             include_str!(
                 "../files/[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json.rs"
             ),
+            include_str!("../files/[network]/exchange/[wallet]/[index]/order.json.rs"),
+            include_str!("../files/[network]/exchange/[wallet]/[index]/cancel.json.rs"),
+            include_str!("../files/[network]/exchange/[wallet]/[index]/cancel_by_cloid.json.rs"),
+            include_str!("../files/[network]/exchange/[wallet]/[index]/update_leverage.json.rs"),
         ];
         for source in sources {
             let path = source
                 .split("\"path_from_bloom_root\": \"")
                 .nth(1)
-                .expect("session help declares a success evidence path")
+                .expect("help declares a success evidence path")
                 .split('"')
                 .next()
                 .unwrap();

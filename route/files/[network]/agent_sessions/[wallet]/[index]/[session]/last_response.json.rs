@@ -17,7 +17,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
     };
     match crate::load_session_response(network, &wallet, session) {
         Ok(Some(response)) => petal::read_json_value(&response),
-        Ok(None) => petal::error(-3, "no session response"),
+        Ok(None) => petal::read_json_value(&crate::serde_json::Value::Null),
         Err(response) => response,
     }
 });

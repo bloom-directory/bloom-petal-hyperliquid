@@ -10,7 +10,7 @@ petal::route_file!(
             "top_level": {
                 "action": "required: {type: \"order\", orders, grouping}",
                 "vaultAddress": "optional 0x address of a vault or subaccount to trade for; it is signed. Omit to trade the selected account",
-                "nonce": "optional unsigned integer in milliseconds. Omit it; the Petal reserves one and reuses it when you retry the same body",
+                "nonce": "optional unsigned integer in milliseconds. Omit it; the Petal reserves one and reuses it when you retry the same body. If set, it must be the current Unix time in milliseconds",
                 "expiresAfter": "optional; the venue rejects the action after this time in milliseconds since the epoch"
             },
             "action": {
@@ -27,7 +27,12 @@ petal::route_file!(
                 "t": "required, exactly one of {\"limit\":{\"tif\":\"Gtc\"|\"Ioc\"|\"Alo\"}} or {\"trigger\":{\"isMarket\":bool,\"triggerPx\":decimal string,\"tpsl\":\"tp\"|\"sl\"}}. Gtc fills what crosses now and rests the remainder; Ioc fills what it can now and cancels the rest; Alo only rests and is rejected if it would cross",
                 "c": "required client order id: 0x plus 32 hex digits, new for every order. The Petal refuses a repeat only within one request; reusing one from an earlier request is accepted, and then c no longer identifies this order. Use it to find the order in users/<account>/frontend_open_orders.json and fills.json"
             },
-            "uncertain_outcome": "If a write fails after approval, the order may still have reached Hyperliquid. Write the same body again (the same nonce can never execute twice), or reconcile by c before writing anything with a new nonce: a new nonce is a new order. Reconciling by c is only reliable if no earlier request used the same c."
+            "uncertain_outcome": "If a write fails after approval, the order may still have reached Hyperliquid. Write the same body again (the same nonce can never execute twice), or reconcile by c before writing anything with a new nonce: a new nonce is a new order. Reconciling by c is only reliable if no earlier request used the same c.",
+            "success_evidence": {
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/frontend_open_orders.json",
+                "predicate": "after approval and the repeated write, an open order has the submitted c; an order that filled at once appears in fills.json instead",
+                "notes": "Read owner_address from wallets/<wallet>/<index>/address.evm"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

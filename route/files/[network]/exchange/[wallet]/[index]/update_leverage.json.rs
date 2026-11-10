@@ -3,7 +3,24 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid update_leverage.json request; signed actions require Bloom approval"
+            "description": "update leverage as the wallet owner; the first write stages it for the owner's Bloom approval and fails with approval required; after the owner approves, write the exact same body again to submit it",
+            "request_schema": {
+                "action": {
+                    "type": "updateLeverage",
+                    "asset": "asset index (see order.json)",
+                    "isCross": "boolean",
+                    "leverage": "unsigned integer"
+                },
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds",
+                "vaultAddress": "optional 0x vault or subaccount address",
+                "expiresAfter": "optional Unix timestamp in milliseconds"
+            },
+            "example": {"action": {"type": "updateLeverage", "asset": 0, "isCross": true, "leverage": 1}},
+            "success_evidence": {
+                "path_from_bloom_root": "petals/hyperliquid/<network>/users/<owner_address>/active_asset_data/BTC.json",
+                "predicate": "leverage.type and leverage.value match the request; replace BTC with the coin",
+                "notes": "Read owner_address from wallets/<wallet>/<index>/address.evm"
+            }
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

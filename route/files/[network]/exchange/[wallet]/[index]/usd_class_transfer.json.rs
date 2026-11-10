@@ -7,8 +7,10 @@ petal::route_file!(
             "body": {
                 "amount": "positive USDC decimal with at most 6 decimal places",
                 "to_perp": "true moves spot USDC into perp, false moves perp USDC into spot",
-                "nonce": "optional timestamp in milliseconds"
-            }
+                "nonce": "optional; omit it and Bloom allocates one. If set, it must be the current Unix time in milliseconds"
+            },
+            "example": {"amount": "10", "to_perp": true},
+            "success_evidence": "after the owner approves and the same body is written again, users/<owner_address>/spot_state.json and clearinghouse.json show the moved USDC; read owner_address from wallets/<wallet>/<index>/address.evm"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
