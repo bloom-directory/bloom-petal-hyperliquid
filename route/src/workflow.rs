@@ -421,6 +421,29 @@ fn sign_payload(
     advisory: Option<Vec<u8>>,
     effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
+    let request = sign_request(
+        ctx,
+        wallet,
+        payload,
+        operation_class,
+        approval_hint,
+        key_ref_jcs,
+        advisory,
+        effects,
+    )?;
+    petal::sdk::sign_payload(&request).map_err(|e| e.message())
+}
+#[allow(clippy::too_many_arguments)]
+fn sign_request(
+    ctx: &Ctx,
+    wallet: &str,
+    payload: &protocol::SigningPayload,
+    operation_class: &str,
+    approval_hint: Option<String>,
+    key_ref_jcs: Option<Vec<u8>>,
+    advisory: Option<Vec<u8>>,
+    effects: ClaimEffects,
+) -> Result<PayloadSignRequest, String> {
     let payload_digest = petal::payload_batch_digest(&[petal::PayloadSignItem {
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
@@ -449,17 +472,17 @@ fn sign_payload(
         "nonce": hex::encode(&nonce_digest[..16]),
         "claim_assurance": {"kind": "machine_asserted"}
     });
-    petal::sdk::sign_payload(&PayloadSignRequest {
+    Ok(PayloadSignRequest {
         wallet: wallet.into(),
         preimage: payload.preimage.clone(),
         claimed_hash: payload.hash.into(),
         signature_algorithm: "secp256k1-keccak256-recoverable".into(),
         operation_class: operation_class.into(),
         petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|e| e.to_string())?,
-        // Delegated actions have no new ceremony. Carry the full public
-        // action witness on the existing use-time evidence channel so Broker
-        // can still rebuild the signed bytes before releasing a signature.
-        claim_assurance_evidence: key_ref_jcs.as_ref().map(|_| payload.review.clone()),
+        // Broker rebuilds the signed bytes from this public action witness
+        // before releasing an agent action, whether a delegated key or the
+        // owner (cleanup after a stop) signs it.
+        claim_assurance_evidence: Some(payload.review.clone()),
         approval_hint,
         action: Some(payload.review.clone()),
         advisory,
@@ -470,7 +493,6 @@ fn sign_payload(
         },
         key_ref_jcs,
     })
-    .map_err(|e| e.message())
 }
 pub fn http_json(net: Network, path: &str, body: Value) -> Result<Value, DispatchResponse> {
     let (status, raw) = http_raw(net, path, body)?;
@@ -541,18 +563,41 @@ fn last_response_key(n: Network, w: &str) -> String {
     ])
 }
 
+/// Created before the first send and never rewritten or removed. The nonce
+/// record is rewritten whole by concurrent approval writes, so its own
+/// `submitted` field can be reset by a stale writer; this marker cannot.
+fn sent_marker_key(key: &str) -> String {
+    format!("{}.sent.json", key.trim_end_matches(".json"))
+}
+
+/// Every caller saves right before sending to Hyperliquid or after it
+/// accepted, so the record is marked submitted from here on. It also stops
+/// expiring: a released reader that ignores `submitted` and the sent marker
+/// then reuses this nonce, which can execute once, instead of advising a
+/// fresh one. A later approval for the same nonce sets a new expiry.
 fn save_pending(key: &str, nonce: u64, completed: bool) -> Result<(), DispatchResponse> {
+    let marker = sent_marker_key(key);
+    if let Err(first_error) = save_json_new(marker.clone(), &true, false)
+        && load_bytes(&marker)?.is_none()
+    {
+        return Err(first_error);
+    }
     let existing = load_json::<PendingNonce>(key.to_owned())?;
     save_json(
         key.to_owned(),
-        &PendingNonce {
-            nonce,
-            expires_ms: existing.as_ref().map_or(u64::MAX, |state| state.expires_ms),
-            action_id: existing.and_then(|state| state.action_id),
-            completed,
-        },
+        &submitted_record(existing, nonce, completed),
         false,
     )
+}
+
+fn submitted_record(existing: Option<PendingNonce>, nonce: u64, completed: bool) -> PendingNonce {
+    PendingNonce {
+        nonce,
+        expires_ms: u64::MAX,
+        action_id: existing.and_then(|state| state.action_id),
+        completed,
+        submitted: Some(true),
+    }
 }
 
 struct OwnerApproval<'a> {
@@ -588,19 +633,21 @@ fn owner_sign_or_approval(
             action_id,
             expires_ms,
         }) => {
-            if let Some(key) = approval_ctx.pending_nonce_key
-                && let Err(e) = save_json(
+            if let Some(key) = approval_ctx.pending_nonce_key {
+                // A new approval for an already-sent nonce must not hide that send.
+                let submitted = load_json::<PendingNonce>(key.to_owned())?
+                    .map_or(Some(false), |state| state.submitted);
+                save_json(
                     key.to_owned(),
                     &PendingNonce {
                         nonce: approval_ctx.nonce,
                         expires_ms,
                         action_id: Some(action_id.clone()),
                         completed: false,
+                        submitted,
                     },
                     false,
-                )
-            {
-                return Err(e);
+                )?;
             }
             Err(approval(
                 approval_ctx.kind,
@@ -764,15 +811,10 @@ fn owner_nonce(
     let key = owner_nonce_key(n, w, leaf, body);
     let now = petal::sdk::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        if pending.completed {
-            return Ok((pending.nonce, Some(key), true));
-        }
-        if pending.expires_ms <= now {
-            return Err(invalid(
-                "approval expired; retry with an explicit fresh nonce",
-            ));
-        }
-        return Ok((pending.nonce, Some(key), false));
+        let sent = load_bytes(&sent_marker_key(&key))?.is_some();
+        return resume_pending(&pending, leaf, sent, now)
+            .map(|completed| (pending.nonce, Some(key), completed))
+            .map_err(invalid);
     }
     let marker = hex::encode(sha3::Keccak256::digest(body));
     let nonce = reserve_nonce(
@@ -793,6 +835,7 @@ fn owner_nonce(
         expires_ms: u64::MAX,
         action_id: None,
         completed: false,
+        submitted: Some(false),
     };
     match save_json_new(key.clone(), &candidate, false) {
         Ok(()) => Ok((candidate.nonce, Some(key), false)),
@@ -800,6 +843,58 @@ fn owner_nonce(
             Some(winner) => Ok((winner.nonce, Some(key), winner.completed)),
             None => Err(first_error),
         },
+    }
+}
+
+/// Whether a stored owner nonce may be reused (`Ok(completed)`). Resending
+/// the same nonce is safe: Hyperliquid never accepts a nonce twice. A fresh
+/// nonce is a new action, so it is only advised when nothing was sent:
+/// no sent marker and a record that says it was never submitted.
+fn resume_pending(
+    pending: &PendingNonce,
+    leaf: &str,
+    sent: bool,
+    now_ms: u64,
+) -> Result<bool, String> {
+    if pending.completed {
+        return Ok(true);
+    }
+    if pending.expires_ms > now_ms {
+        return Ok(false);
+    }
+    if !sent && pending.submitted == Some(false) {
+        return Err(
+            "approval expired before anything was sent; retry with an explicit fresh nonce".into(),
+        );
+    }
+    Err(format!(
+        "approval expired after nonce {} may have reached Hyperliquid; its outcome is unknown. \
+         A fresh nonce is a new action and can duplicate it. First reconcile through \
+         last_response.json and {}, then retry with an explicit fresh nonce only if it did \
+         not execute",
+        pending.nonce,
+        reconcile_reads(leaf)
+    ))
+}
+
+/// Where an owner can see whether an uncertain action of this route executed.
+fn reconcile_reads(leaf: &str) -> &'static str {
+    match leaf {
+        "order.json" => {
+            "users/<account>/frontend_open_orders.json and fills.json, matched by each order's c"
+        }
+        "cancel.json" | "cancel_by_cloid.json" | "schedule_cancel.json" => {
+            "users/<account>/frontend_open_orders.json, to see whether the orders are still open"
+        }
+        "update_leverage.json" => {
+            "users/<account>/clearinghouse.json, to see the asset's current leverage"
+        }
+        // Normally refused earlier by `withdraw_resume`; a record left by
+        // v0.1.9 can still reach this message.
+        "withdraw.json" => "withdrawals/<nonce>.json and the destination's balance on Arbitrum",
+        _ => {
+            "the balances in users/<account>/clearinghouse.json and spot_state.json for both sides of the transfer"
+        }
     }
 }
 
@@ -811,6 +906,10 @@ struct PendingNonce {
     action_id: Option<String>,
     #[serde(default)]
     completed: bool,
+    /// `Some(true)` once sent to Hyperliquid; `None` for records written
+    /// before this field existed, which are treated as possibly sent.
+    #[serde(default)]
+    submitted: Option<bool>,
 }
 /// A cleanup action waiting on the owner's Exact approval. The approval covers
 /// one payload, and `close_all` prices from live mids, so rebuilding on the
@@ -874,6 +973,7 @@ fn session_nonce(
         expires_ms: u64::MAX,
         action_id: None,
         completed: false,
+        submitted: Some(false),
     };
     match save_json_new(key.clone(), &candidate, false) {
         Ok(()) => Ok((candidate.nonce, Some(key), false)),
@@ -2390,7 +2490,11 @@ impl SessionSigning {
     /// rather than turned into an owner approval ceremony.
     fn retry_as_owner(self, delegated: &Result<SignOutcome, String>) -> bool {
         self == Self::DelegatedThenOwner
-            && matches!(delegated, Err(error) if *error == SdkError::Host(HostStatus::Denied).message())
+            && matches!(delegated, Err(error) if {
+                // Hosts may append a reason: "denied: <reason>".
+                let denied = SdkError::Host(HostStatus::Denied).message();
+                *error == denied || error.starts_with(&format!("{denied}: "))
+            })
     }
 }
 
@@ -2769,6 +2873,11 @@ fn asset_ids(n: Network) -> Result<std::collections::BTreeMap<String, u32>, Disp
             .collect()
     })
 }
+/// Cleanup may fall back to the owner, whose approval Broker can only display
+/// up to 256 fields: 125 cancels or 41 closing orders. Each cleanup write
+/// therefore covers at most one such batch; writing it again does the rest.
+const CLEANUP_CANCELS: usize = 125;
+const CLEANUP_CLOSES: usize = 41;
 fn session_cancel_all(
     ctx: &Ctx,
     n: Network,
@@ -2818,6 +2927,7 @@ fn session_cancel_all(
     if cancels.is_empty() {
         return ok_write();
     }
+    cancels.truncate(CLEANUP_CANCELS);
     let action = match serde_json::from_value::<ExchangeAction>(
         json!({"type":"cancel","cancels":cancels}),
     ) {
@@ -2937,6 +3047,7 @@ fn session_close_all(
     if orders.is_empty() {
         return ok_write();
     }
+    orders.truncate(CLEANUP_CLOSES);
     let action = ExchangeAction::Order {
         orders,
         grouping: protocol::Grouping::Na,
@@ -3567,6 +3678,100 @@ mod tests {
 
     use super::*;
 
+    const OWNER_ORDER_HELP: &str =
+        include_str!("../files/[network]/exchange/[wallet]/[index]/order.json.rs");
+
+    #[test]
+    fn owner_order_help_examples_pass_the_request_parser() {
+        let examples: Vec<&str> = OWNER_ORDER_HELP
+            .split("r#\"")
+            .skip(1)
+            .map(|rest| rest.split("\"#").next().unwrap())
+            .collect();
+        assert_eq!(examples.len(), 2);
+        for raw in examples {
+            let request: SignSubmit = serde_json::from_str(raw).expect(raw);
+            request.action.validate().expect(raw);
+            request.action.validate_owner_review().expect(raw);
+            let ExchangeAction::Order { orders, .. } = &request.action else {
+                panic!("help example is not an order: {raw}");
+            };
+            assert!(orders.iter().all(|order| order.cloid.is_some()), "{raw}");
+        }
+    }
+
+    fn pending(expires_ms: u64, completed: bool, submitted: Option<bool>) -> PendingNonce {
+        PendingNonce {
+            nonce: 7,
+            expires_ms,
+            action_id: Some("a".into()),
+            completed,
+            submitted,
+        }
+    }
+
+    #[test]
+    fn expired_approval_never_advises_a_fresh_nonce_after_a_send() {
+        // Accepted by the venue, response lost: completed stays false.
+        // A stale approval write can reset `submitted` to false after the
+        // send began; the sent marker still records the send.
+        for (submitted, sent) in [(Some(true), false), (None, false), (Some(false), true)] {
+            let error =
+                resume_pending(&pending(10, false, submitted), "order.json", sent, 10).unwrap_err();
+            assert!(error.contains("may have reached Hyperliquid"), "{error}");
+            assert!(
+                error.contains("fills.json, matched by each order's c"),
+                "{error}"
+            );
+        }
+        let error =
+            resume_pending(&pending(10, false, Some(false)), "order.json", false, 10).unwrap_err();
+        assert!(error.contains("before anything was sent"), "{error}");
+    }
+
+    /// v0.1.9 reads only `expires_ms` and advises a fresh nonce once it has
+    /// passed. A sent record must never look expired to it.
+    #[test]
+    fn a_sent_record_never_looks_expired_to_a_released_reader() {
+        let record = submitted_record(Some(pending(10, false, Some(false))), 7, false);
+        assert_eq!(record.expires_ms, u64::MAX);
+        assert_eq!(record.action_id.as_deref(), Some("a"));
+        let released: serde_json::Value = serde_json::to_value(&record).unwrap();
+        assert!(released["expires_ms"].as_u64().unwrap() > 4_102_444_800_000);
+    }
+
+    #[test]
+    fn uncertain_transfers_are_not_reconciled_by_order_reads() {
+        for leaf in ["send_asset.json", "usd_class_transfer.json"] {
+            let error =
+                resume_pending(&pending(10, false, Some(true)), leaf, true, 10).unwrap_err();
+            assert!(error.contains("spot_state.json"), "{error}");
+            assert!(!error.contains("fills.json"), "{error}");
+        }
+    }
+
+    /// A v0.1.9 withdrawal record (no `submitted`, real expiry) that expired
+    /// is pointed at the withdrawal record, not at balance or order reads.
+    #[test]
+    fn an_expired_v019_withdrawal_points_at_its_withdrawal_record() {
+        let error =
+            resume_pending(&pending(10, false, None), "withdraw.json", true, 10).unwrap_err();
+        assert!(error.contains("withdrawals/<nonce>.json"), "{error}");
+        assert!(!error.contains("spot_state.json"), "{error}");
+    }
+
+    #[test]
+    fn live_or_completed_records_reuse_their_nonce() {
+        assert_eq!(
+            resume_pending(&pending(11, false, Some(true)), "order.json", true, 10),
+            Ok(false)
+        );
+        assert_eq!(
+            resume_pending(&pending(0, true, Some(true)), "order.json", true, 10),
+            Ok(true)
+        );
+    }
+
     #[test]
     fn oversized_owner_batch_is_rejected_before_any_host_call() {
         struct Route;
@@ -3751,13 +3956,91 @@ mod tests {
             action_id: "a".into(),
             expires_ms: 1,
         });
+        let reasoned = Err("denied: SELECTOR_MISMATCH: approval revoked".to_owned());
+        let lookalike = Err("deniedx".to_owned());
         assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&denied));
+        assert!(SessionSigning::DelegatedThenOwner.retry_as_owner(&reasoned));
+        assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&lookalike));
         assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&backend));
         assert!(!SessionSigning::DelegatedThenOwner.retry_as_owner(&pending));
         // Trading never escalates to the owner, and owner signing has no
         // delegated attempt to retry.
         assert!(!SessionSigning::Delegated.retry_as_owner(&denied));
         assert!(!SessionSigning::Owner.retry_as_owner(&denied));
+    }
+
+    #[test]
+    fn full_cleanup_batches_fit_one_owner_review() {
+        let cancels: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancel",
+            "cancels": vec![json!({"a": 9999, "o": u64::MAX}); CLEANUP_CANCELS + 1]
+        }))
+        .unwrap();
+        // Same shape session_close_all builds: reduce-only IOC, no client id.
+        let closes: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": vec![json!({
+                "a": 9999, "b": true, "p": "123456.7", "s": "1234.5678", "r": true,
+                "t": {"limit": {"tif": "Ioc"}}
+            }); CLEANUP_CLOSES + 1],
+            "grouping": "na"
+        }))
+        .unwrap();
+        for mut action in [cancels, closes] {
+            assert!(action.validate_owner_review().is_err());
+            match &mut action {
+                ExchangeAction::Cancel { cancels, .. } => {
+                    cancels.pop();
+                }
+                ExchangeAction::Order { orders, .. } => {
+                    orders.pop();
+                }
+                _ => unreachable!(),
+            }
+            action.validate_owner_review().unwrap();
+        }
+    }
+
+    #[test]
+    fn owner_signed_agent_action_carries_its_use_time_witness() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![("bloom.route_id".into(), "cancel_all".into())],
+            actor: None,
+        });
+        let action = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+            fast: None,
+        };
+        let payload =
+            protocol::l1_signing_payload(Network::Testnet, &action, 1, None, None).unwrap();
+        // Broker refuses any hyperliquid.agent_action without the witness,
+        // including the owner fallback that cleans up a stopped session.
+        for key_ref_jcs in [None, Some(b"{}".to_vec())] {
+            let request = sign_request(
+                &ctx,
+                "main",
+                &payload,
+                "hyperliquid.agent_action",
+                None,
+                key_ref_jcs,
+                None,
+                ClaimEffects::none(),
+            )
+            .unwrap();
+            assert_eq!(
+                request.claim_assurance_evidence,
+                Some(payload.review.clone())
+            );
+        }
     }
 
     #[test]

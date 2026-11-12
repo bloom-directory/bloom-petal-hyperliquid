@@ -444,6 +444,16 @@ pub fn parse_address(raw: &str) -> Result<Address, String> {
     };
     raw.parse().map_err(|e| format!("address: {e}"))
 }
+/// Whether two orders in one batch share a client order id, ignoring hex case.
+/// Reconciliation finds an order by its id, so a shared one is ambiguous.
+pub fn shares_cloid(orders: &[OrderWire]) -> bool {
+    let mut cloids: Vec<String> = orders
+        .iter()
+        .filter_map(|order| order.cloid.as_deref().map(str::to_ascii_lowercase))
+        .collect();
+    cloids.sort();
+    cloids.windows(2).any(|pair| pair[0] == pair[1])
+}
 pub fn validate_cloid(raw: &str) -> Result<(), String> {
     if raw.len() != 34 || !raw.starts_with("0x") || !raw[2..].chars().all(|c| c.is_ascii_hexdigit())
     {
@@ -865,6 +875,23 @@ pub fn validate_exchange_response(value: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use k256::ecdsa::SigningKey;
+
+    #[test]
+    fn a_batch_may_not_reuse_a_client_order_id() {
+        let order = |c: &str| -> OrderWire {
+            serde_json::from_value(json!({"a":3,"b":true,"p":"1","s":"1","r":false,
+                "t":{"limit":{"tif":"Gtc"}},"c":c}))
+            .unwrap()
+        };
+        let a = "0x0000000000000000000000000000a001";
+        let b = "0x0000000000000000000000000000a002";
+        assert!(!shares_cloid(&[order(a), order(b)]));
+        assert!(shares_cloid(&[order(a), order(b), order(a)]));
+        assert!(shares_cloid(&[
+            order("0x000000000000000000000000000000ab"),
+            order("0x000000000000000000000000000000AB"),
+        ]));
+    }
 
     /// The owner address must come from the signature, not from the caller.
     ///
