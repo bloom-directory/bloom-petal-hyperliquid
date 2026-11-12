@@ -14,7 +14,7 @@ petal::route_file!(
                         "s": "positive decimal size string",
                         "r": "boolean reduce-only flag",
                         "t": {"limit": {"tif": "Alo, Gtc, or Ioc for a buy; Alo only for a sell, because a sell that crosses the book fills above its limit and its builder fee cannot be bounded"}},
-                        "c": "optional 16-byte 0x client order id"
+                        "c": "required client order id: 0x plus 32 hex digits, new for every order. This route's success evidence is keyed on it, so an order without one cannot be confirmed"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
                     "builder": {"b": "lowercase builder address matching the session's builder_address", "f": "fee in tenths of a basis point, at most the session's max_builder_fee_tenths_bps and the venue cap"}
@@ -73,7 +73,7 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid session action: {error}")),
         };
-        if !matches!(&request.action, crate::ExchangeAction::Order { .. }) {
+        let crate::ExchangeAction::Order { orders, .. } = &request.action else {
             return petal::error(
                 -3,
                 format!(
@@ -81,12 +81,15 @@ petal::route_file!(
                     request.action.kind()
                 ),
             );
-        }
+        };
         if !request.action.carries_builder() {
             return petal::error(
                 -3,
                 "builder_order.json requires an order carrying a builder fee; write orders without one to order.json",
             );
+        }
+        if let Err(error) = crate::validate_order_cloids(orders) {
+            return petal::error(-3, error);
         }
         crate::session_action_write(ctx, network, &wallet, session, request)
     }

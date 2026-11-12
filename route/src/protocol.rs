@@ -454,6 +454,28 @@ pub fn shares_cloid(orders: &[OrderWire]) -> bool {
     cloids.sort();
     cloids.windows(2).any(|pair| pair[0] == pair[1])
 }
+/// Every order must carry its own client order id.
+///
+/// An order whose submission is uncertain is reconciled by `c`: it is what
+/// finds the order in `frontend_open_orders.json` and `fills.json`, and what
+/// the session routes' correlated receipts are keyed on. An order without one
+/// cannot be reconciled at all, and two orders sharing one are ambiguous, so
+/// both are refused before anything is signed or sent.
+///
+/// Shared by all four order routes so the rule cannot drift between them.
+pub fn validate_order_cloids(orders: &[OrderWire]) -> Result<(), String> {
+    if orders.iter().any(|order| order.cloid.is_none()) {
+        return Err(
+            "every order needs c, a unique client order id (0x plus 32 hex digits), so an uncertain submission can be reconciled"
+                .into(),
+        );
+    }
+    if shares_cloid(orders) {
+        return Err("two orders share c; give each order its own client order id".into());
+    }
+    Ok(())
+}
+
 pub fn validate_cloid(raw: &str) -> Result<(), String> {
     if raw.len() != 34 || !raw.starts_with("0x") || !raw[2..].chars().all(|c| c.is_ascii_hexdigit())
     {

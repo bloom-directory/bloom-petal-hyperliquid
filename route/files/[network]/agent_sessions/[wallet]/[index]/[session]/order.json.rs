@@ -14,7 +14,7 @@ petal::route_file!(
                         "s": "positive decimal size string",
                         "r": "boolean reduce-only flag",
                         "t": {"limit": {"tif": "Alo, Gtc, or Ioc"}},
-                        "c": "optional 16-byte 0x client order id"
+                        "c": "required client order id: 0x plus 32 hex digits, new for every order. This route's success evidence is keyed on it, so an order without one cannot be confirmed"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
                     "builder": "not accepted here; write a builder-bearing order to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class and requires the session's builder bound"
@@ -72,7 +72,7 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid session action: {error}")),
         };
-        if !matches!(&request.action, crate::ExchangeAction::Order { .. }) {
+        let crate::ExchangeAction::Order { orders, .. } = &request.action else {
             return petal::error(
                 -3,
                 format!(
@@ -80,12 +80,15 @@ petal::route_file!(
                     request.action.kind()
                 ),
             );
-        }
+        };
         if request.action.carries_builder() {
             return petal::error(
                 -3,
                 "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
             );
+        }
+        if let Err(error) = crate::validate_order_cloids(orders) {
+            return petal::error(-3, error);
         }
         crate::session_action_write(ctx, network, &wallet, session, request)
     }

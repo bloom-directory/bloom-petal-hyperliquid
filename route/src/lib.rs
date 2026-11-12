@@ -1,3 +1,4 @@
+mod host;
 mod protocol;
 mod settings;
 mod workflow;
@@ -98,19 +99,56 @@ mod order_route_admission {
         }
     }
 
-    fn order_body(builder: Option<crate::serde_json::Value>) -> Vec<u8> {
+    const CLOID: &str = "0x000000000000000000000000000000a1";
+
+    /// One order per entry in `cloids`, each carrying that client order id, or
+    /// none where the entry is `None`.
+    fn order_body_with_cloids(
+        builder: Option<crate::serde_json::Value>,
+        cloids: &[Option<&str>],
+    ) -> Vec<u8> {
+        let orders: Vec<_> = cloids
+            .iter()
+            .map(|cloid| {
+                let mut order = crate::serde_json::json!({
+                    "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                    "t": {"limit": {"tif": "Gtc"}}
+                });
+                if let Some(cloid) = cloid {
+                    order["c"] = crate::serde_json::json!(cloid);
+                }
+                order
+            })
+            .collect();
         let mut action = crate::serde_json::json!({
             "type": "order",
-            "orders": [{
-                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
-                "t": {"limit": {"tif": "Gtc"}}
-            }],
+            "orders": orders,
             "grouping": "na"
         });
         if let Some(builder) = builder {
             action["builder"] = builder;
         }
         crate::serde_json::to_vec(&crate::serde_json::json!({"action": action})).unwrap()
+    }
+
+    /// A minimal admissible order body: one order carrying a client order id,
+    /// which every order route requires.
+    fn order_body(builder: Option<crate::serde_json::Value>) -> Vec<u8> {
+        order_body_with_cloids(builder, &[Some(CLOID)])
+    }
+
+    /// Every order route, each paired with a builder field that route admits,
+    /// so a body gets past the route-fit refusal to the checks after it.
+    fn every_route() -> Vec<(&'static str, Write, Option<crate::serde_json::Value>)> {
+        ORDINARY_ROUTES
+            .into_iter()
+            .map(|(route, write)| (route, write, None))
+            .chain(
+                BUILDER_ROUTES
+                    .into_iter()
+                    .map(|(route, write)| (route, write, Some(builder()))),
+            )
+            .collect()
     }
 
     fn builder() -> crate::serde_json::Value {
@@ -121,6 +159,61 @@ mod order_route_admission {
         match result {
             Err(RouteError::Invalid(message)) => message,
             other => panic!("{route} did not refuse the body as invalid: {other:?}"),
+        }
+    }
+
+    /// A body that is both on the wrong route and missing `c` is told which
+    /// route it belongs on, because routing is the first thing to fix: an
+    /// agent told to add a client order id would add one and still be
+    /// refused. All four routes settle route fit before inspecting the body.
+    #[test]
+    fn every_order_route_reports_the_wrong_route_before_a_missing_client_order_id() {
+        for (route, write) in ORDINARY_ROUTES {
+            let body = order_body_with_cloids(Some(builder()), &[None]);
+            let message = refusal(route, write(ctx(), body));
+            assert!(
+                message.contains("cannot carry a builder fee"),
+                "{route}: {message}"
+            );
+        }
+        for (route, write) in BUILDER_ROUTES {
+            let body = order_body_with_cloids(None, &[None]);
+            let message = refusal(route, write(ctx(), body));
+            assert!(
+                message.contains("requires an order carrying a builder fee"),
+                "{route}: {message}"
+            );
+        }
+    }
+
+    /// Reconciling an uncertain submission finds the order by `c`, and the
+    /// session routes' success evidence is keyed on it. A route that accepted
+    /// an order without one would leave a submission that cannot be settled
+    /// either way, so all four refuse it.
+    #[test]
+    fn every_order_route_requires_a_client_order_id() {
+        for (route, write, builder) in every_route() {
+            let message = refusal(
+                route,
+                write(ctx(), order_body_with_cloids(builder, &[None])),
+            );
+            assert!(
+                message.contains("every order needs c"),
+                "{route}: {message}"
+            );
+        }
+    }
+
+    /// Two orders sharing one id are ambiguous to reconcile, so they are
+    /// refused as well — ignoring hex case, since the venue does not
+    /// distinguish them.
+    #[test]
+    fn every_order_route_refuses_a_batch_sharing_a_client_order_id() {
+        let upper = CLOID.to_ascii_uppercase();
+        for (route, write, builder) in every_route() {
+            let body = order_body_with_cloids(builder, &[Some(CLOID), Some(&upper)]);
+            let message = refusal(route, write(ctx(), body));
+            assert!(message.contains("two orders share c"), "{route}: {message}");
         }
     }
 

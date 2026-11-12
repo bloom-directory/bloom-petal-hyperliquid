@@ -69,8 +69,12 @@ impl ClaimEffects {
     /// `{"kind":"fee","chain","asset","amount"}`, `amount` a plain integer
     /// string) with no field for the fee's recipient, so the builder address
     /// itself cannot be carried here — only what will be charged. The
-    /// recipient and rate are committed in the signed order payload and
-    /// shown in the owner's advisory instead.
+    /// recipient and rate are committed in the signed order payload, and
+    /// what shows them to the owner is that payload's
+    /// `bloom.message.review.v1` envelope, which Broker checks against the
+    /// exact preimage hash before rendering. Not this Petal's advisory
+    /// prose, which is asserted rather than checked and is not delivered at
+    /// the pinned revisions.
     fn builder_order_fee(fee_micros: u64) -> Self {
         Self {
             declared_debits: Vec::new(),
@@ -349,7 +353,7 @@ fn save_json(
     secret: bool,
 ) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
+    crate::host::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
 }
 fn save_json_new(
     key: String,
@@ -357,10 +361,10 @@ fn save_json_new(
     secret: bool,
 ) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
+    crate::host::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
 }
 fn load_bytes_result(key: &str) -> Result<Option<Vec<u8>>, SdkError> {
-    match petal::sdk::store_get(key, MAX_BODY) {
+    match crate::host::store_get(key, MAX_BODY) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
         Err(e) => Err(e),
@@ -809,7 +813,7 @@ fn owner_nonce(
         return Ok((nonce, None, false));
     }
     let key = owner_nonce_key(n, w, leaf, body);
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
         let sent = load_bytes(&sent_marker_key(&key))?.is_some();
         return resume_pending(&pending, leaf, sent, now)
@@ -929,13 +933,13 @@ fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
     let Some(key) = key else {
         return Ok(());
     };
-    match petal::sdk::store_del(key) {
+    match crate::host::store_del(key) {
         Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
         Err(e) => Err(backend(e.message())),
     }
 }
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     for offset in 0..1024_u64 {
         let nonce = now.saturating_add(offset);
         let key = format!("{prefix}/{nonce}.json");
@@ -950,24 +954,33 @@ fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     }
     Err(backend("unable to reserve a unique Hyperliquid nonce"))
 }
-fn session_nonce(
+/// The nonce already stored for this operation, reserving nothing.
+///
+/// Kept apart from the reservation so a settled operation can be answered
+/// before any live check runs. A retry of an order that already executed must
+/// not be refused because `/info` is unreachable or because the approved cap
+/// was lowered after it filled.
+fn session_pending_nonce(
     n: Network,
     w: &str,
     id: &str,
-    action: &ExchangeAction,
-    vault: Option<&str>,
-    expires: Option<u64>,
-    explicit: Option<u64>,
-) -> Result<(u64, Option<String>, bool), DispatchResponse> {
-    if let Some(nonce) = explicit {
-        return Ok((nonce, None, false));
-    }
-    let digest = session_operation_digest(action, vault, expires)?;
+    digest: &str,
+) -> Result<Option<(u64, String, bool)>, DispatchResponse> {
     let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
-    if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        return Ok((pending.nonce, Some(key), pending.completed));
-    }
-    let nonce = reserve_nonce(&session_key(n, w, id, "nonces"), &digest)?;
+    Ok(load_json::<PendingNonce>(key.clone())?
+        .map(|pending| (pending.nonce, key, pending.completed)))
+}
+
+/// Reserves a nonce for an operation that has none. Called only once the
+/// order is known admissible, so a refused order reserves nothing.
+fn session_reserve_nonce(
+    n: Network,
+    w: &str,
+    id: &str,
+    digest: &str,
+) -> Result<(u64, Option<String>, bool), DispatchResponse> {
+    let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
+    let nonce = reserve_nonce(&session_key(n, w, id, "nonces"), digest)?;
     let candidate = PendingNonce {
         nonce,
         expires_ms: u64::MAX,
@@ -1178,7 +1191,7 @@ struct ApproveBuilderFee {
     nonce: Option<u64>,
 }
 /// What a repeated `approve_builder_fee.json` write is matched on. A body that
-/// omits `builder` resolves it from the override or the release default, so
+/// omits `builder` resolves it from the release default, so
 /// the same body can mean a different builder later; matching on the body
 /// alone would report a new builder's approval as already done.
 ///
@@ -1221,6 +1234,41 @@ fn may_corroborate_from_record(requested: u32, record: Option<&BuilderFeeApprova
         return false;
     }
     record.is_some_and(|state| state.approved_tenths_bps == requested)
+}
+
+/// Records an approval the venue accepted.
+///
+/// The approval record lands before the nonce is marked completed, and the
+/// order is the whole point. A retry is answered without reaching the venue
+/// only from a completed nonce, so of the two partial failures that a crash
+/// between these writes can leave, the reachable one must be the one where
+/// nothing claims success. Writing the record first gives that: the record
+/// advances the generation, the generation is part of the identity the nonce
+/// is keyed on, and the retry therefore computes a fresh key and re-approves.
+///
+/// Swapped, the nonce would be marked completed under an identity whose
+/// generation never moved, and the retry would read success for a cap the
+/// venue never took. `an_approval_record_that_lands_first_keeps_a_retry_honest`
+/// fails if these two writes are ever reordered.
+fn commit_builder_fee_approval(
+    approval_key: String,
+    approved_tenths_bps: u32,
+    generation: u64,
+    pending_nonce_key: Option<String>,
+    nonce: u64,
+) -> Result<(), DispatchResponse> {
+    save_json(
+        approval_key,
+        &BuilderFeeApproval {
+            approved_tenths_bps,
+            generation: generation.saturating_add(1),
+        },
+        false,
+    )?;
+    if let Some(key) = pending_nonce_key {
+        save_pending(&key, nonce, true)?;
+    }
+    Ok(())
 }
 
 fn builder_fee_approval_key(n: Network, w: &str, resolved_builder: &str) -> String {
@@ -1315,7 +1363,9 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             .map(|account| live_builder_fee_cap(n, &account, &resolved_builder))
         {
             Some(Ok(live)) if live == u64::from(req.max_fee_tenths_bps) => return ok_write(),
-            Some(Err(e)) => return e,
+            // An approval that cannot read the cap submitted nothing, and the
+            // bare transport or status error cannot say so for itself.
+            Some(Err(e)) => return unverified_builder_fee_cap(e),
             Some(Ok(_)) | None => {}
         }
     }
@@ -1326,8 +1376,17 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             Ok(x) => x,
             Err(e) => return e,
         };
-    // Still the guard for the window between a venue success and the approval
-    // record below: the cap did land, so answering success is truthful.
+    // Not the guard for the window between a venue success and the approval
+    // record below. In that window the stored record still reads
+    // `completed: false`, because it is marked completed only after the
+    // record lands; and once the record does land it advances the generation
+    // this identity is keyed on, so a later retry computes a different key and
+    // never reads this one again.
+    //
+    // What still reaches here is a concurrent writer: one that computed this
+    // identity before the generation moved, then lost the create race to a
+    // request that has since completed. Answering success is truthful for it,
+    // because the cap did land.
     if completed {
         return ok_write();
     }
@@ -1378,25 +1437,13 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
-            // The approval record must land before the nonce is marked
-            // completed. The `completed` guard above answers a retry without
-            // reaching the venue, so of the two possible partial failures the
-            // reachable one must be the one where nothing claims success: a
-            // failed record write leaves the nonce incomplete, and the retry
-            // re-approves.
-            if let Err(e) = save_json(
+            if let Err(e) = commit_builder_fee_approval(
                 approval_key,
-                &BuilderFeeApproval {
-                    approved_tenths_bps: req.max_fee_tenths_bps,
-                    generation: generation.saturating_add(1),
-                },
-                false,
+                req.max_fee_tenths_bps,
+                generation,
+                pending_nonce_key,
+                nonce,
             ) {
-                return e;
-            }
-            if let Some(key) = pending_nonce_key
-                && let Err(e) = save_pending(&key, nonce, true)
-            {
                 return e;
             }
             ok_write()
@@ -1703,7 +1750,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         payload_hash: hex::encode(payload.hash),
         status: "approval_pending".into(),
         response: None,
-        updated_ms: petal::sdk::now_ms(),
+        updated_ms: crate::host::now_ms(),
     };
     let stored = match load_json::<WithdrawOperation>(op_key.clone()) {
         Ok(x) => x,
@@ -1720,7 +1767,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
                 stale_marker,
                 record,
             } => {
-                if stale_marker && let Err(e) = petal::sdk::store_del(&marker_key) {
+                if stale_marker && let Err(e) = crate::host::store_del(&marker_key) {
                     return backend(e.message());
                 }
                 record
@@ -1794,7 +1841,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         None => intent,
     };
     op.status = "submitted".into();
-    op.updated_ms = petal::sdk::now_ms();
+    op.updated_ms = crate::host::now_ms();
     if let Err(e) = save_json(op_key.clone(), &op.clone(), false) {
         return backend(format!(
             "could not persist the submission state for withdrawal nonce {nonce}; refusing to submit: {e:?}"
@@ -1808,7 +1855,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
             };
             op.status = status.into();
             op.response = Some(v.clone());
-            op.updated_ms = petal::sdk::now_ms();
+            op.updated_ms = crate::host::now_ms();
             if let Err(e) = save_json(op_key, &op, false) {
                 return e;
             }
@@ -1816,7 +1863,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
                 // Record the exact rejection, then release the submission slot
                 // so an explicit retry of this body replays the identical
                 // action instead of being stranded.
-                let _ = petal::sdk::store_del(&marker_key);
+                let _ = crate::host::store_del(&marker_key);
                 return outcome;
             }
             if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
@@ -1870,7 +1917,7 @@ pub fn withdraw_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRe
     let w = wallet(ctx)?;
     let prefix = withdraw_record_prefix(n, &w);
     let keys =
-        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+        crate::host::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
     Ok(withdraw_record_names(&prefix, &keys)
         .into_iter()
         .map(petal::file)
@@ -2446,7 +2493,7 @@ fn active_session(n: Network, w: &str, id: &str) -> Result<Session, DispatchResp
         retire_session_key(n, w, id, &session)?;
         return Err(denied("session is stopped"));
     }
-    if session.expires_ms <= petal::sdk::now_ms() {
+    if session.expires_ms <= crate::host::now_ms() {
         retire_session_key(n, w, id, &session)?;
         return Err(denied("session has expired"));
     }
@@ -2510,7 +2557,7 @@ fn cleanup_session(
         return Ok((session, SessionSigning::DelegatedThenOwner));
     }
     match load_session(n, w, id) {
-        Ok(Some(session)) if session.stopped || session.expires_ms <= petal::sdk::now_ms() => {
+        Ok(Some(session)) if session.stopped || session.expires_ms <= crate::host::now_ms() => {
             Ok((session, SessionSigning::Owner))
         }
         // An unloadable or still-live session keeps the original denial.
@@ -2570,24 +2617,43 @@ fn session_submit(
         Ok(effects) => effects,
         Err(e) => return invalid(e),
     };
+    let operation_digest = match session_operation_digest(&action, vault_str.as_deref(), expires) {
+        Ok(digest) => digest,
+        Err(e) => return e,
+    };
+    // A settled operation is answered before any live check, as the owner path
+    // does: `owner_action_write` returns on `completed` before it checks the
+    // builder approval. Checking first here meant a retry of an order already
+    // on the book could fail on an `/info` outage, or on a cap lowered after
+    // it filled, and an agent reading that error may place the order again.
+    let stored_nonce = match explicit_nonce {
+        Some(_) => None,
+        None => match session_pending_nonce(n, w, id, &operation_digest) {
+            Ok(stored) => stored,
+            Err(e) => return e,
+        },
+    };
+    if matches!(stored_nonce, Some((_, _, true))) {
+        if let Err(e) = clear_cleanup_replay(replay_key) {
+            return e;
+        }
+        return ok_write();
+    }
     if let Err(e) = ensure_builder_fee_is_approved(n, &s.owner_address, &action) {
         return e;
     }
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
         return e;
     }
-    let (nonce, operation_key, completed) = match session_nonce(
-        n,
-        w,
-        id,
-        &action,
-        vault_str.as_deref(),
-        expires,
-        explicit_nonce,
-    ) {
-        Ok(x) => x,
-        Err(e) => return e,
+    let (nonce, operation_key, completed) = match (explicit_nonce, stored_nonce) {
+        (Some(nonce), _) => (nonce, None, false),
+        (None, Some((nonce, key, _))) => (nonce, Some(key), false),
+        (None, None) => match session_reserve_nonce(n, w, id, &operation_digest) {
+            Ok(x) => x,
+            Err(e) => return e,
+        },
     };
+    // Only the lost-race path above can still report a completed operation.
     if completed {
         if let Err(e) = clear_cleanup_replay(replay_key) {
             return e;
@@ -2606,10 +2672,6 @@ fn session_submit(
         item_count: receipt_item_count,
         targets: &receipt_targets,
     });
-    let operation_digest = match session_operation_digest(&action, vault_str.as_deref(), expires) {
-        Ok(digest) => digest,
-        Err(e) => return e,
-    };
     let receipt_reservations = receipt_batch.as_ref().map_or_else(Vec::new, |batch| {
         receipt_reservations(nonce, &operation_digest, batch)
     });
@@ -2708,7 +2770,7 @@ fn session_submit(
             if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
                 return e;
             }
-            let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
+            let _ = crate::host::store_del(&session_key(n, w, id, "last_error.json"));
             let _ = append_audit(
                 n,
                 w,
@@ -2782,10 +2844,10 @@ fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), Disp
     let time = event
         .get("time_ms")
         .and_then(Value::as_u64)
-        .unwrap_or_else(petal::sdk::now_ms);
+        .unwrap_or_else(crate::host::now_ms);
     let digest = hex::encode(sha3::Keccak256::digest(&line));
     let key = session_key(n, w, id, &format!("audit/{time:020}-{digest}.jsonl"));
-    match petal::sdk::store_put_new(&key, &line, false) {
+    match crate::host::store_put_new(&key, &line, false) {
         Ok(()) => Ok(()),
         Err(e) => match load_bytes(&key) {
             Ok(Some(existing)) if existing == line => Ok(()),
@@ -2802,7 +2864,7 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
         out.clear();
     }
     let prefix = session_key(n, w, id, "audit/");
-    let mut keys = petal::sdk::store_list(&prefix, MAX_BODY).map_err(|e| e.message())?;
+    let mut keys = crate::host::store_list(&prefix, MAX_BODY).map_err(|e| e.message())?;
     keys.sort();
     for key in keys.iter().skip(keys.len().saturating_sub(1024)) {
         let Some(line) = load_bytes_result(key).map_err(|e| e.message())? else {
@@ -2979,7 +3041,7 @@ fn session_close_all(
         Ok(pending) => pending,
         Err(e) => return e,
     };
-    if let Some(action) = live_cleanup_replay(pending, petal::sdk::now_ms()) {
+    if let Some(action) = live_cleanup_replay(pending, crate::host::now_ms()) {
         return session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()));
     }
     let state = match http_json(
@@ -3218,30 +3280,47 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
 /// last submitted and goes stale the moment another client approves for the
 /// same wallet. Not authoritative in the strong sense: the request is proxied
 /// by the Machine, which Sealed Approvals already treats as able to lie.
+/// Reads the cap Hyperliquid currently has on record.
+///
+/// The error is deliberately left bare. Two routes check this cap and they
+/// owe the caller different things: an approval that fails here submitted
+/// nothing and left the existing cap alone, while an order preflight was
+/// never changing a cap at all. Each call site adds its own wording, so a
+/// failed order can no longer tell an agent that a cap it never touched is
+/// unchanged — which invites a pointless re-approval instead of a retry.
 fn live_builder_fee_cap(n: Network, account: &str, builder: &str) -> Result<u64, DispatchResponse> {
     http_json(
         n,
         "/info",
         json!({"type": "maxBuilderFee", "user": account, "builder": builder}),
-    )
-    // Without this a caller retrying an approval during an outage reads a bare
-    // transport or status error from an approval route and cannot tell a
-    // failed submission from a failed check.
-    .map_err(unverified_builder_fee_cap)?
+    )?
     .as_u64()
     .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))
-    .map_err(unverified_builder_fee_cap)
+}
+
+fn cap_check_cause(e: &DispatchResponse) -> String {
+    match e {
+        DispatchResponse::Error { message, .. } => message.clone(),
+        _ => "unknown error".to_owned(),
+    }
 }
 
 /// Says that the approval was not attempted, which the underlying transport or
 /// status error cannot say for itself.
 fn unverified_builder_fee_cap(e: DispatchResponse) -> DispatchResponse {
-    let cause = match &e {
-        DispatchResponse::Error { message, .. } => message.clone(),
-        _ => "unknown error".to_owned(),
-    };
+    let cause = cap_check_cause(&e);
     backend(format!(
         "could not check the builder's currently approved cap with Hyperliquid, so nothing was submitted; the existing cap is unchanged and this is safe to retry: {cause}"
+    ))
+}
+
+/// Says that the order was not sent. It must not mention the approved cap
+/// being unchanged: an order preflight never changes one, and saying so sends
+/// an agent to re-approve when the order is what needs retrying.
+fn unverified_builder_order_cap(e: DispatchResponse) -> DispatchResponse {
+    let cause = cap_check_cause(&e);
+    backend(format!(
+        "could not check the builder's approved cap with Hyperliquid, so nothing was sent; this is safe to retry: {cause}"
     ))
 }
 
@@ -3262,7 +3341,8 @@ fn ensure_builder_fee_is_approved(
     else {
         return Ok(());
     };
-    let approved = live_builder_fee_cap(n, account, &builder.address)?;
+    let approved =
+        live_builder_fee_cap(n, account, &builder.address).map_err(unverified_builder_order_cap)?;
     if approved < u64::from(builder.fee_tenths_bps) {
         return Err(invalid(format!(
             "builder {} is not yet approved for a fee of {} tenths of a basis point (currently approved up to {approved}); call approve_builder_fee.json for this builder before placing this order",
@@ -3299,7 +3379,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(agent_name) => agent_name,
         Err(error) => return invalid(error),
     };
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     let request_digest = hex::encode(sha3::Keccak256::digest(body));
     let pending_key = session_key(n, &w, &req.id, "pending.json");
     let pending = match load_secret_json::<Pending>(pending_key.clone()) {
@@ -3587,7 +3667,7 @@ pub fn session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRes
         "",
     ]);
     let keys =
-        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+        crate::host::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
     Ok(completed_session_ids(&prefix, keys)
         .into_iter()
         .map(petal::dir)
@@ -3610,6 +3690,164 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+    /// `session_submit` answers a settled operation before it checks the
+    /// builder approval or the live leverage, so a retry of an order that is
+    /// already on the book is not refused because `/info` is unreachable or
+    /// because the approved cap was lowered after the order filled. That
+    /// depends on reading the stored nonce without reserving one, which is
+    /// why the lookup is separate from the reservation.
+    #[test]
+    fn a_settled_session_operation_is_reported_without_reserving_a_nonce() {
+        use super::{Network, PendingNonce, save_json, session_key, session_pending_nonce};
+        let (n, w, id, digest) = (Network::Testnet, "main", "s1", "abc123");
+        crate::host::test_reset();
+        let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
+        save_json(
+            key.clone(),
+            &PendingNonce {
+                nonce: 42,
+                expires_ms: u64::MAX,
+                action_id: None,
+                completed: true,
+                submitted: Some(true),
+            },
+            false,
+        )
+        .unwrap();
+        let before = crate::host::store_list("state/", usize::MAX).unwrap();
+
+        assert_eq!(
+            session_pending_nonce(n, w, id, digest).unwrap(),
+            Some((42, key, true)),
+            "a settled operation is reported from its stored record"
+        );
+        assert_eq!(
+            crate::host::store_list("state/", usize::MAX).unwrap(),
+            before,
+            "reading a settled operation must reserve nothing and write nothing"
+        );
+    }
+
+    /// The approval record must land before the nonce is marked completed.
+    ///
+    /// Fails if `commit_builder_fee_approval` ever writes them the other way
+    /// round: the completion mark is the write made to fail here, so a
+    /// swapped order would fail before the record was written and leave the
+    /// generation where it started.
+    #[test]
+    fn an_approval_record_that_lands_first_keeps_a_retry_honest() {
+        use super::{
+            BuilderFeeApproval, Network, approve_builder_fee_identity, builder_fee_approval_key,
+            commit_builder_fee_approval, load_json, owner_nonce,
+        };
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        let approval_key = builder_fee_approval_key(n, w, builder);
+        let generation = |key: &str| {
+            load_json::<BuilderFeeApproval>(key.to_owned())
+                .unwrap()
+                .map_or(0, |state| state.generation)
+        };
+        crate::host::test_reset();
+
+        let identity = approve_builder_fee_identity(body, builder, 0);
+        let (nonce, key, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        assert!(!completed, "a first approval has nothing to resume");
+        let key = key.expect("a reserved nonce is keyed");
+
+        // The venue accepted; the write marking the nonce completed fails.
+        crate::host::test_fail_writes_matching(Some(&key));
+        let committed =
+            commit_builder_fee_approval(approval_key.clone(), 10, 0, Some(key.clone()), nonce);
+        crate::host::test_fail_writes_matching(None);
+        assert!(committed.is_err(), "the completion mark was made to fail");
+        assert_eq!(
+            generation(&approval_key),
+            1,
+            "the approval record must be written before the completion mark, \
+             or a crash between them leaves a completed nonce for a cap the \
+             record never recorded"
+        );
+
+        // So the retry computes a fresh identity and goes back to the venue.
+        let retry = approve_builder_fee_identity(body, builder, 1);
+        assert_ne!(identity, retry, "a new generation is a new identity");
+        let (_, _, retry_completed) = owner_nonce(n, w, leaf, &retry, None).unwrap();
+        assert!(
+            !retry_completed,
+            "a retry answered as completed would report an approval the venue never took"
+        );
+    }
+
+    /// Why that order matters, stated as the failure it avoids: a nonce marked
+    /// completed while the approval record is missing leaves the generation
+    /// where it was, so the retry recomputes the same identity and is answered
+    /// with a success for a cap that never landed.
+    #[test]
+    fn a_completed_nonce_without_its_record_would_answer_a_retry_with_a_cap_that_never_landed() {
+        use super::{Network, approve_builder_fee_identity, owner_nonce, save_pending};
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        crate::host::test_reset();
+
+        let identity = approve_builder_fee_identity(body, builder, 0);
+        let (nonce, key, _) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        save_pending(&key.expect("a reserved nonce is keyed"), nonce, true).unwrap();
+
+        let (_, _, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        assert!(
+            completed,
+            "the generation never moved, so this identity still reads its own completed record"
+        );
+    }
+
+    /// Approve 10, revoke, approve 10 again. The third write is byte-identical
+    /// to the first in body and builder, and must still reach the venue: only
+    /// the generation keeps it from being answered by the first one's record.
+    #[test]
+    fn approving_a_cap_again_after_a_revocation_still_reaches_the_venue() {
+        use super::{
+            BuilderFeeApproval, Network, approve_builder_fee_identity, builder_fee_approval_key,
+            commit_builder_fee_approval, load_json, owner_nonce,
+        };
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approval_key = builder_fee_approval_key(n, w, builder);
+        crate::host::test_reset();
+
+        let mut identities = Vec::new();
+        for (cap, body) in [
+            (10u32, &br#"{"max_fee_tenths_bps":10}"#[..]),
+            (0, &br#"{"max_fee_tenths_bps":0}"#[..]),
+            (10, &br#"{"max_fee_tenths_bps":10}"#[..]),
+        ] {
+            let generation = load_json::<BuilderFeeApproval>(approval_key.clone())
+                .unwrap()
+                .map_or(0, |state| state.generation);
+            let identity = approve_builder_fee_identity(body, builder, generation);
+            let (nonce, key, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+            assert!(
+                !completed,
+                "a cap of {cap} must reach the venue, not be answered from a record"
+            );
+            commit_builder_fee_approval(
+                approval_key.clone(),
+                cap,
+                generation,
+                Some(key.expect("a reserved nonce is keyed")),
+                nonce,
+            )
+            .unwrap();
+            identities.push(identity);
+        }
+        assert_ne!(
+            identities[0], identities[2],
+            "the repeat of a cap already held must not reuse the first write's identity"
+        );
+    }
+
     /// A caller who reads "revoked" stops expecting the builder to charge, and
     /// every input the corroboration rests on is a store key or a
     /// Machine-proxied read. So a revocation is never answered from stored

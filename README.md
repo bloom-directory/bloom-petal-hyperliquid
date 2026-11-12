@@ -223,23 +223,24 @@ call named, which any caller can already choose explicitly, so it added no
 capability — while adding a ceremony-free write, shared across every account
 of the wallet, that silently changed what later default approvals would name.
 
-**Pre-merge gate: Bloom #224 and Broker #103.** What makes the builder address
-and rate visible to the owner is the signed typed data, not an advisory. Every
-signing payload now carries a `bloom.message.review.v1` envelope — the EIP-712
-typed data for `approveBuilderFee`, and the `hyperliquid_l1` action for orders
-— which `sign_payload` forwards. Broker #103's `message_review` decodes that
-envelope, checks it against the exact preimage hash and renders each typed
-leaf, labelling `action.builder.b` and `action.builder.f` as the builder fee
-recipient and rate. Until #224 and #103 land, those leaves are not rendered.
+What makes the builder address and rate visible to the owner is the signed
+typed data, not an advisory. Every signing payload carries a
+`bloom.message.review.v1` envelope — the EIP-712 typed data for
+`approveBuilderFee`, and the `hyperliquid_l1` action for orders — which
+`sign_payload` forwards. Broker's `message_review` decodes that envelope,
+checks it against the exact preimage hash and renders each typed leaf,
+labelling `action.builder.b` and `action.builder.f` as the builder fee
+recipient and rate.
 
-The envelope is also why this branch must stay merged with `main`: Bloom #224's
-`petal_review_payload` refuses any secp256k1 payload beginning with `0x19` that
-carries no envelope, so `approve_builder_fee.json` and the owner
-`builder_order.json` would both be refused without it.
+Rendering those leaves needs a Bloom that forwards the envelope and a Broker
+that decodes it, and a Bloom that forwards it also refuses a secp256k1 payload
+beginning with `0x19` that carries none. Both are properties of the revisions
+this Petal pins, which `ci.yml` and `scripts/check-triad-package.sh` record
+rather than this file: when the pinned Bloom predates envelope forwarding, the
+typed leaves are not rendered.
 
-The Petal's own advisory text remains undelivered at the pinned revisions and
-is a weaker, separate concern: it is asserted prose, whereas the envelope is
-checked against the hash that gets signed.
+The Petal's own advisory text is a weaker, separate concern: it is asserted
+prose, whereas the envelope is checked against the hash that gets signed.
 
 ## Account-scoped routes
 
