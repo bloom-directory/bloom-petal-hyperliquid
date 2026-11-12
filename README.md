@@ -24,15 +24,15 @@ committed in the signed order payload, which is forwarded for owner review as
 a `bloom.message.review.v1` envelope rather than carried in the claim. The bound uses each leg's limit price. A buy fills at or below its limit; a
 builder-bearing sell must be post-only (`Alo`), since a crossing sell fills at
 the resting bid, which no order price caps, while a post-only sell fills at
-exactly its limit. Spot buys pay no builder fee and add nothing, and an order
-of only spot buys is refused. A builder-bearing trigger order is refused, since
-it fills at the market once triggered. Hyperliquid collects the builder fee in
-the market's quote or collateral asset and the claim declares USDC, so a
-builder-bearing leg is accepted only where the fee is known to be USDC: core
-perps, and spot sells on pairs quoted in USDC (read from `spotMeta`; a spot buy
-pays no fee). A spot sell on a pair quoted in another token is refused. HIP-3
-perps and outcome markets are refused too: this Petal does not look up their
-fee asset, which for HIP-3 depends on the dex.
+exactly its limit. A builder-bearing trigger order is refused, since it fills
+at the market once triggered. Hyperliquid collects the builder fee in the
+market's quote or collateral asset and the claim declares USDC, so a
+builder-bearing leg is accepted only on core perps. Spot pairs are refused
+whichever token quotes them and whichever side the leg takes, and so are HIP-3
+perps and outcome markets. Broker bounds the same order from its signed bytes
+and refuses every one of these, because the signed order does not carry a spot
+pair's quote token or a HIP-3 dex's collateral asset; a leg accepted here but
+refused there would be signed and then denied at the claim.
 `approve_builder_fee.json` approves the maximum fee a builder may charge; like
 `usd_class_transfer.json`, it must be signed by the main wallet and is
 deliberately absent from the delegated agent session surface. A delegated
