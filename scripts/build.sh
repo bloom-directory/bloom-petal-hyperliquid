@@ -3,6 +3,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PETAL_REV="2beed2ff344ce2b0c112e07096027e1ae0404007"
 
+# A release build embeds this release's default builder address. The release
+# workflow passes it as the generic PETAL_COMPILE_TIME_SECRET; re-export it
+# under the name route/src/settings.rs reads. It is public on-chain data, not
+# a credential: it is a build input only because this repository is public,
+# and the owner still approves the address in every ceremony. A build that
+# sets nothing has no default, and callers must name a builder.
+if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
+  if [[ -z "$PETAL_COMPILE_TIME_SECRET" ]]; then
+    echo "PETAL_COMPILE_TIME_SECRET is set but empty" >&2
+    exit 1
+  fi
+  if [[ ! "$PETAL_COMPILE_TIME_SECRET" =~ ^0x[0-9a-f]{40}$ ]]; then
+    echo "PETAL_COMPILE_TIME_SECRET must be a builder address: 0x followed by 40 lowercase hex digits" >&2
+    exit 1
+  fi
+  export HYPERLIQUID_BUILDER_ADDRESS="$PETAL_COMPILE_TIME_SECRET"
+  unset PETAL_COMPILE_TIME_SECRET
+fi
+
+# Bloom materializes composed route artifacts here after package validation
+# (both `bloom petals install <dir>` and the developer provenance-enrollment
+# path write it directly into this tree). They are derived from the route
+# sources and must not survive a source rebuild, or the next
+# `bloom petals build/install` rejects the stale bytes before it gets a
+# chance to regenerate them.
+rm -rf -- "$ROOT/artifacts"
+
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
 else

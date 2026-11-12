@@ -5,6 +5,7 @@ use sha2::Sha256;
 use sha3::Digest;
 
 use crate::protocol::{self, ExchangeAction, Network, SignSubmit};
+use crate::settings;
 use petal::{
     Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
     SignSelector,
@@ -41,6 +42,7 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+
     /// A withdrawal debits the gross amount from the Hyperliquid account and
     /// settles on the destination chain (Arbitrum). The Broker catalogues petal
     /// operation classes with a `none` fee asset, so the claim itself cannot
@@ -59,6 +61,180 @@ impl ClaimEffects {
             declared_fee: json!({"kind": "none"}),
         }
     }
+
+    /// An order that carries a per-order builder fee pays it to a third-party
+    /// address the caller chose, so it is a real economic effect the owner's
+    /// approval ceremony must see rather than `{"kind":"none"}`. Broker's
+    /// `DeclaredFee` is a closed schema (`{"kind":"none"}` or
+    /// `{"kind":"fee","chain","asset","amount"}`, `amount` a plain integer
+    /// string) with no field for the fee's recipient, so the builder address
+    /// itself cannot be carried here — only what will be charged. The
+    /// recipient and rate are committed in the signed order payload, and
+    /// what shows them to the owner is that payload's
+    /// `bloom.message.review.v1` envelope, which Broker checks against the
+    /// exact preimage hash before rendering. Not this Petal's advisory
+    /// prose, which is asserted rather than checked and is not delivered at
+    /// the pinned revisions.
+    fn builder_order_fee(fee_micros: u64) -> Self {
+        Self {
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": fee_micros.to_string(),
+            }),
+        }
+    }
+}
+
+/// Computes the claim effect for an owner- or session-signed order action,
+/// naming the builder's fee exactly when the order carries one so it is never
+/// signed under `ClaimEffects::none()`. The declared amount is an upper bound
+/// (rounded up) on `notional * fee_tenths_bps`, from prices the request itself
+/// fixes, so nothing fetched before signing can go stale:
+///
+/// - A buy fills at or below its limit, so its limit bounds it.
+/// - A sell crossing the book fills at the resting bid, which no order price
+///   caps from above, so a builder-bearing sell must be post-only (`Alo`):
+///   the venue refuses it rather than let it cross, and as a maker it fills
+///   at exactly its limit.
+/// - Hyperliquid charges no builder fee on the buying side of spot trades, so
+///   spot buys add nothing; an order of only spot buys is refused, since its
+///   builder would earn nothing.
+/// - A trigger order fills at the market once triggered, so it is refused.
+/// - Hyperliquid collects the builder fee in the market's quote or collateral
+///   asset, and the claim declares USDC, so only core perps are accepted.
+///   Spot pairs are refused whichever token quotes them, and so are HIP-3
+///   perps and outcomes. Broker bounds the same order from the signed bytes
+///   and cannot read a spot pair's quote token from them, so a spot leg
+///   accepted here would be signed and then denied at the claim.
+///
+/// Every other leg counts, reduce-only included. The venue computes and
+/// deducts the exact fee.
+fn order_claim_effects(action: &ExchangeAction) -> Result<ClaimEffects, String> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(ClaimEffects::none());
+    };
+    protocol::parse_address(&builder.address)?;
+    Ok(ClaimEffects::builder_order_fee(
+        builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps)?,
+    ))
+}
+
+/// Refuses a builder-bearing leg this Petal cannot bound in USDC.
+///
+/// Core perps only. Broker computes its own bound from the signed order and
+/// refuses anything else, because it cannot read a spot pair's quote token
+/// from the order, so accepting a USDC-quoted spot sell here would sign an
+/// order the Broker then denies.
+fn ensure_builder_leg_can_be_bounded(order: &protocol::OrderWire) -> Result<(), String> {
+    if protocol::is_hip3_perp_asset(order.asset) {
+        return Err(format!(
+            "asset {} is a builder-deployed (HIP-3) perp; Hyperliquid collects its builder fee in that dex's collateral asset, which is not always USDC and which this Petal does not look up, so builder fees are accepted only on core perps",
+            order.asset
+        ));
+    }
+    if protocol::is_outcome_asset(order.asset) {
+        return Err(format!(
+            "asset {} is an outcome market; this Petal does not bound builder fees on outcomes, so builder fees are accepted only on core perps",
+            order.asset
+        ));
+    }
+    if protocol::is_spot_asset(order.asset) {
+        return Err(format!(
+            "asset {} is a spot pair; Hyperliquid collects its builder fee in the pair's quote token, which cannot be read from the signed order, so builder fees are accepted only on core perps",
+            order.asset
+        ));
+    }
+    Ok(())
+}
+
+fn builder_fee_upper_bound_micros(
+    orders: &[protocol::OrderWire],
+    fee_tenths_bps: u32,
+) -> Result<u64, String> {
+    for o in orders {
+        ensure_builder_leg_can_be_bounded(o)?;
+    }
+    let mut fee_micros = 0_u64;
+    for o in orders {
+        let Some(limit_type) = &o.order_type.limit else {
+            return Err(
+                "a builder-bearing trigger order cannot be bounded: a stop or take-profit fills at the market once triggered, so its builder fee cannot be declared in advance; submit it without a builder or as a limit order".into(),
+            );
+        };
+        if !o.is_buy && !matches!(limit_type.tif, protocol::TimeInForce::Alo) {
+            return Err(
+                "a builder-bearing sell must be post-only (tif \"Alo\"): a sell that crosses the book fills at the resting bid, which nothing in the order caps, so its builder fee cannot be bounded; a post-only sell fills at exactly its limit".into(),
+            );
+        }
+        let leg_fee = exact_builder_fee_micros(&o.price, &o.size, fee_tenths_bps)?;
+        fee_micros = fee_micros
+            .checked_add(leg_fee)
+            .ok_or("builder fee exceeds the supported USDC amount")?;
+    }
+    Ok(fee_micros)
+}
+
+/// Round each leg upward in micro-USDC using the signed decimal bytes.
+/// Floating-point rounding can erase a fraction above an integer, and
+/// saturating a large fee silently understates the amount being authorized.
+fn exact_builder_fee_micros(price: &str, size: &str, rate: u32) -> Result<u64, String> {
+    use alloy_primitives::U256;
+
+    let decimal = |raw: &str| -> Result<(U256, usize), String> {
+        let fraction = raw.split_once('.').map_or(0, |(_, value)| value.len());
+        let mantissa = raw
+            .replace('.', "")
+            .parse::<U256>()
+            .map_err(|_| "order price and size exceed the supported decimal range")?;
+        Ok((mantissa, fraction))
+    };
+    let (price, price_scale) = decimal(price)?;
+    let (size, size_scale) = decimal(size)?;
+    let overflow = "builder fee exceeds the supported USDC amount";
+    // 1 USDC = 10^6 micros; one tenth-basis-point = 1/10^5.
+    let numerator = price
+        .checked_mul(size)
+        .and_then(|value| value.checked_mul(U256::from(rate)))
+        .and_then(|value| value.checked_mul(U256::from(10)))
+        .ok_or(overflow)?;
+    let denominator = U256::from(10)
+        .checked_pow(U256::from(price_scale + size_scale))
+        .ok_or(overflow)?;
+    let mut bound = numerator / denominator;
+    if numerator % denominator != U256::ZERO {
+        bound = bound.checked_add(U256::from(1)).ok_or(overflow)?;
+    }
+    bound.try_into().map_err(|_| overflow.into())
+}
+
+/// The ceremony advisory for an order that carries a builder fee, so the
+/// owner sees the recipient and the rate rather than only an opaque hash.
+fn builder_order_advisory_for(action: &ExchangeAction) -> Option<Vec<u8>> {
+    let ExchangeAction::Order {
+        orders,
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return None;
+    };
+    // Runs after `order_claim_effects` accepted the same action, so the bound
+    // that produced the declared fee is the one shown here.
+    let fee_micros = builder_fee_upper_bound_micros(orders, builder.fee_tenths_bps).ok()?;
+    Some(builder_order_advisory(
+        &builder.address,
+        builder.fee_tenths_bps,
+        fee_micros,
+    ))
 }
 
 fn ok_write() -> DispatchResponse {
@@ -95,7 +271,7 @@ fn save_json(
     secret: bool,
 ) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
+    crate::host::store_put(&key, &b, secret).map_err(|e| backend(e.message()))
 }
 fn save_json_new(
     key: String,
@@ -103,10 +279,10 @@ fn save_json_new(
     secret: bool,
 ) -> Result<(), DispatchResponse> {
     let b = serde_json::to_vec(v).map_err(|e| backend(e.to_string()))?;
-    petal::sdk::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
+    crate::host::store_put_new(&key, &b, secret).map_err(|e| backend(e.message()))
 }
 fn load_bytes_result(key: &str) -> Result<Option<Vec<u8>>, SdkError> {
-    match petal::sdk::store_get(key, MAX_BODY) {
+    match crate::host::store_get(key, MAX_BODY) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
         Err(e) => Err(e),
@@ -404,6 +580,24 @@ fn owner_sign_or_approval(
     }
 }
 
+/// The public owner address last recovered from one of this wallet's owner
+/// signatures. Kept so a check that needs it, the builder-approval precheck,
+/// can run before the next ceremony instead of only after it; the
+/// authoritative check on the freshly recovered signer still runs after.
+fn owner_address_key(w: &str) -> String {
+    state_key(&["owner-address", w])
+}
+
+fn cached_owner_address(w: &str) -> Option<String> {
+    load_json::<String>(owner_address_key(w)).ok().flatten()
+}
+
+fn remember_owner_address(w: &str, address: &str) {
+    // Best effort: a failed write only costs a wasted ceremony on a later
+    // call, never correctness, because the post-signature check still runs.
+    let _ = save_json(owner_address_key(w), &address.to_owned(), false);
+}
+
 pub fn owner_action_write(
     ctx: &Ctx,
     n: Network,
@@ -438,6 +632,24 @@ pub fn owner_action_write(
             Ok(h) => h,
             Err(e) => return invalid(e),
         };
+    let carries_builder = req.action.carries_builder();
+    // The claim (and with it every market and bound refusal) comes first, so
+    // an order this Petal will refuse anyway never sends the owner to approve
+    // its builder.
+    let effects = match order_claim_effects(&req.action) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
+    // Refuse an unapproved builder before the ceremony whenever the owner
+    // address is already known from an earlier signature, so the owner is
+    // not asked for a passkey tap the venue would then make pointless. The
+    // authoritative check on the recovered signer still runs below.
+    if carries_builder
+        && let Some(owner_address) = cached_owner_address(&w)
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
+    }
     let sig = match owner_sign_or_approval(
         ctx,
         &w,
@@ -447,13 +659,23 @@ pub fn owner_action_write(
             pending_nonce_key: pending_nonce_key.as_deref(),
             nonce,
             kind: "exchange",
-            advisory: None,
-            effects: ClaimEffects::none(),
+            advisory: builder_order_advisory_for(&req.action),
+            effects,
         },
     ) {
         Ok(sig) => sig,
         Err(response) => return response,
     };
+    let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+        Ok(address) => address,
+        Err(e) => return backend(e),
+    };
+    remember_owner_address(&w, &owner_address);
+    if carries_builder
+        && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
+    {
+        return e;
+    }
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
     {
@@ -505,7 +727,7 @@ fn owner_nonce(
         return Ok((nonce, None, false));
     }
     let key = owner_nonce_key(n, w, leaf, body);
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
         let sent = load_bytes(&sent_marker_key(&key))?.is_some();
         return resume_pending(&pending, leaf, sent, now)
@@ -625,13 +847,13 @@ fn clear_cleanup_replay(key: Option<&str>) -> Result<(), DispatchResponse> {
     let Some(key) = key else {
         return Ok(());
     };
-    match petal::sdk::store_del(key) {
+    match crate::host::store_del(key) {
         Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
         Err(e) => Err(backend(e.message())),
     }
 }
 fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     for offset in 0..1024_u64 {
         let nonce = now.saturating_add(offset);
         let key = format!("{prefix}/{nonce}.json");
@@ -646,24 +868,33 @@ fn reserve_nonce(prefix: &str, marker: &str) -> Result<u64, DispatchResponse> {
     }
     Err(backend("unable to reserve a unique Hyperliquid nonce"))
 }
-fn session_nonce(
+/// The nonce already stored for this operation, reserving nothing.
+///
+/// Kept apart from the reservation so a settled operation can be answered
+/// before any live check runs. A retry of an order that already executed must
+/// not be refused because `/info` is unreachable or because the approved cap
+/// was lowered after it filled.
+fn session_pending_nonce(
     n: Network,
     w: &str,
     id: &str,
-    action: &ExchangeAction,
-    vault: Option<&str>,
-    expires: Option<u64>,
-    explicit: Option<u64>,
-) -> Result<(u64, Option<String>, bool), DispatchResponse> {
-    if let Some(nonce) = explicit {
-        return Ok((nonce, None, false));
-    }
-    let digest = session_operation_digest(action, vault, expires)?;
+    digest: &str,
+) -> Result<Option<(u64, String, bool)>, DispatchResponse> {
     let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
-    if let Some(pending) = load_json::<PendingNonce>(key.clone())? {
-        return Ok((pending.nonce, Some(key), pending.completed));
-    }
-    let nonce = reserve_nonce(&session_key(n, w, id, "nonces"), &digest)?;
+    Ok(load_json::<PendingNonce>(key.clone())?
+        .map(|pending| (pending.nonce, key, pending.completed)))
+}
+
+/// Reserves a nonce for an operation that has none. Called only once the
+/// order is known admissible, so a refused order reserves nothing.
+fn session_reserve_nonce(
+    n: Network,
+    w: &str,
+    id: &str,
+    digest: &str,
+) -> Result<(u64, Option<String>, bool), DispatchResponse> {
+    let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
+    let nonce = reserve_nonce(&session_key(n, w, id, "nonces"), digest)?;
     let candidate = PendingNonce {
         nonce,
         expires_ms: u64::MAX,
@@ -858,6 +1089,282 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         Err(e) => e,
     }
 }
+/// Reports which builder address `approve_builder_fee.json` would use as its
+/// default today, and why, for `settings/status.json`.
+pub fn builder_address_status() -> settings::BuilderAddressStatus {
+    settings::default_builder_address_status()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveBuilderFee {
+    #[serde(default)]
+    builder: Option<String>,
+    max_fee_tenths_bps: u32,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+/// What a repeated `approve_builder_fee.json` write is matched on. A body that
+/// omits `builder` resolves it from the release default, so
+/// the same body can mean a different builder later; matching on the body
+/// alone would report a new builder's approval as already done.
+///
+/// The generation is what lets a cap come back to a value it already held.
+/// Body and builder alone are not unique over time: approving 10, revoking
+/// with 0, then approving 10 again produces the first write's identity a
+/// second time, and its completed pending record would answer the venue call
+/// with a bare success while the cap stayed revoked. The generation advances
+/// on each completed approval, so a changed cap gets its own record while a
+/// retry of the cap in flight keeps the one it started.
+fn approve_builder_fee_identity(body: &[u8], resolved_builder: &str, generation: u64) -> Vec<u8> {
+    let mut identity = body.to_vec();
+    identity.extend_from_slice(b"\0builder=");
+    identity.extend_from_slice(resolved_builder.as_bytes());
+    identity.extend_from_slice(b"\0generation=");
+    identity.extend_from_slice(generation.to_string().as_bytes());
+    identity
+}
+
+/// The last cap this Petal successfully approved for one builder, and the
+/// generation that keys its pending-nonce record. Stored per network, wallet
+/// and builder, so one builder's history cannot answer for another's.
+#[derive(Debug, Serialize, Deserialize)]
+struct BuilderFeeApproval {
+    approved_tenths_bps: u32,
+    generation: u64,
+}
+
+/// Whether a stored approval record may be corroborated and answered from,
+/// rather than the approval being submitted again.
+///
+/// Extracted so the rule is reachable by a test: the call site sits in a route
+/// with no store or venue double, where deleting the whole guard left the
+/// suite green.
+fn may_corroborate_from_record(requested: u32, record: Option<&BuilderFeeApproval>) -> bool {
+    // A revocation is never answered from stored state. See the call site: the
+    // caller's belief that the builder can no longer charge is the point of
+    // revoking, and every input this shortcut rests on is a store key.
+    if requested == 0 {
+        return false;
+    }
+    record.is_some_and(|state| state.approved_tenths_bps == requested)
+}
+
+/// Records an approval the venue accepted.
+///
+/// The approval record lands before the nonce is marked completed, and the
+/// order is the whole point. A retry is answered without reaching the venue
+/// only from a completed nonce, so of the two partial failures that a crash
+/// between these writes can leave, the reachable one must be the one where
+/// nothing claims success. Writing the record first gives that: the record
+/// advances the generation, the generation is part of the identity the nonce
+/// is keyed on, and the retry therefore computes a fresh key and re-approves.
+///
+/// Swapped, the nonce would be marked completed under an identity whose
+/// generation never moved, and the retry would read success for a cap the
+/// venue never took. `an_approval_record_that_lands_first_keeps_a_retry_honest`
+/// fails if these two writes are ever reordered.
+fn commit_builder_fee_approval(
+    approval_key: String,
+    approved_tenths_bps: u32,
+    generation: u64,
+    pending_nonce_key: Option<String>,
+    nonce: u64,
+) -> Result<(), DispatchResponse> {
+    save_json(
+        approval_key,
+        &BuilderFeeApproval {
+            approved_tenths_bps,
+            generation: generation.saturating_add(1),
+        },
+        false,
+    )?;
+    if let Some(key) = pending_nonce_key {
+        save_pending(&key, nonce, true)?;
+    }
+    Ok(())
+}
+
+fn builder_fee_approval_key(n: Network, w: &str, resolved_builder: &str) -> String {
+    state_key(&[
+        "exchange",
+        "builder_fee_approvals",
+        if matches!(n, Network::Mainnet) {
+            "mainnet"
+        } else {
+            "testnet"
+        },
+        w,
+        resolved_builder,
+        "approval.json",
+    ])
+}
+
+/// Approves a maximum builder fee for a builder address. Hyperliquid requires
+/// this to be signed by the main wallet, so — like `usd_class_transfer` — it
+/// is deliberately absent from the delegated agent session surface: it is
+/// reached only through `owner_sign_or_approval`, never through a session's
+/// Signer-owned key.
+pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<ApproveBuilderFee>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid approve_builder_fee body: {e}")),
+    };
+    let resolved_builder = match settings::resolve_default_builder_address(req.builder.as_deref()) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let builder_source = if req.builder.is_some() {
+        "explicit in this request"
+    } else {
+        match settings::default_builder_address_status().source {
+            settings::BuilderAddressSource::ReleaseDefault => "this release's default",
+            settings::BuilderAddressSource::Unconfigured => "unconfigured",
+        }
+    };
+    let builder = match protocol::parse_address(&resolved_builder) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    // The per-order builder field is required lowercase so it matches this
+    // approval byte-for-byte; require the approval's address the same way
+    // rather than silently normalizing it, so the two can never drift.
+    if resolved_builder != resolved_builder.to_ascii_lowercase() {
+        return invalid("builder address must be lowercase");
+    }
+    if req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS {
+        return invalid(format!(
+            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval. One approval covers perp and spot orders, so it is bounded by the venue's spot ceiling; each perp order is still capped at {}",
+            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS,
+            protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
+        ));
+    }
+    // A completed approval for the cap already in force is genuinely done, so
+    // a lost response can be retried without submitting twice. A different cap
+    // is a change and must reach the venue even when an identical body once
+    // did, which is what the generation below keys apart.
+    let approval_key = builder_fee_approval_key(n, &w, &resolved_builder);
+    let approval = match load_json::<BuilderFeeApproval>(approval_key.clone()) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    // A revocation is never answered from stored state, and never from this
+    // shortcut at all. Everything it rests on — the approval record, the owner
+    // address it probes with — is a store key, so a caller who writes 0 and
+    // reads success would believe the builder can no longer charge while it
+    // still can. That belief is the whole point of revoking, so a revocation
+    // always reaches the venue, at the cost of a ceremony on an operation that
+    // is rare and deliberate.
+    //
+    // For a cap being raised or kept the same, a false success fails closed
+    // instead: the builder is not authorized, so the order preflight refuses
+    // the order rather than letting an undisclosed fee through.
+    if may_corroborate_from_record(req.max_fee_tenths_bps, approval.as_ref()) {
+        // This record is ours, not the venue's. Another client approving a
+        // different cap for the same wallet leaves it stale, and answering
+        // from it alone would report a cap that is not in force.
+        //
+        // What this is NOT: proof. `cached_owner_address` is a store key and
+        // `/info` is proxied by the same Machine, so both inputs are within
+        // what Sealed Approvals already concedes a compromised Machine may
+        // lie about. This closes honest staleness; it is an optimization with
+        // a corroboration check, not a control.
+        //
+        // The owner address is only known here from an earlier signature, so
+        // when it is not cached the shortcut is simply not taken: the approval
+        // then reaches the venue.
+        match cached_owner_address(&w)
+            .map(|account| live_builder_fee_cap(n, &account, &resolved_builder))
+        {
+            Some(Ok(live)) if live == u64::from(req.max_fee_tenths_bps) => return ok_write(),
+            // An approval that cannot read the cap submitted nothing, and the
+            // bare transport or status error cannot say so for itself.
+            Some(Err(e)) => return unverified_builder_fee_cap(e),
+            Some(Ok(_)) | None => {}
+        }
+    }
+    let generation = approval.as_ref().map_or(0, |state| state.generation);
+    let identity = approve_builder_fee_identity(body, &resolved_builder, generation);
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "approve_builder_fee.json", &identity, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    // Not the guard for the window between a venue success and the approval
+    // record below. In that window the stored record still reads
+    // `completed: false`, because it is marked completed only after the
+    // record lands; and once the record does land it advances the generation
+    // this identity is keyed on, so a later retry computes a different key and
+    // never reads this one again.
+    //
+    // What still reaches here is a concurrent writer: one that computed this
+    // identity before the generation moved, then lost the create race to a
+    // request that has since completed. Answering success is truthful for it,
+    // because the cap did land.
+    if completed {
+        return ok_write();
+    }
+    let max_fee_rate = protocol::builder_fee_max_rate_string(req.max_fee_tenths_bps);
+    let (action, payload) =
+        match protocol::approve_builder_fee_payload(n, builder, &max_fee_rate, nonce) {
+            Ok(x) => x,
+            Err(e) => return invalid(e),
+        };
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.approve_builder_fee",
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "approve_builder_fee",
+            advisory: Some(builder_fee_approval_advisory(
+                n,
+                &resolved_builder,
+                req.max_fee_tenths_bps,
+                builder_source,
+            )),
+            // Approving a cap charges nothing by itself — only a later order
+            // that actually carries a builder fee has an effect to declare —
+            // and Broker's DeclaredFee schema has no field for a bare ceiling
+            // in any case (only `{"kind":"fee",...}` or `{"kind":"none"}`).
+            effects: ClaimEffects::none(),
+        },
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    if let Ok(owner_address) = protocol::recover_signer_from_json(&payload.hash, &sig) {
+        remember_owner_address(&w, &owner_address);
+    }
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            if let Err(e) = protocol::validate_exchange_response(&v) {
+                return backend(e);
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Err(e) = commit_builder_fee_approval(
+                approval_key,
+                req.max_fee_tenths_bps,
+                generation,
+                pending_nonce_key,
+                nonce,
+            ) {
+                return e;
+            }
+            ok_write()
+        }
+        Err(e) => e,
+    }
+}
 /// Venue-reported flat withdrawal fee at implementation time (Hyperliquid
 /// exchange docs, 2026-09). Hyperliquid deducts it from the withdrawn amount,
 /// so the destination receives the amount minus this fee; the venue may change
@@ -951,6 +1458,68 @@ struct WithdrawOperation {
     #[serde(default)]
     response: Option<Value>,
     updated_ms: u64,
+}
+
+/// What the owner sees when approving a builder-fee cap. The recipient and
+/// the ceiling are otherwise only inside the EIP-712 hash, so without this
+/// the ceremony could not show which builder is being approved, or for how
+/// much, or where that address came from.
+fn builder_fee_approval_advisory(
+    n: Network,
+    builder: &str,
+    cap_tenths_bps: u32,
+    source: &str,
+) -> Vec<u8> {
+    let mut lines = vec![
+        format!(
+            "Approves builder {builder} to charge up to {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional on this account's Hyperliquid {} orders.",
+            protocol::builder_fee_max_rate_string(cap_tenths_bps),
+            n.chain()
+        ),
+        format!("Builder address source: {source}."),
+    ];
+    if cap_tenths_bps == 0 {
+        lines.push("A cap of 0% revokes this builder's approval.".to_owned());
+    } else {
+        lines.push(
+            "Only orders that name this builder pay it; Hyperliquid enforces its own ceilings of 0.1% on perps and 1% on spot."
+                .to_owned(),
+        );
+    }
+    lines.join("\n").into_bytes()
+}
+
+/// What the owner sees when signing an order that carries a builder fee.
+fn builder_order_advisory(builder: &str, fee_tenths_bps: u32, fee_micros: u64) -> Vec<u8> {
+    let legs = "across all legs, reduce-only included";
+    [
+        format!(
+            "This order pays a builder fee to {builder}: {} ({fee_tenths_bps} tenths of a basis point) of each fill's notional.",
+            protocol::builder_fee_max_rate_string(fee_tenths_bps)
+        ),
+        format!(
+            "Declared upper bound: {} USDC {legs}; the venue deducts the exact fee from each fill.",
+            micros_decimal(fee_micros)
+        ),
+    ]
+    .join("\n")
+    .into_bytes()
+}
+
+/// What the owner *would* see when approving a session created with a builder
+/// bound: the one builder its orders may pay, and the most they may pay it.
+///
+/// Not displayed at the pinned Bloom and Broker revisions — see
+/// `settings::EMBEDDED_DEFAULT_BUILDER_ADDRESS` for the chain that drops it.
+/// Note also that the refusal this text promises is a check against
+/// `session.json`, a store record, and neither the bound address nor the cap
+/// enters the Signer-enforced key scope.
+fn session_builder_bound_advisory(builder: &str, cap_tenths_bps: u32) -> Vec<u8> {
+    format!(
+        "This session may submit builder-fee orders only to builder {builder}, at most {} ({cap_tenths_bps} tenths of a basis point) of each fill's notional; an order naming another builder or a higher fee is refused before signing.",
+        protocol::builder_fee_max_rate_string(cap_tenths_bps)
+    )
+    .into_bytes()
 }
 
 fn withdraw_advisory(amount_micros: u64, destination: Address) -> Vec<u8> {
@@ -1086,7 +1655,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         payload_hash: hex::encode(payload.hash),
         status: "approval_pending".into(),
         response: None,
-        updated_ms: petal::sdk::now_ms(),
+        updated_ms: crate::host::now_ms(),
     };
     let stored = match load_json::<WithdrawOperation>(op_key.clone()) {
         Ok(x) => x,
@@ -1103,7 +1672,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
                 stale_marker,
                 record,
             } => {
-                if stale_marker && let Err(e) = petal::sdk::store_del(&marker_key) {
+                if stale_marker && let Err(e) = crate::host::store_del(&marker_key) {
                     return backend(e.message());
                 }
                 record
@@ -1177,7 +1746,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
         None => intent,
     };
     op.status = "submitted".into();
-    op.updated_ms = petal::sdk::now_ms();
+    op.updated_ms = crate::host::now_ms();
     if let Err(e) = save_json(op_key.clone(), &op.clone(), false) {
         return backend(format!(
             "could not persist the submission state for withdrawal nonce {nonce}; refusing to submit: {e:?}"
@@ -1191,7 +1760,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
             };
             op.status = status.into();
             op.response = Some(v.clone());
-            op.updated_ms = petal::sdk::now_ms();
+            op.updated_ms = crate::host::now_ms();
             if let Err(e) = save_json(op_key, &op, false) {
                 return e;
             }
@@ -1199,7 +1768,7 @@ pub fn withdraw(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
                 // Record the exact rejection, then release the submission slot
                 // so an explicit retry of this body replays the identical
                 // action instead of being stranded.
-                let _ = petal::sdk::store_del(&marker_key);
+                let _ = crate::host::store_del(&marker_key);
                 return outcome;
             }
             if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
@@ -1253,7 +1822,7 @@ pub fn withdraw_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRe
     let w = wallet(ctx)?;
     let prefix = withdraw_record_prefix(n, &w);
     let keys =
-        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+        crate::host::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
     Ok(withdraw_record_names(&prefix, &keys)
         .into_iter()
         .map(petal::file)
@@ -1293,6 +1862,8 @@ pub struct Session {
     pub max_notional_usd: Option<String>,
     pub max_leverage: Option<u32>,
     pub assets: Vec<String>,
+    pub builder_address: Option<String>,
+    pub max_builder_fee_tenths_bps: Option<u32>,
     pub stopped: bool,
     pub last_response: Option<Value>,
     pub last_error: Option<String>,
@@ -1316,6 +1887,7 @@ fn request_session_key(
     w: &str,
     session_id: &str,
     lifetime_ms: u64,
+    builder_bound: bool,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: w.to_owned(),
@@ -1323,11 +1895,43 @@ fn request_session_key(
         // The host replaces this legacy field with the package-authenticated
         // canonical route scope declared in [[key.derive]].
         allowed_routes: Vec::new(),
-        allowed_operation_classes: vec!["hyperliquid.agent_action".into()],
+        allowed_operation_classes: session_key_classes(builder_bound),
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
+}
+
+/// The operation classes a session key may sign under.
+///
+/// A session created with a builder bound also gets the fee-bearing
+/// builder-order class; every other session is scoped to the fee-free
+/// `hyperliquid.agent_action` surface only, so it cannot sign an order that
+/// declares a fee however its stored record is later edited.
+///
+/// Routes are deliberately not scoped here. The host overwrites the request's
+/// route list with the package-authenticated set from `[[key.derive]]`
+/// (`bloom-petals/src/vm.rs`), so every session key carries the whole session
+/// route surface and the class is what separates a builder-bound session from
+/// a plain one. The host does honour this list, requiring it to be a non-empty
+/// subset of the manifest's classes.
+fn session_key_classes(builder_bound: bool) -> Vec<String> {
+    let mut classes = vec!["hyperliquid.agent_action".to_owned()];
+    if builder_bound {
+        classes.push(protocol::BUILDER_ORDER_INTENT.to_owned());
+    }
+    classes
+}
+
+/// The class a session-signed action is authorized under. A builder-bearing
+/// order declares a fee, so it signs under `BUILDER_ORDER_INTENT` rather than
+/// the fee-free `hyperliquid.agent_action` every other session action uses.
+fn session_operation_class(action: &ExchangeAction) -> &'static str {
+    if action.carries_builder() {
+        protocol::BUILDER_ORDER_INTENT
+    } else {
+        "hyperliquid.agent_action"
+    }
 }
 
 fn session_key_slot(n: Network, session_id: &str) -> String {
@@ -1361,6 +1965,10 @@ struct NewSession {
     #[serde(default)]
     assets: Vec<String>,
     #[serde(default)]
+    builder_address: Option<String>,
+    #[serde(default)]
+    max_builder_fee_tenths_bps: Option<u32>,
+    #[serde(default)]
     nonce: Option<u64>,
 }
 
@@ -1387,6 +1995,29 @@ fn session_preflight(req: &NewSession) -> Result<String, String> {
         .is_some_and(|value| !(1..=50).contains(&value))
     {
         return Err("max_leverage must be 1..=50".into());
+    }
+    match (&req.builder_address, req.max_builder_fee_tenths_bps) {
+        (Some(address), Some(fee)) => {
+            protocol::parse_address(address)?;
+            if address != &address.to_ascii_lowercase() {
+                return Err("builder_address must be lowercase".into());
+            }
+            // Delegated sessions never submit spot orders (session_policy
+            // rejects spot asset ids unconditionally), so the session-level
+            // bound is capped at the perp venue ceiling.
+            if fee == 0 || fee > protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS {
+                return Err(format!(
+                    "max_builder_fee_tenths_bps must be 1..={}",
+                    protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "builder_address and max_builder_fee_tenths_bps must be set together".into(),
+            );
+        }
     }
     valid_session_id(&req.id)?;
     let agent_name = req
@@ -1767,7 +2398,7 @@ fn active_session(n: Network, w: &str, id: &str) -> Result<Session, DispatchResp
         retire_session_key(n, w, id, &session)?;
         return Err(denied("session is stopped"));
     }
-    if session.expires_ms <= petal::sdk::now_ms() {
+    if session.expires_ms <= crate::host::now_ms() {
         retire_session_key(n, w, id, &session)?;
         return Err(denied("session has expired"));
     }
@@ -1831,7 +2462,7 @@ fn cleanup_session(
         return Ok((session, SessionSigning::DelegatedThenOwner));
     }
     match load_session(n, w, id) {
-        Ok(Some(session)) if session.stopped || session.expires_ms <= petal::sdk::now_ms() => {
+        Ok(Some(session)) if session.stopped || session.expires_ms <= crate::host::now_ms() => {
             Ok((session, SessionSigning::Owner))
         }
         // An unloadable or still-live session keeps the original denial.
@@ -1880,21 +2511,50 @@ fn session_submit(
     if let Err(e) = session_policy(s, &action) {
         return denied(e);
     }
+    // The claim (and every market and bound refusal) comes before the
+    // builder-approval check and before any nonce or receipt is reserved, so
+    // an order refused here reserves nothing and never prompts an approval.
+    let effects = match order_claim_effects(&action) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
+    let operation_digest = match session_operation_digest(&action, vault_str.as_deref(), expires) {
+        Ok(digest) => digest,
+        Err(e) => return e,
+    };
+    // A settled operation is answered before any live check, as the owner path
+    // does: `owner_action_write` returns on `completed` before it checks the
+    // builder approval. Checking first here meant a retry of an order already
+    // on the book could fail on an `/info` outage, or on a cap lowered after
+    // it filled, and an agent reading that error may place the order again.
+    let stored_nonce = match explicit_nonce {
+        Some(_) => None,
+        None => match session_pending_nonce(n, w, id, &operation_digest) {
+            Ok(stored) => stored,
+            Err(e) => return e,
+        },
+    };
+    if matches!(stored_nonce, Some((_, _, true))) {
+        if let Err(e) = clear_cleanup_replay(replay_key) {
+            return e;
+        }
+        return ok_write();
+    }
+    if let Err(e) = ensure_builder_fee_is_approved(n, &s.owner_address, &action) {
+        return e;
+    }
     if let Err(e) = verify_live_session_leverage(n, s, &action) {
         return e;
     }
-    let (nonce, operation_key, completed) = match session_nonce(
-        n,
-        w,
-        id,
-        &action,
-        vault_str.as_deref(),
-        expires,
-        explicit_nonce,
-    ) {
-        Ok(x) => x,
-        Err(e) => return e,
+    let (nonce, operation_key, completed) = match (explicit_nonce, stored_nonce) {
+        (Some(nonce), _) => (nonce, None, false),
+        (None, Some((nonce, key, _))) => (nonce, Some(key), false),
+        (None, None) => match session_reserve_nonce(n, w, id, &operation_digest) {
+            Ok(x) => x,
+            Err(e) => return e,
+        },
     };
+    // Only the lost-race path above can still report a completed operation.
     if completed {
         if let Err(e) = clear_cleanup_replay(replay_key) {
             return e;
@@ -1913,10 +2573,6 @@ fn session_submit(
         item_count: receipt_item_count,
         targets: &receipt_targets,
     });
-    let operation_digest = match session_operation_digest(&action, vault_str.as_deref(), expires) {
-        Ok(digest) => digest,
-        Err(e) => return e,
-    };
     let receipt_reservations = receipt_batch.as_ref().map_or_else(Vec::new, |batch| {
         receipt_reservations(nonce, &operation_digest, batch)
     });
@@ -1941,11 +2597,11 @@ fn session_submit(
             ctx,
             w,
             &signing_payload,
-            "hyperliquid.agent_action",
+            session_operation_class(&action),
             None,
             key_ref_jcs,
             None,
-            ClaimEffects::none(),
+            effects.clone(),
         )
     };
     let mut signed = sign(match signing {
@@ -2015,7 +2671,7 @@ fn session_submit(
             if let Err(e) = save_json(session_key(n, w, id, "last_response.json"), &v, false) {
                 return e;
             }
-            let _ = petal::sdk::store_del(&session_key(n, w, id, "last_error.json"));
+            let _ = crate::host::store_del(&session_key(n, w, id, "last_error.json"));
             let _ = append_audit(
                 n,
                 w,
@@ -2089,10 +2745,10 @@ fn append_audit(n: Network, w: &str, id: &str, event: &Value) -> Result<(), Disp
     let time = event
         .get("time_ms")
         .and_then(Value::as_u64)
-        .unwrap_or_else(petal::sdk::now_ms);
+        .unwrap_or_else(crate::host::now_ms);
     let digest = hex::encode(sha3::Keccak256::digest(&line));
     let key = session_key(n, w, id, &format!("audit/{time:020}-{digest}.jsonl"));
-    match petal::sdk::store_put_new(&key, &line, false) {
+    match crate::host::store_put_new(&key, &line, false) {
         Ok(()) => Ok(()),
         Err(e) => match load_bytes(&key) {
             Ok(Some(existing)) if existing == line => Ok(()),
@@ -2109,7 +2765,7 @@ pub fn read_audit(n: Network, w: &str, id: &str) -> Result<Vec<u8>, String> {
         out.clear();
     }
     let prefix = session_key(n, w, id, "audit/");
-    let mut keys = petal::sdk::store_list(&prefix, MAX_BODY).map_err(|e| e.message())?;
+    let mut keys = crate::host::store_list(&prefix, MAX_BODY).map_err(|e| e.message())?;
     keys.sort();
     for key in keys.iter().skip(keys.len().saturating_sub(1024)) {
         let Some(line) = load_bytes_result(key).map_err(|e| e.message())? else {
@@ -2286,7 +2942,7 @@ fn session_close_all(
         Ok(pending) => pending,
         Err(e) => return e,
     };
-    if let Some(action) = live_cleanup_replay(pending, petal::sdk::now_ms()) {
+    if let Some(action) = live_cleanup_replay(pending, crate::host::now_ms()) {
         return session_agent_submit(ctx, n, w, id, s, action, signing, Some(replay_key.as_str()));
     }
     let state = match http_json(
@@ -2377,7 +3033,7 @@ fn session_allows_asset(session: &Session, asset: u32) -> bool {
 }
 fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
     a.validate()?;
-    let is_perpetual = |asset: u32| asset < 10_000;
+    let is_perpetual = protocol::is_core_perp_asset;
     let all_perpetual = match a {
         ExchangeAction::Order { orders, .. } => orders.iter().all(|o| is_perpetual(o.asset)),
         ExchangeAction::Cancel { cancels, .. } => cancels.iter().all(|o| is_perpetual(o.asset)),
@@ -2388,7 +3044,10 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         ExchangeAction::ScheduleCancel { .. } => true,
     };
     if !all_perpetual {
-        return Err("delegated sessions do not support spot asset ids".into());
+        return Err(
+            "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                .into(),
+        );
     }
     if let ExchangeAction::UpdateLeverage { leverage, .. } = a
         && s.max_leverage.is_some_and(|m| *leverage > m)
@@ -2430,6 +3089,23 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         };
         if !all_allowed {
             return Err("asset is outside the session allow-list".into());
+        }
+    }
+    // A per-order builder fee routes venue fee revenue to a third-party address
+    // the agent chooses, so it is bounded like notional, leverage, and assets
+    // are: an agent may only ever use the single builder and fee ceiling the
+    // owner approved when the session was created.
+    if let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = a
+    {
+        match (&s.builder_address, s.max_builder_fee_tenths_bps) {
+            (Some(allowed), Some(cap))
+                if *allowed == builder.address && builder.fee_tenths_bps <= cap => {}
+            _ => {
+                return Err("builder fee is outside the session's approved builder bound".into());
+            }
         }
     }
     Ok(())
@@ -2498,6 +3174,84 @@ fn active_asset_leverage(state: &Value) -> Option<u32> {
         .parse::<u32>()
         .ok()
 }
+
+/// The cap Hyperliquid reports in force for this wallet and builder.
+///
+/// More current than our own approval record, which is only what this Petal
+/// last submitted and goes stale the moment another client approves for the
+/// same wallet. Not authoritative in the strong sense: the request is proxied
+/// by the Machine, which Sealed Approvals already treats as able to lie.
+/// Reads the cap Hyperliquid currently has on record.
+///
+/// The error is deliberately left bare. Two routes check this cap and they
+/// owe the caller different things: an approval that fails here submitted
+/// nothing and left the existing cap alone, while an order preflight was
+/// never changing a cap at all. Each call site adds its own wording, so a
+/// failed order can no longer tell an agent that a cap it never touched is
+/// unchanged — which invites a pointless re-approval instead of a retry.
+fn live_builder_fee_cap(n: Network, account: &str, builder: &str) -> Result<u64, DispatchResponse> {
+    http_json(
+        n,
+        "/info",
+        json!({"type": "maxBuilderFee", "user": account, "builder": builder}),
+    )?
+    .as_u64()
+    .ok_or_else(|| backend("Hyperliquid returned a non-numeric maxBuilderFee response"))
+}
+
+fn cap_check_cause(e: &DispatchResponse) -> String {
+    match e {
+        DispatchResponse::Error { message, .. } => message.clone(),
+        _ => "unknown error".to_owned(),
+    }
+}
+
+/// Says that the approval was not attempted, which the underlying transport or
+/// status error cannot say for itself.
+fn unverified_builder_fee_cap(e: DispatchResponse) -> DispatchResponse {
+    let cause = cap_check_cause(&e);
+    backend(format!(
+        "could not check the builder's currently approved cap with Hyperliquid, so nothing was submitted; the existing cap is unchanged and this is safe to retry: {cause}"
+    ))
+}
+
+/// Says that the order was not sent. It must not mention the approved cap
+/// being unchanged: an order preflight never changes one, and saying so sends
+/// an agent to re-approve when the order is what needs retrying.
+fn unverified_builder_order_cap(e: DispatchResponse) -> DispatchResponse {
+    let cause = cap_check_cause(&e);
+    backend(format!(
+        "could not check the builder's approved cap with Hyperliquid, so nothing was sent; this is safe to retry: {cause}"
+    ))
+}
+
+/// Hyperliquid silently rejects a builder-fee order unless the account has
+/// already signed a separate `approveBuilderFee` action authorizing at least
+/// the requested rate for that builder. Checking this ourselves turns that
+/// into a clear, actionable error instead of a venue-side rejection the
+/// caller has no way to interpret.
+fn ensure_builder_fee_is_approved(
+    n: Network,
+    account: &str,
+    action: &ExchangeAction,
+) -> Result<(), DispatchResponse> {
+    let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    let approved =
+        live_builder_fee_cap(n, account, &builder.address).map_err(unverified_builder_order_cap)?;
+    if approved < u64::from(builder.fee_tenths_bps) {
+        return Err(invalid(format!(
+            "builder {} is not yet approved for a fee of {} tenths of a basis point (currently approved up to {approved}); call approve_builder_fee.json for this builder before placing this order",
+            builder.address, builder.fee_tenths_bps
+        )));
+    }
+    Ok(())
+}
 /// The single wallet identity a session is created under.
 ///
 /// Derivation, pending/session storage and owner signing all use this one
@@ -2526,7 +3280,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         Ok(agent_name) => agent_name,
         Err(error) => return invalid(error),
     };
-    let now = petal::sdk::now_ms();
+    let now = crate::host::now_ms();
     let request_digest = hex::encode(sha3::Keccak256::digest(body));
     let pending_key = session_key(n, &w, &req.id, "pending.json");
     let pending = match load_secret_json::<Pending>(pending_key.clone()) {
@@ -2588,36 +3342,37 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived = match request_session_key(n, &w, &req.id, lifetime_ms) {
-        Ok(petal::PetalKeyOutcome::Pending {
-            operation_id,
-            scope_digest,
-        }) => {
-            return approval(
-                "derive_agent_key",
-                &json!({
-                    "operation_id": operation_id,
-                    "scope_digest": scope_digest,
-                    "session": req.id
-                }),
-            );
-        }
-        Ok(petal::PetalKeyOutcome::Ready {
-            operation_id: _,
-            scope_digest: _,
-            key_ref_jcs,
-            addresses,
-        }) => {
-            let Some(address) = addresses
-                .into_iter()
-                .find(|address| protocol::parse_address(address).is_ok())
-            else {
-                return backend("derived KeyRef has no EVM address");
-            };
-            (key_ref_jcs, address)
-        }
-        Err(response) => return response,
-    };
+    let derived =
+        match request_session_key(n, &w, &req.id, lifetime_ms, req.builder_address.is_some()) {
+            Ok(petal::PetalKeyOutcome::Pending {
+                operation_id,
+                scope_digest,
+            }) => {
+                return approval(
+                    "derive_agent_key",
+                    &json!({
+                        "operation_id": operation_id,
+                        "scope_digest": scope_digest,
+                        "session": req.id
+                    }),
+                );
+            }
+            Ok(petal::PetalKeyOutcome::Ready {
+                operation_id: _,
+                scope_digest: _,
+                key_ref_jcs,
+                addresses,
+            }) => {
+                let Some(address) = addresses
+                    .into_iter()
+                    .find(|address| protocol::parse_address(address).is_ok())
+                else {
+                    return backend("derived KeyRef has no EVM address");
+                };
+                (key_ref_jcs, address)
+            }
+            Err(response) => return response,
+        };
     let generated_session = Session {
         schema: "bloom.hyperliquid_agent_session.v1".into(),
         network: if matches!(n, Network::Mainnet) {
@@ -2642,6 +3397,8 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         max_notional_usd: req.max_notional_usd,
         max_leverage: req.max_leverage,
         assets: session_assets,
+        builder_address: req.builder_address,
+        max_builder_fee_tenths_bps: req.max_builder_fee_tenths_bps,
         stopped: false,
         last_response: None,
         last_error: None,
@@ -2691,6 +3448,11 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
     {
         return e;
     };
+    let builder_bound_advisory =
+        match (&session.builder_address, session.max_builder_fee_tenths_bps) {
+            (Some(builder), Some(cap)) => Some(session_builder_bound_advisory(builder, cap)),
+            _ => None,
+        };
     let sig = match sign_payload(
         ctx,
         &w,
@@ -2698,7 +3460,7 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         "hyperliquid.approve_agent",
         approval_hint,
         None,
-        None,
+        builder_bound_advisory,
         ClaimEffects::none(),
     ) {
         Ok(SignOutcome::Signature(raw)) => {
@@ -2806,7 +3568,7 @@ pub fn session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRes
         "",
     ]);
     let keys =
-        petal::sdk::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
+        crate::host::store_list(&prefix, MAX_BODY).map_err(|error| backend(error.message()))?;
     Ok(completed_session_ids(&prefix, keys)
         .into_iter()
         .map(petal::dir)
@@ -2829,6 +3591,230 @@ pub fn wallet_session_children(ctx: &Ctx) -> Result<Vec<petal::RouteChild>, Disp
 
 #[cfg(test)]
 mod tests {
+    /// `session_submit` answers a settled operation before it checks the
+    /// builder approval or the live leverage, so a retry of an order that is
+    /// already on the book is not refused because `/info` is unreachable or
+    /// because the approved cap was lowered after the order filled. That
+    /// depends on reading the stored nonce without reserving one, which is
+    /// why the lookup is separate from the reservation.
+    #[test]
+    fn a_settled_session_operation_is_reported_without_reserving_a_nonce() {
+        use super::{Network, PendingNonce, save_json, session_key, session_pending_nonce};
+        let (n, w, id, digest) = (Network::Testnet, "main", "s1", "abc123");
+        crate::host::test_reset();
+        let key = session_key(n, w, id, &format!("operations/{digest}/nonce.json"));
+        save_json(
+            key.clone(),
+            &PendingNonce {
+                nonce: 42,
+                expires_ms: u64::MAX,
+                action_id: None,
+                completed: true,
+                submitted: Some(true),
+            },
+            false,
+        )
+        .unwrap();
+        let before = crate::host::store_list("state/", usize::MAX).unwrap();
+
+        assert_eq!(
+            session_pending_nonce(n, w, id, digest).unwrap(),
+            Some((42, key, true)),
+            "a settled operation is reported from its stored record"
+        );
+        assert_eq!(
+            crate::host::store_list("state/", usize::MAX).unwrap(),
+            before,
+            "reading a settled operation must reserve nothing and write nothing"
+        );
+    }
+
+    /// The approval record must land before the nonce is marked completed.
+    ///
+    /// Fails if `commit_builder_fee_approval` ever writes them the other way
+    /// round: the completion mark is the write made to fail here, so a
+    /// swapped order would fail before the record was written and leave the
+    /// generation where it started.
+    #[test]
+    fn an_approval_record_that_lands_first_keeps_a_retry_honest() {
+        use super::{
+            BuilderFeeApproval, Network, approve_builder_fee_identity, builder_fee_approval_key,
+            commit_builder_fee_approval, load_json, owner_nonce,
+        };
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        let approval_key = builder_fee_approval_key(n, w, builder);
+        let generation = |key: &str| {
+            load_json::<BuilderFeeApproval>(key.to_owned())
+                .unwrap()
+                .map_or(0, |state| state.generation)
+        };
+        crate::host::test_reset();
+
+        let identity = approve_builder_fee_identity(body, builder, 0);
+        let (nonce, key, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        assert!(!completed, "a first approval has nothing to resume");
+        let key = key.expect("a reserved nonce is keyed");
+
+        // The venue accepted; the write marking the nonce completed fails.
+        crate::host::test_fail_writes_matching(Some(&key));
+        let committed =
+            commit_builder_fee_approval(approval_key.clone(), 10, 0, Some(key.clone()), nonce);
+        crate::host::test_fail_writes_matching(None);
+        assert!(committed.is_err(), "the completion mark was made to fail");
+        assert_eq!(
+            generation(&approval_key),
+            1,
+            "the approval record must be written before the completion mark, \
+             or a crash between them leaves a completed nonce for a cap the \
+             record never recorded"
+        );
+
+        // So the retry computes a fresh identity and goes back to the venue.
+        let retry = approve_builder_fee_identity(body, builder, 1);
+        assert_ne!(identity, retry, "a new generation is a new identity");
+        let (_, _, retry_completed) = owner_nonce(n, w, leaf, &retry, None).unwrap();
+        assert!(
+            !retry_completed,
+            "a retry answered as completed would report an approval the venue never took"
+        );
+    }
+
+    /// Why that order matters, stated as the failure it avoids: a nonce marked
+    /// completed while the approval record is missing leaves the generation
+    /// where it was, so the retry recomputes the same identity and is answered
+    /// with a success for a cap that never landed.
+    #[test]
+    fn a_completed_nonce_without_its_record_would_answer_a_retry_with_a_cap_that_never_landed() {
+        use super::{Network, approve_builder_fee_identity, owner_nonce, save_pending};
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        crate::host::test_reset();
+
+        let identity = approve_builder_fee_identity(body, builder, 0);
+        let (nonce, key, _) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        save_pending(&key.expect("a reserved nonce is keyed"), nonce, true).unwrap();
+
+        let (_, _, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+        assert!(
+            completed,
+            "the generation never moved, so this identity still reads its own completed record"
+        );
+    }
+
+    /// Approve 10, revoke, approve 10 again. The third write is byte-identical
+    /// to the first in body and builder, and must still reach the venue: only
+    /// the generation keeps it from being answered by the first one's record.
+    #[test]
+    fn approving_a_cap_again_after_a_revocation_still_reaches_the_venue() {
+        use super::{
+            BuilderFeeApproval, Network, approve_builder_fee_identity, builder_fee_approval_key,
+            commit_builder_fee_approval, load_json, owner_nonce,
+        };
+        let (n, w, leaf) = (Network::Testnet, "main", "approve_builder_fee.json");
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approval_key = builder_fee_approval_key(n, w, builder);
+        crate::host::test_reset();
+
+        let mut identities = Vec::new();
+        for (cap, body) in [
+            (10u32, &br#"{"max_fee_tenths_bps":10}"#[..]),
+            (0, &br#"{"max_fee_tenths_bps":0}"#[..]),
+            (10, &br#"{"max_fee_tenths_bps":10}"#[..]),
+        ] {
+            let generation = load_json::<BuilderFeeApproval>(approval_key.clone())
+                .unwrap()
+                .map_or(0, |state| state.generation);
+            let identity = approve_builder_fee_identity(body, builder, generation);
+            let (nonce, key, completed) = owner_nonce(n, w, leaf, &identity, None).unwrap();
+            assert!(
+                !completed,
+                "a cap of {cap} must reach the venue, not be answered from a record"
+            );
+            commit_builder_fee_approval(
+                approval_key.clone(),
+                cap,
+                generation,
+                Some(key.expect("a reserved nonce is keyed")),
+                nonce,
+            )
+            .unwrap();
+            identities.push(identity);
+        }
+        assert_ne!(
+            identities[0], identities[2],
+            "the repeat of a cap already held must not reuse the first write's identity"
+        );
+    }
+
+    /// A caller who reads "revoked" stops expecting the builder to charge, and
+    /// every input the corroboration rests on is a store key or a
+    /// Machine-proxied read. So a revocation is never answered from stored
+    /// state, however well corroborated.
+    #[test]
+    fn a_revocation_is_never_answered_from_a_stored_record() {
+        use super::{BuilderFeeApproval, may_corroborate_from_record};
+        let record = |approved_tenths_bps| BuilderFeeApproval {
+            approved_tenths_bps,
+            generation: 1,
+        };
+        assert!(
+            !may_corroborate_from_record(0, Some(&record(0))),
+            "a revocation must reach the venue even when the record agrees"
+        );
+        // A cap being kept the same still corroborates: a false success there
+        // fails closed, because an unapproved builder's orders are refused by
+        // the order preflight.
+        assert!(may_corroborate_from_record(10, Some(&record(10))));
+        // A changed cap is a change, and a first-ever call has nothing to
+        // corroborate against.
+        assert!(!may_corroborate_from_record(10, Some(&record(20))));
+        assert!(!may_corroborate_from_record(10, None));
+    }
+
+    /// A caller retrying an approval during an `/info` outage must be able to
+    /// tell a failed submission from a failed check, so the error says the
+    /// approval was never sent and names the cause.
+    #[test]
+    fn a_failed_cap_check_says_nothing_was_submitted() {
+        use super::unverified_builder_fee_cap;
+        let petal::DispatchResponse::Error { code, message } =
+            unverified_builder_fee_cap(petal::error(-4, "Hyperliquid API status 503: upstream"))
+        else {
+            panic!("must stay an error");
+        };
+        assert_eq!(code, -4);
+        assert!(message.contains("nothing was submitted"), "{message}");
+        assert!(message.contains("safe to retry"), "{message}");
+        // The cause survives, or the operator cannot tell what went wrong.
+        assert!(message.contains("status 503"), "{message}");
+    }
+
+    #[test]
+    fn a_changed_default_builder_is_not_mistaken_for_a_repeat_approval() {
+        // The same body resolves to builder A, then to builder B when the
+        // release default differs: each must get its own approval record.
+        let body = br#"{"max_fee_tenths_bps":10}"#;
+        let a = "0x00000000000000000000000000000000000000aa";
+        let b = "0x00000000000000000000000000000000000000bb";
+        let key = |builder, generation| {
+            owner_nonce_key(
+                Network::Testnet,
+                "main",
+                "approve_builder_fee.json",
+                &approve_builder_fee_identity(body, builder, generation),
+            )
+        };
+        assert_ne!(key(a, 0), key(b, 0));
+        // An exact repeat for the same builder still matches its record.
+        assert_eq!(key(a, 0), key(a, 0));
+        // A later generation for the same builder and body does not, which is
+        // what lets a revoked cap be approved again.
+        assert_ne!(key(a, 0), key(a, 1));
+    }
+
     use super::*;
 
     const OWNER_ORDER_HELP: &str =
@@ -2956,6 +3942,60 @@ mod tests {
         );
     }
 
+    /// The class is the whole control. The host overwrites the request's route
+    /// list with the manifest's, so every session key carries the
+    /// builder-order route; only a session that bound a builder may sign
+    /// under the fee-bearing class, and signing checks the class.
+    #[test]
+    fn only_a_builder_bound_session_is_scoped_to_the_fee_bearing_class() {
+        assert_eq!(session_key_classes(false), ["hyperliquid.agent_action"]);
+        assert_eq!(
+            session_key_classes(true),
+            ["hyperliquid.agent_action", protocol::BUILDER_ORDER_INTENT]
+        );
+        // Must stay a subset of the manifest's declared classes, or the host
+        // refuses the derivation outright.
+        let manifest = include_str!("../../petal.toml");
+        let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
+        let (declared, _) = derive
+            .split_once("operation_classes = [")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap();
+        for class in session_key_classes(true) {
+            assert!(declared.contains(&format!("\"{class}\"")), "{class}");
+        }
+    }
+
+    #[test]
+    fn session_actions_sign_under_the_builder_order_class_only_with_a_builder() {
+        let plain: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&plain), "hyperliquid.agent_action");
+        let with_builder: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{"a": 0, "b": true, "p": "1", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        assert_eq!(
+            session_operation_class(&with_builder),
+            protocol::BUILDER_ORDER_INTENT
+        );
+        let cancel: ExchangeAction = serde_json::from_value(json!({
+            "type": "cancel",
+            "cancels": [{"a": 0, "o": 1}]
+        }))
+        .unwrap();
+        assert_eq!(session_operation_class(&cancel), "hyperliquid.agent_action");
+    }
+
     fn bounded_session() -> Session {
         Session {
             schema: "bloom.hyperliquid_agent_session.v1".into(),
@@ -2971,6 +4011,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: Some(3),
             assets: vec!["0".into()],
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             stopped: false,
             last_response: None,
             last_error: None,
@@ -3000,6 +4042,8 @@ mod tests {
             max_notional_usd: None,
             max_leverage: None,
             assets: Vec::new(),
+            builder_address: None,
+            max_builder_fee_tenths_bps: None,
             nonce: None,
         };
         assert_eq!(
@@ -3202,6 +4246,296 @@ mod tests {
             })]
         );
         assert_eq!(effects.declared_fee, json!({"kind": "none"}));
+    }
+
+    fn order_action_with_builder(address: &str, fee_tenths_bps: u32) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na",
+            "builder": {"b": address, "f": fee_tenths_bps}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn order_claim_effects_name_the_builder_and_fee_only_when_present() {
+        let cancel = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire { asset: 0, oid: 42 }],
+            fast: None,
+        };
+        assert_eq!(order_claim_effects(&cancel).unwrap(), ClaimEffects::none());
+
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(
+            order_claim_effects(&plain_order).unwrap(),
+            ClaimEffects::none()
+        );
+
+        // notional = 100 * 0.01 = 1.0 USDC; fee = 1_000_000 micros * 10 / 100_000 = 100 micros
+        let builder_order =
+            order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+        let effects = order_claim_effects(&builder_order).unwrap();
+        assert!(effects.declared_debits.is_empty());
+        assert!(effects.declared_destinations.is_empty());
+        assert_eq!(
+            effects.declared_fee,
+            json!({
+                "kind": "fee",
+                "chain": "hyperliquid",
+                "asset": "usdc",
+                "amount": "100",
+            })
+        );
+    }
+
+    #[test]
+    fn order_claim_effects_fee_includes_reduce_only_legs() {
+        let action: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [
+                {"a": 0, "b": true, "p": "100", "s": "0.01", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+                {"a": 0, "b": true, "p": "200", "s": "0.5", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+            ],
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap();
+        // Hyperliquid charges the builder fee on every fill of an order that
+        // names a builder, reduce-only legs included, so both legs count:
+        // (1 + 100) notional at 1 bp is 10100 micro-USDC. The session
+        // max_notional_usd check still excludes reduce-only legs; that is a
+        // different bound with a different purpose.
+        assert_eq!(
+            order_claim_effects(&action).unwrap().declared_fee,
+            json!({"kind": "fee", "chain": "hyperliquid", "asset": "usdc", "amount": "10100"})
+        );
+    }
+
+    #[test]
+    fn builder_fee_bound_preserves_sub_micro_fractions_and_refuses_overflow() {
+        // f64 erases the fraction and declares 10_000_000 micros instead
+        // of rounding the exact positive fraction upward.
+        assert_eq!(
+            exact_builder_fee_micros("100000.000000000001", "1", 10),
+            Ok(10_000_001)
+        );
+        assert_eq!(exact_builder_fee_micros("0.1", "0.1", 1), Ok(1));
+        assert_eq!(exact_builder_fee_micros("100", "0.01", 10), Ok(100));
+        assert!(exact_builder_fee_micros("18446744073709551616", "1", 100).is_err());
+
+        let action = builder_order(json!([
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": true, "p": "100000000000000000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert!(
+            declared_amount(&action).is_err(),
+            "the summed fee must not saturate"
+        );
+    }
+
+    #[test]
+    fn builder_fees_are_accepted_only_on_core_perps() {
+        // Broker bounds the same order from its signed bytes and refuses any
+        // leg it cannot price in USDC from them. A leg accepted here but
+        // refused there would be signed and then denied at the claim, so the
+        // two must agree: core perps only.
+
+        // HIP-3 perps (100000 + dex * 10000 + index) are perps, not spot: a
+        // buy pays the builder fee, in the dex's collateral asset.
+        let hip3_buy = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        let err = declared_amount(&hip3_buy).unwrap_err();
+        assert!(err.contains("HIP-3"), "{err}");
+        assert!(builder_order_advisory_for(&hip3_buy).is_none());
+
+        // Beside a core sell the HIP-3 buy would be charged without being
+        // declared, so the whole order is refused rather than part of it.
+        let hip3_with_core_sell = builder_order(json!([
+            {"a": 110000, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert!(
+            declared_amount(&hip3_with_core_sell)
+                .unwrap_err()
+                .contains("HIP-3")
+        );
+
+        // Outcomes (100000000 + 10 * outcome + side) get their own reason.
+        let outcome = builder_order(json!([
+            {"a": 100_000_010, "b": false, "p": "0.5", "s": "100", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        let err = declared_amount(&outcome).unwrap_err();
+        assert!(err.contains("outcome market"), "{err}");
+        assert!(!err.contains("HIP-3"), "{err}");
+
+        // Spot is refused whichever token quotes the pair, and whichever side
+        // the leg takes. Pair 0 is quoted in USDC and pair 207 in USDT0; the
+        // quote token is no longer consulted, so both answer the same way,
+        // and a buy is refused for the same reason as a sell rather than
+        // passing as a leg that pays nothing.
+        let usdc_quoted = protocol::SPOT_ASSET_ID_OFFSET;
+        let usdt0_quoted = protocol::SPOT_ASSET_ID_OFFSET + 207;
+        for (asset, is_buy, tif) in [
+            (usdc_quoted, false, "Alo"),
+            (usdc_quoted, true, "Gtc"),
+            (usdt0_quoted, false, "Alo"),
+            (usdt0_quoted, true, "Gtc"),
+        ] {
+            let action = builder_order(json!([
+                {"a": asset, "b": is_buy, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": tif}}}
+            ]));
+            let err = declared_amount(&action).unwrap_err();
+            assert!(
+                err.contains("is a spot pair"),
+                "asset {asset} buy={is_buy}: {err}"
+            );
+            assert!(builder_order_advisory_for(&action).is_none());
+        }
+
+        // A spot leg beside an otherwise acceptable core perp still refuses
+        // the whole order.
+        let spot_with_core_sell = builder_order(json!([
+            {"a": usdc_quoted, "b": true, "p": "1", "s": "50", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert!(
+            declared_amount(&spot_with_core_sell)
+                .unwrap_err()
+                .contains("is a spot pair")
+        );
+
+        // Core perps are declared as before: a post-only sell and a buy,
+        // 100 * 1 and 100 * 1 at 1 bp.
+        let core_only = builder_order(json!([
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}},
+            {"a": 1, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}}
+        ]));
+        assert_eq!(declared_amount(&core_only).unwrap(), "20000");
+        let advisory = String::from_utf8(builder_order_advisory_for(&core_only).unwrap()).unwrap();
+        assert!(advisory.contains("0.02 USDC"), "{advisory}");
+        assert!(advisory.contains("across all legs"), "{advisory}");
+        assert!(!advisory.contains("spot"), "{advisory}");
+    }
+
+    fn builder_order(legs: Value) -> ExchangeAction {
+        serde_json::from_value(json!({
+            "type": "order",
+            "orders": legs,
+            "grouping": "na",
+            "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+        }))
+        .unwrap()
+    }
+
+    fn declared_amount(action: &ExchangeAction) -> Result<Value, String> {
+        order_claim_effects(action).map(|effects| effects.declared_fee["amount"].clone())
+    }
+
+    #[test]
+    fn a_builder_bearing_sell_must_be_post_only() {
+        // A GTC or IOC sell at limit 100 crosses into bids at 200 and fills
+        // at 200: the venue charges 200 * 1 bp = 20000 micro-USDC, above any
+        // bound the request or a pre-signing mid could give. It is refused.
+        for tif in ["Gtc", "Ioc"] {
+            let action = builder_order(json!([
+                {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": tif}}}
+            ]));
+            let err = declared_amount(&action).unwrap_err();
+            assert!(err.contains("post-only"), "{err}");
+            assert!(builder_order_advisory_for(&action).is_none());
+        }
+        // Post-only, the same sell can only rest and fill at exactly 100,
+        // however far bids later rise: 100 * 1 bp = 10000 micro-USDC.
+        let post_only = builder_order(json!([
+            {"a": 0, "b": false, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Alo"}}}
+        ]));
+        assert_eq!(declared_amount(&post_only).unwrap(), "10000");
+        // Buys keep any time in force: they fill at or below their limit.
+        let ioc_buy = builder_order(json!([
+            {"a": 0, "b": true, "p": "100", "s": "1", "r": false, "t": {"limit": {"tif": "Ioc"}}}
+        ]));
+        assert_eq!(declared_amount(&ioc_buy).unwrap(), "10000");
+    }
+
+    #[test]
+    fn a_builder_bearing_trigger_order_is_refused() {
+        // A take-profit with limit 190000 and trigger 200000 fills at the
+        // market once triggered; its limit does not bound the fee the venue
+        // would charge on such a fill, so the request is refused.
+        for (is_buy, is_market) in [(false, false), (false, true), (true, false)] {
+            let action: ExchangeAction = serde_json::from_value(json!({
+                "type": "order",
+                "orders": [{
+                    "a": 0, "b": is_buy, "p": "190000", "s": "1", "r": false,
+                    "t": {"trigger": {"isMarket": is_market, "triggerPx": "200000", "tpsl": "tp"}}
+                }],
+                "grouping": "na",
+                "builder": {"b": "0x0000000000000000000000000000000000000001", "f": 10}
+            }))
+            .unwrap();
+            let err = order_claim_effects(&action).unwrap_err();
+            assert!(err.contains("trigger order cannot be bounded"), "{err}");
+            assert!(builder_order_advisory_for(&action).is_none());
+        }
+        // The same order without a builder declares no fee and is not the
+        // fee bound's concern.
+        let plain: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": false, "p": "190000", "s": "1", "r": false,
+                "t": {"trigger": {"isMarket": false, "triggerPx": "200000", "tpsl": "tp"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(order_claim_effects(&plain).unwrap(), ClaimEffects::none());
+    }
+
+    #[test]
+    fn builder_advisories_name_the_recipient_and_the_rate() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approval = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            10,
+            "explicit in this request",
+        ))
+        .unwrap();
+        assert!(approval.contains(builder));
+        assert!(approval.contains("0.01%"));
+        assert!(approval.contains("10 tenths of a basis point"));
+        assert!(approval.contains("explicit in this request"));
+        let revoke = String::from_utf8(builder_fee_approval_advisory(
+            Network::Testnet,
+            builder,
+            0,
+            "x",
+        ))
+        .unwrap();
+        assert!(revoke.contains("revokes"));
+
+        let order = String::from_utf8(builder_order_advisory(builder, 10, 10100)).unwrap();
+        assert!(order.contains(builder));
+        assert!(order.contains("0.01%"));
+        assert!(order.contains("0.0101 USDC"));
+
+        let bound = String::from_utf8(session_builder_bound_advisory(builder, 25)).unwrap();
+        assert!(bound.contains(builder));
+        assert!(bound.contains("0.025%"));
+        assert!(bound.contains("25 tenths of a basis point"));
     }
 
     #[test]
@@ -3498,7 +4832,22 @@ mod tests {
         };
         assert_eq!(
             session_policy(&unrestricted, &spot),
-            Err("delegated sessions do not support spot asset ids".into())
+            Err(
+                "delegated sessions support only core perpetual asset ids, not spot, HIP-3 or outcome assets"
+                    .into()
+            )
+        );
+        let hip3 = ExchangeAction::Cancel {
+            cancels: vec![protocol::CancelWire {
+                asset: 110_000,
+                oid: 42,
+            }],
+            fast: None,
+        };
+        assert!(
+            session_policy(&unrestricted, &hip3)
+                .unwrap_err()
+                .contains("core perpetual")
         );
     }
 
@@ -3574,6 +4923,123 @@ mod tests {
         assert_eq!(
             session_policy(&bounded_session(), &excessive_leverage),
             Err("requested leverage exceeds session bound".into())
+        );
+    }
+
+    #[test]
+    fn session_policy_enforces_the_session_builder_bound() {
+        let mut session = bounded_session();
+        let order = order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
+
+        // no builder bound configured on the session: rejected outright
+        assert_eq!(
+            session_policy(&session, &order),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        session.builder_address = Some("0x0000000000000000000000000000000000000001".into());
+        session.max_builder_fee_tenths_bps = Some(10);
+        // matching address, fee at the session cap: accepted
+        assert_eq!(session_policy(&session, &order), Ok(()));
+
+        // fee above the session's cap (but within the venue cap): rejected
+        let over_cap = order_action_with_builder("0x0000000000000000000000000000000000000001", 11);
+        assert_eq!(
+            session_policy(&session, &over_cap),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // a different builder address: rejected even though the fee is in range
+        let other_builder =
+            order_action_with_builder("0x0000000000000000000000000000000000000002", 5);
+        assert_eq!(
+            session_policy(&session, &other_builder),
+            Err("builder fee is outside the session's approved builder bound".into())
+        );
+
+        // an order without a builder is unaffected by the bound
+        let plain_order: ExchangeAction = serde_json::from_value(json!({
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": true, "p": "100", "s": "0.01", "r": false,
+                "t": {"limit": {"tif": "Gtc"}}
+            }],
+            "grouping": "na"
+        }))
+        .unwrap();
+        assert_eq!(session_policy(&session, &plain_order), Ok(()));
+    }
+
+    #[test]
+    fn session_preflight_enforces_builder_bound_pairing_case_and_cap() {
+        fn request(
+            builder_address: Option<&str>,
+            max_builder_fee_tenths_bps: Option<u32>,
+        ) -> NewSession {
+            NewSession {
+                id: "session".into(),
+                duration_ms: None,
+                agent_name: None,
+                max_notional_usd: None,
+                max_leverage: None,
+                assets: Vec::new(),
+                builder_address: builder_address.map(str::to_owned),
+                max_builder_fee_tenths_bps,
+                nonce: None,
+            }
+        }
+
+        // neither field set: fine, no builder bound
+        assert!(session_preflight(&request(None, None)).is_ok());
+
+        // set together, within the perp venue cap: fine
+        assert!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(100)
+            ))
+            .is_ok()
+        );
+
+        // only one of the pair set: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                None
+            )),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+        assert_eq!(
+            session_preflight(&request(None, Some(10))),
+            Err("builder_address and max_builder_fee_tenths_bps must be set together".into())
+        );
+
+        // uppercase address: rejected (the "0x" prefix must stay intact)
+        let checksummed = format!(
+            "0x{}",
+            "000000000000000000000000000000000000000a".to_ascii_uppercase()
+        );
+        assert_eq!(
+            session_preflight(&request(Some(checksummed.as_str()), Some(10))),
+            Err("builder_address must be lowercase".into())
+        );
+
+        // above the perp venue cap (sessions never submit spot orders): rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(101)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
+        );
+
+        // zero: rejected
+        assert_eq!(
+            session_preflight(&request(
+                Some("0x0000000000000000000000000000000000000001"),
+                Some(0)
+            )),
+            Err("max_builder_fee_tenths_bps must be 1..=100".into())
         );
     }
 
@@ -3835,6 +5301,58 @@ mod tests {
         let cancel_targets = receipt_targets(&cancel).unwrap();
         assert_eq!(cancel_targets[0].item_index, 0);
         assert_eq!(cancel_targets[0].cloid, targets[0].cloid);
+    }
+
+    /// Approving 10, revoking with 0, then approving 10 again presents the
+    /// first write's body a second time. Keyed on body and builder alone the
+    /// third write reused the first's completed pending record and answered
+    /// success without contacting the venue, leaving the cap revoked. The
+    /// generation separates the two while keeping a retry of the cap in
+    /// flight on the record it started.
+    #[test]
+    fn repeat_builder_fee_approval_is_keyed_apart_from_the_cap_it_replaces() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approve = br#"{"max_fee_tenths_bps":10}"#;
+        let revoke = br#"{"max_fee_tenths_bps":0}"#;
+
+        // Generation 0 approves, generation 1 revokes, generation 2 approves
+        // the same cap again: the third identity must not equal the first.
+        let first = approve_builder_fee_identity(approve, builder, 0);
+        let revoked = approve_builder_fee_identity(revoke, builder, 1);
+        let reapproved = approve_builder_fee_identity(approve, builder, 2);
+        assert_ne!(
+            first, reapproved,
+            "re-approving a revoked cap must key fresh"
+        );
+        assert_ne!(first, revoked);
+        assert_ne!(revoked, reapproved);
+
+        // A retry of the write in flight keeps its own record.
+        assert_eq!(first, approve_builder_fee_identity(approve, builder, 0));
+
+        // A different builder never answers for another's history.
+        let other = "0x0000000000000000000000000000000000000002";
+        assert_ne!(first, approve_builder_fee_identity(approve, other, 0));
+    }
+
+    #[test]
+    fn builder_fee_approval_key_is_scoped_by_network_wallet_and_builder() {
+        let builder = "0x0000000000000000000000000000000000000001";
+        let other = "0x0000000000000000000000000000000000000002";
+        let mainnet = builder_fee_approval_key(Network::Mainnet, "alice", builder);
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Testnet, "alice", builder)
+        );
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Mainnet, "bob", builder)
+        );
+        assert_ne!(
+            mainnet,
+            builder_fee_approval_key(Network::Mainnet, "alice", other)
+        );
+        assert!(mainnet.contains("builder_fee_approvals"), "{mainnet}");
     }
 
     #[test]
