@@ -239,8 +239,16 @@ fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
         source.matches("fee_asset: catalogued_fee_asset(").count() >= 2,
         "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
     );
+    // The production half only. This asserts that no *enrollment* path writes
+    // an unconditional `None`, which is what the pinned Bloom's own tests
+    // deliberately plant to exercise its heal: fixtures below `#[cfg(test)]`
+    // carry `fee_asset: None` on purpose and are not a contract the Petal
+    // depends on. Grepping the whole file conflated the two.
+    let production = source
+        .split_once("#[cfg(test)]")
+        .map_or(source.as_str(), |(before, _)| before);
     assert!(
-        !source.contains("fee_asset: None"),
+        !production.contains("fee_asset: None"),
         "the pinned Bloom still enrolls a class with an unconditional fee_asset: None"
     );
 }
