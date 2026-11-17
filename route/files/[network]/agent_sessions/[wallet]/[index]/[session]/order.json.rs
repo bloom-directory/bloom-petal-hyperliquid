@@ -14,10 +14,10 @@ petal::route_file!(
                         "s": "positive decimal size string",
                         "r": "boolean reduce-only flag",
                         "t": {"limit": {"tif": "Alo, Gtc, or Ioc"}},
-                        "c": "optional 16-byte 0x client order id"
+                        "c": "required client order id: 0x plus 32 hex digits, new for every order. This route's success evidence is keyed on it, so an order without one cannot be confirmed"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
-                    "builder": "unsupported because delegated claims cannot represent an exact builder fee"
+                    "builder": "not accepted here; write a builder-bearing order to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class and requires the session's builder bound"
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
@@ -42,9 +42,9 @@ petal::route_file!(
                 "path_from_session_root": "receipts/<submitted_cloid>/order.json",
                 "poll_interval_ms": 1000,
                 "timeout_ms": 120000,
-                "predicate": "receipt cloid equals the submitted order c field, request equals that submitted order item, and response.response.data.statuses[0].resting.oid exists",
-                "result": "the correlated resting response confirms venue acceptance and its oid is the venue order id",
-                "notes": "Submit a unique client order id. The create-only receipt records the original batch item and item_index, and its response statuses array contains only that item's positional venue status. It is scoped by session, action, and normalized cloid, so it cannot race last_response.json or be overwritten by a later action. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds. The receipt path normally returns not-found until dispatch completes; treat that as pending, wait poll_interval_ms, and retry the same exact path until the predicate matches or timeout_ms expires."
+                "predicate": "receipt cloid equals the submitted order c field, request equals that submitted order item, and response.response.data.statuses[0] carries either resting.oid or filled.oid",
+                "result": "the correlated response confirms venue acceptance: resting.oid is the venue order id of an order now on the book, filled.oid is the venue order id of one that matched immediately. A buy may do either, so treat both as success",
+                "notes": "Submit a unique client order id. The create-only receipt records the original batch item and item_index, and its response statuses array contains only that item's positional venue status. It is scoped by session, action, and normalized cloid, so it cannot race last_response.json or be overwritten by a later action. An accepted filesystem write is asynchronous and dispatch can take longer than 30 seconds. The receipt path normally returns not-found until dispatch completes; treat that as pending, wait poll_interval_ms, and retry the same exact path until the predicate matches or timeout_ms expires. A status of error, or a rejection naming the order, is terminal: stop polling and report it rather than waiting out timeout_ms."
             }
         }))
     },
@@ -72,7 +72,7 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid session action: {error}")),
         };
-        if !matches!(&request.action, crate::ExchangeAction::Order { .. }) {
+        let crate::ExchangeAction::Order { orders, .. } = &request.action else {
             return petal::error(
                 -3,
                 format!(
@@ -80,6 +80,15 @@ petal::route_file!(
                     request.action.kind()
                 ),
             );
+        };
+        if request.action.carries_builder() {
+            return petal::error(
+                -3,
+                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
+            );
+        }
+        if let Err(error) = crate::validate_order_cloids(orders) {
+            return petal::error(-3, error);
         }
         crate::session_action_write(ctx, network, &wallet, session, request)
     }

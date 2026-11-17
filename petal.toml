@@ -28,10 +28,14 @@ methods = ["post"]
 paths = ["/info", "/exchange"]
 
 [sign]
-allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.withdraw", "hyperliquid.order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
+allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyperliquid.usd_send", "hyperliquid.usd_class_transfer", "hyperliquid.withdraw", "hyperliquid.approve_builder_fee", "hyperliquid.order", "hyperliquid.builder_order", "hyperliquid.cancel", "hyperliquid.cancel_by_cloid", "hyperliquid.schedule_cancel", "hyperliquid.update_leverage"]
 
 [[key.derive]]
 route = "[network]/agent_sessions/[wallet]/[index]/new.json"
+# `hyperliquid.builder_order` is deliberately absent, and so is the session
+# builder-order route below. See `session_key_classes` in route/src/workflow.rs:
+# listing that route here denies every session that does not also request the
+# builder class, which is every plain session.
 operation_classes = ["hyperliquid.agent_action"]
 allowed_routes = [
   "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
