@@ -318,10 +318,6 @@ pub const SPOT_ASSET_ID_OFFSET: u32 = 10_000;
 pub const HIP3_ASSET_ID_OFFSET: u32 = 100_000;
 /// Outcome asset ids are `OUTCOME_ASSET_ID_OFFSET + 10 * outcome + side`.
 pub const OUTCOME_ASSET_ID_OFFSET: u32 = 100_000_000;
-/// The spot token index of USDC, the core perps' collateral and the quote
-/// token of USDC-quoted spot pairs, on both mainnet and testnet.
-pub const USDC_SPOT_TOKEN_INDEX: u64 = 0;
-
 /// A core (non-HIP-3) perpetual.
 pub fn is_core_perp_asset(asset: u32) -> bool {
     asset < SPOT_ASSET_ID_OFFSET

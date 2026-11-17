@@ -100,9 +100,6 @@ impl ClaimEffects {
 ///   caps from above, so a builder-bearing sell must be post-only (`Alo`):
 ///   the venue refuses it rather than let it cross, and as a maker it fills
 ///   at exactly its limit.
-/// - Hyperliquid charges no builder fee on the buying side of spot trades, so
-///   spot buys add nothing; an order of only spot buys is refused, since its
-///   builder would earn nothing.
 /// - A trigger order fills at the market once triggered, so it is refused.
 /// - Hyperliquid collects the builder fee in the market's quote or collateral
 ///   asset, and the claim declares USDC, so only core perps are accepted.

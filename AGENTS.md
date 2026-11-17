@@ -18,13 +18,17 @@ through the session route of the same name), which signs under
 `order.json` refuses a builder. What is refused, and why the bound is what it
 is, is set out in README.md; the rules that decide whether
 a call succeeds are: a builder-bearing sell must be post-only (`Alo`); a
-builder-bearing trigger order is refused; an order of only spot buys is
-refused; and a builder-bearing leg is accepted only where the fee is known to
-be USDC, meaning core perps and spot sells on USDC-quoted pairs, so HIP-3
-perps, outcome markets and spot sells quoted in another token are refused. A
-delegated session may use a builder fee only if it was created with a matching
-`builder_address`/`max_builder_fee_tenths_bps` bound, which is also what adds
-the fee-bearing class to that session key's scope. `withdraw.json` submits Hyperliquid's `withdraw3`
+builder-bearing trigger order is refused; and a builder-bearing leg is
+accepted only on core perps, the one case where the fee asset is known to be
+USDC, so spot pairs are refused whichever token quotes them and whichever side
+the leg takes, and so are HIP-3 perps and outcome markets. A delegated session
+may use a builder fee only if it was created with a matching
+`builder_address`/`max_builder_fee_tenths_bps` bound. Only half of that bound
+is an enforced control: it is what adds the fee-bearing class to the session
+key's Signer-enforced scope, so a session created without it cannot sign a
+fee-declaring order at all, but the address and the rate cap are checked
+against `session.json`, a Machine-owned store record, and enter neither the
+key scope nor the claim. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
 settlement proof. Operation records are listed at `withdrawals/` and readable

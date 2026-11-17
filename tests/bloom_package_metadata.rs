@@ -235,18 +235,32 @@ fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
         )),
         "the pinned Bloom does not catalogue {BUILDER_ORDER_INTENT} as a fee-bearing class"
     );
+    // Both remaining assertions are about the *enrollment* paths, so both read
+    // the production half only. The pinned Bloom's own tests deliberately
+    // plant `fee_asset: None` fixtures to exercise its heal; those are not a
+    // contract the Petal depends on, and grepping the whole file conflated the
+    // two. This split is only as good as the marker being unique: a second
+    // `#[cfg(test)]` earlier in the file would silently cut the window short
+    // and weaken the `None` check below, so pin the count rather than trust
+    // it. Zero would mean the pin dropped its test module entirely -- also
+    // worth a failure, since the reasoning above would no longer hold.
+    assert_eq!(
+        source.matches("#[cfg(test)]").count(),
+        1,
+        "this test splits the pinned Bloom's enrollment source at its single \
+         `#[cfg(test)]` to separate production from fixtures; that marker is no \
+         longer unique, so the split can no longer be trusted"
+    );
+    let (production, _) = source
+        .split_once("#[cfg(test)]")
+        .expect("the count above proves the marker is present");
     assert!(
-        source.matches("fee_asset: catalogued_fee_asset(").count() >= 2,
+        production
+            .matches("fee_asset: catalogued_fee_asset(")
+            .count()
+            >= 2,
         "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
     );
-    // The production half only. This asserts that no *enrollment* path writes
-    // an unconditional `None`, which is what the pinned Bloom's own tests
-    // deliberately plant to exercise its heal: fixtures below `#[cfg(test)]`
-    // carry `fee_asset: None` on purpose and are not a contract the Petal
-    // depends on. Grepping the whole file conflated the two.
-    let production = source
-        .split_once("#[cfg(test)]")
-        .map_or(source.as_str(), |(before, _)| before);
     assert!(
         !production.contains("fee_asset: None"),
         "the pinned Bloom still enrolls a class with an unconditional fee_asset: None"
