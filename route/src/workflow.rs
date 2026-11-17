@@ -1898,17 +1898,6 @@ fn request_session_key(
     .map_err(|error| backend(error.message()))
 }
 
-/// Whether the delegated session surface may carry builder fees.
-///
-/// `false` at the pinned Bloom contract, where two separate things deny the
-/// path -- see `session_key_classes` below for both, and README.md for the
-/// reader-facing version. The session `builder_order.json` route reads this
-/// and refuses every call; `new.json` refuses the bound the route would check
-/// against. Flipping it to `true` is one of the two edits that re-enable the
-/// path, the other being the session builder-order route's return to
-/// `[[key.derive]].allowed_routes` in petal.toml.
-pub const SESSION_BUILDER_FEES_AVAILABLE: bool = false;
-
 /// The operation classes a session key may sign under: the fee-free
 /// `hyperliquid.agent_action` surface, for every session. The fee-bearing
 /// builder-order class is deliberately absent, so no session key can sign an
@@ -3137,6 +3126,19 @@ fn session_policy(s: &Session, a: &ExchangeAction) -> Result<(), String> {
         match (&s.builder_address, s.max_builder_fee_tenths_bps) {
             (Some(allowed), Some(cap))
                 if *allowed == builder.address && builder.fee_tenths_bps <= cap => {}
+            // No bound at all, which is every session at the pinned Bloom:
+            // `new.json` refuses one, because no session key carries the
+            // fee-bearing class. Saying the fee is outside the approved bound
+            // would read as something a bound could fix, and none can be set.
+            // `session_key_classes` has the two Bloom reasons.
+            (None, None) => {
+                return Err(
+                    "session-signed builder fees are not available at the pinned Bloom \
+                            contract; submit builder-bearing orders through the owner-signed \
+                            exchange/[wallet]/[index]/builder_order.json route"
+                        .into(),
+                );
+            }
             _ => {
                 return Err("builder fee is outside the session's approved builder bound".into());
             }
@@ -4011,17 +4013,6 @@ mod tests {
             !allowed.contains("[session]/builder_order.json"),
             "the session builder-order route is back in the delegated key scope, which denies \
              every session created without a builder bound"
-        );
-        // The manifest and the route's own gate have to move together: the
-        // route refuses every call while the gate is false, and denies every
-        // plain session's key derivation while it is listed above. Flipping
-        // either alone ships a route that cannot work, or a Petal whose
-        // sessions cannot be created.
-        assert!(
-            !SESSION_BUILDER_FEES_AVAILABLE,
-            "SESSION_BUILDER_FEES_AVAILABLE is true while the session builder-order route is \
-             absent from [[key.derive]].allowed_routes, so the route is reachable but no \
-             session key is scoped to it"
         );
     }
 
@@ -4988,7 +4979,20 @@ mod tests {
         let mut session = bounded_session();
         let order = order_action_with_builder("0x0000000000000000000000000000000000000001", 10);
 
-        // no builder bound configured on the session: rejected outright
+        // No builder bound configured, which is every session at the pinned
+        // Bloom since `new.json` refuses one: rejected, and told why rather
+        // than that the fee is outside a bound it could never have set.
+        let unavailable = session_policy(&session, &order).unwrap_err();
+        assert!(
+            unavailable.contains("not available at the pinned Bloom contract")
+                && unavailable.contains("builder_order.json"),
+            "{unavailable}"
+        );
+
+        // A mismatched bound still gets the bound message, so re-enabling the
+        // path does not need this rewritten.
+        session.builder_address = Some("0x0000000000000000000000000000000000000009".into());
+        session.max_builder_fee_tenths_bps = Some(10);
         assert_eq!(
             session_policy(&session, &order),
             Err("builder fee is outside the session's approved builder bound".into())

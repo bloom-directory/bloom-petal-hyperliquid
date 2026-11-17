@@ -91,24 +91,11 @@ petal::route_file!(
         if let Err(error) = crate::validate_order_cloids(orders) {
             return petal::error(-3, error);
         }
-        // Checked after route fit, so a caller who sent the wrong action type
-        // or a malformed order still learns that first.
-        //
-        // No session key carries the fee-bearing class at the pinned Bloom, and
-        // `new.json` refuses the bound this route would check against, so every
-        // call fails. Left to run on, the caller would reach `session_policy`
-        // and be told the fee is "outside the session's approved builder
-        // bound" -- true, but it reads as something a bound would fix, and no
-        // bound can be set. `session_key_classes` in route/src/workflow.rs has
-        // the two Bloom reasons; both are in README.md.
-        if !crate::SESSION_BUILDER_FEES_AVAILABLE {
-            return petal::error(
-                -3,
-                "session-signed builder fees are not available at the pinned Bloom contract; \
-                 submit builder-bearing orders through the owner-signed \
-                 exchange/[wallet]/[index]/builder_order.json route",
-            );
-        }
+        // Every call is refused, but not here: `session_policy` is where it
+        // lands, and it names this exact case. Refusing in this file instead
+        // would compile a component that imports none of the caps its spec
+        // declares -- `petal build` rejects that, and rightly, since a route
+        // that needs nothing is not a signing route.
         crate::session_action_write(ctx, network, &wallet, session, request)
     }
 );
