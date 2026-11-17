@@ -1884,7 +1884,6 @@ fn request_session_key(
     w: &str,
     session_id: &str,
     lifetime_ms: u64,
-    builder_bound: bool,
 ) -> Result<petal::PetalKeyOutcome, DispatchResponse> {
     petal::sdk::derive_key(&petal::PetalKeyRequest {
         wallet_id: w.to_owned(),
@@ -1892,32 +1891,48 @@ fn request_session_key(
         // The host replaces this legacy field with the package-authenticated
         // canonical route scope declared in [[key.derive]].
         allowed_routes: Vec::new(),
-        allowed_operation_classes: session_key_classes(builder_bound),
+        allowed_operation_classes: session_key_classes(),
         allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
         maximum_lifetime_ms: lifetime_ms,
     })
     .map_err(|error| backend(error.message()))
 }
 
-/// The operation classes a session key may sign under.
+/// The operation classes a session key may sign under: the fee-free
+/// `hyperliquid.agent_action` surface, for every session. The fee-bearing
+/// builder-order class is deliberately absent, so no session key can sign an
+/// order that declares a fee. Builder fees are owner-signed only.
 ///
-/// A session created with a builder bound also gets the fee-bearing
-/// builder-order class; every other session is scoped to the fee-free
-/// `hyperliquid.agent_action` surface only, so it cannot sign an order that
-/// declares a fee however its stored record is later edited.
+/// That is narrower than this Petal can otherwise express, and the reason is
+/// in Bloom at the pinned revision. Two of its rules meet badly:
 ///
-/// Routes are deliberately not scoped here. The host overwrites the request's
-/// route list with the package-authenticated set from `[[key.derive]]`
-/// (`bloom-petals/src/vm.rs`), so every session key carries the whole session
-/// route surface and the class is what separates a builder-bound session from
-/// a plain one. The host does honour this list, requiring it to be a non-empty
-/// subset of the manifest's classes.
-fn session_key_classes(builder_bound: bool) -> Vec<String> {
-    let mut classes = vec!["hyperliquid.agent_action".to_owned()];
-    if builder_bound {
-        classes.push(protocol::BUILDER_ORDER_INTENT.to_owned());
-    }
-    classes
+/// - `[[key.derive]].allowed_routes` is the *whole* route set every derived
+///   key receives. The host overwrites whatever route list the Petal requests
+///   with the manifest's (`bloom-petals/src/vm.rs`), so the set cannot vary
+///   per key.
+/// - The daemon then requires every route in that set to share at least one
+///   operation class with what the key requested, and denies the derivation
+///   outright when one does not (`bloom-daemon`, "has no scoped provenance
+///   class"). Package validation separately requires every allowed route's
+///   signing intent to appear in `operation_classes`
+///   (`bloom-petals/src/package.rs`).
+///
+/// Together those make a route whose class only *some* keys request
+/// unrepresentable: listing the session builder-order route in
+/// `[[key.derive]]` denies every session key that did not also request the
+/// builder class — that is, every plain session. Requesting the class for all
+/// sessions would restore creation at the cost of the control, since every
+/// session key would then be granted the fee-bearing class and only
+/// `session.json`, a Machine-owned record, would bound the builder.
+///
+/// So the route stays out of the manifest scope and the class stays out of
+/// here. Re-enabling is a two-line manifest change once Bloom narrows a
+/// key's grants instead of refusing the derivation — and it needs the
+/// reusable key-scope approval to carry value limits as well, or Broker
+/// denies the fee claim with `VALUE_ASSET_NOT_ALLOWED` whatever the key
+/// scope says.
+fn session_key_classes() -> Vec<String> {
+    vec!["hyperliquid.agent_action".to_owned()]
 }
 
 /// The class a session-signed action is authorized under. A builder-bearing
@@ -2008,6 +2023,17 @@ fn session_preflight(req: &NewSession) -> Result<String, String> {
                     protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
                 ));
             }
+            // Refused last, so a malformed bound still reports its own fault
+            // rather than this. Nothing downstream can honour the bound at
+            // the pinned Bloom -- see `session_key_classes` -- so accepting it
+            // would store a bound that confers nothing and hand back a session
+            // whose every builder order is refused later and less clearly.
+            return Err(
+                "session-signed builder fees are not available at the pinned Bloom contract; \
+                 submit builder-bearing orders through the owner-signed \
+                 exchange/[wallet]/[index]/builder_order.json route"
+                    .into(),
+            );
         }
         (None, None) => {}
         _ => {
@@ -3339,37 +3365,36 @@ pub fn create_session(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatch
         normalized
     };
     let lifetime_ms = req.duration_ms.unwrap_or(3_600_000).min(86_400_000);
-    let derived =
-        match request_session_key(n, &w, &req.id, lifetime_ms, req.builder_address.is_some()) {
-            Ok(petal::PetalKeyOutcome::Pending {
-                operation_id,
-                scope_digest,
-            }) => {
-                return approval(
-                    "derive_agent_key",
-                    &json!({
-                        "operation_id": operation_id,
-                        "scope_digest": scope_digest,
-                        "session": req.id
-                    }),
-                );
-            }
-            Ok(petal::PetalKeyOutcome::Ready {
-                operation_id: _,
-                scope_digest: _,
-                key_ref_jcs,
-                addresses,
-            }) => {
-                let Some(address) = addresses
-                    .into_iter()
-                    .find(|address| protocol::parse_address(address).is_ok())
-                else {
-                    return backend("derived KeyRef has no EVM address");
-                };
-                (key_ref_jcs, address)
-            }
-            Err(response) => return response,
-        };
+    let derived = match request_session_key(n, &w, &req.id, lifetime_ms) {
+        Ok(petal::PetalKeyOutcome::Pending {
+            operation_id,
+            scope_digest,
+        }) => {
+            return approval(
+                "derive_agent_key",
+                &json!({
+                    "operation_id": operation_id,
+                    "scope_digest": scope_digest,
+                    "session": req.id
+                }),
+            );
+        }
+        Ok(petal::PetalKeyOutcome::Ready {
+            operation_id: _,
+            scope_digest: _,
+            key_ref_jcs,
+            addresses,
+        }) => {
+            let Some(address) = addresses
+                .into_iter()
+                .find(|address| protocol::parse_address(address).is_ok())
+            else {
+                return backend("derived KeyRef has no EVM address");
+            };
+            (key_ref_jcs, address)
+        }
+        Err(response) => return response,
+    };
     let generated_session = Session {
         schema: "bloom.hyperliquid_agent_session.v1".into(),
         network: if matches!(n, Network::Mainnet) {
@@ -3939,19 +3964,15 @@ mod tests {
         );
     }
 
-    /// The class is the whole control. The host overwrites the request's route
-    /// list with the manifest's, so every session key carries the
-    /// builder-order route; only a session that bound a builder may sign
-    /// under the fee-bearing class, and signing checks the class.
+    /// No session key is scoped to the fee-bearing class, and the session
+    /// builder-order route is absent from the manifest's delegated key scope.
+    /// Those two go together: a route listed there whose signing intent no
+    /// key requests denies the derivation outright, so listing the route
+    /// while leaving the class out of *some* keys breaks plain session
+    /// creation. `session_key_classes` has the full reasoning.
     #[test]
-    fn only_a_builder_bound_session_is_scoped_to_the_fee_bearing_class() {
-        assert_eq!(session_key_classes(false), ["hyperliquid.agent_action"]);
-        assert_eq!(
-            session_key_classes(true),
-            ["hyperliquid.agent_action", protocol::BUILDER_ORDER_INTENT]
-        );
-        // Must stay a subset of the manifest's declared classes, or the host
-        // refuses the derivation outright.
+    fn no_session_key_is_scoped_to_the_fee_bearing_class() {
+        assert_eq!(session_key_classes(), ["hyperliquid.agent_action"]);
         let manifest = include_str!("../../petal.toml");
         let (_, derive) = manifest.split_once("[[key.derive]]").unwrap();
         let (declared, _) = derive
@@ -3960,9 +3981,26 @@ mod tests {
             .1
             .split_once(']')
             .unwrap();
-        for class in session_key_classes(true) {
+        // A subset of the manifest's classes, or the host refuses the
+        // derivation; and the fee-bearing class is in neither.
+        for class in session_key_classes() {
             assert!(declared.contains(&format!("\"{class}\"")), "{class}");
         }
+        assert!(
+            !declared.contains(protocol::BUILDER_ORDER_INTENT),
+            "the manifest still declares the fee-bearing class for session keys"
+        );
+        let (allowed, _) = derive
+            .split_once("allowed_routes = [")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap();
+        assert!(
+            !allowed.contains("[session]/builder_order.json"),
+            "the session builder-order route is back in the delegated key scope, which denies \
+             every session created without a builder bound"
+        );
     }
 
     #[test]
@@ -4989,13 +5027,18 @@ mod tests {
         // neither field set: fine, no builder bound
         assert!(session_preflight(&request(None, None)).is_ok());
 
-        // set together, within the perp venue cap: fine
+        // set together and well formed, but refused: no session key carries
+        // the fee-bearing class at the pinned Bloom, so the bound cannot be
+        // honoured. The message names the owner-signed route instead.
+        let refused = session_preflight(&request(
+            Some("0x0000000000000000000000000000000000000001"),
+            Some(100),
+        ))
+        .unwrap_err();
         assert!(
-            session_preflight(&request(
-                Some("0x0000000000000000000000000000000000000001"),
-                Some(100)
-            ))
-            .is_ok()
+            refused.contains("not available at the pinned Bloom contract")
+                && refused.contains("builder_order.json"),
+            "{refused}"
         );
 
         // only one of the pair set: rejected

@@ -32,9 +32,12 @@ allowed_intents = ["hyperliquid.approve_agent", "hyperliquid.agent_action", "hyp
 
 [[key.derive]]
 route = "[network]/agent_sessions/[wallet]/[index]/new.json"
-operation_classes = ["hyperliquid.agent_action", "hyperliquid.builder_order"]
+# `hyperliquid.builder_order` is deliberately absent, and so is the session
+# builder-order route below. See `session_key_classes` in route/src/workflow.rs:
+# listing that route here denies every session that does not also request the
+# builder class, which is every plain session.
+operation_classes = ["hyperliquid.agent_action"]
 allowed_routes = [
-  "[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json",
   "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
   "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
   "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",

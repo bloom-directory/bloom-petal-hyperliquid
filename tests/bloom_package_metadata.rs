@@ -112,15 +112,18 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let derivation = routes
         .get(DERIVATION_ROUTE)
         .expect("agent-session derivation route");
-    // The manifest declares both classes because the host takes the derived
-    // key's route scope from `[[key.derive]]` and validates the requested
-    // classes as a subset of these. A session created without a builder bound
-    // requests `agent_action` alone, so only a builder-bound session can sign
-    // under the fee-bearing class.
-    assert_eq!(
-        operation_classes(derivation),
-        [AGENT_ACTION_INTENT, BUILDER_ORDER_INTENT]
-    );
+    // `agent_action` alone. The fee-bearing class is deliberately absent, and
+    // so is the session builder-order route from the scope asserted below.
+    //
+    // Those two must stay absent together. The host takes a derived key's
+    // route scope from `[[key.derive]]` wholesale and then denies the
+    // derivation if any route in it shares no operation class with the key's
+    // request, so listing that route obliges *every* session key to request
+    // the builder class -- and a key that requested it would be granted the
+    // fee-bearing class, leaving only a Machine-owned store record to bound
+    // the builder. Builder fees are owner-signed only; `session_key_classes`
+    // in `route/src/workflow.rs` carries the full reasoning.
+    assert_eq!(operation_classes(derivation), [AGENT_ACTION_INTENT]);
     assert_eq!(
         derivation.install_metadata.sign_intent.as_deref(),
         Some("hyperliquid.approve_agent")
@@ -134,13 +137,13 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
             "bloom:store",
         ]
     );
-    // The builder-order route is scoped by the manifest like every other
-    // session route, but it signs under its own fee-bearing intent, so it is
-    // not part of the agent-action list above.
+    // The session builder-order route is NOT here, which is what keeps plain
+    // session creation working -- see the comment on the class list above.
+    // The route still ships, and still signs under its own fee-bearing
+    // intent; no session key is scoped to it.
     let mut expected_scope = SESSION_ACTION_ROUTES
         .iter()
         .copied()
-        .chain(std::iter::once(SESSION_BUILDER_ORDER_ROUTE.0))
         .map(|pattern| routes[pattern].route_id.as_str())
         .chain(std::iter::once(derivation.route_id.as_str()))
         .collect::<Vec<_>>();
@@ -188,6 +191,13 @@ fn exact_built_package_scopes_delegated_and_direct_signing_metadata() {
     let builder_order = routes
         .get(SESSION_BUILDER_ORDER_ROUTE.0)
         .expect("session builder-order route");
+    assert!(
+        !derivation
+            .key_derive_allowed_routes
+            .contains(&builder_order.route_id),
+        "the session builder-order route is back in the delegated key scope, which denies every \
+         session created without a builder bound"
+    );
     assert_eq!(builder_order.route_id, SESSION_BUILDER_ORDER_ROUTE.1);
     assert_eq!(
         builder_order.install_metadata.sign_intent.as_deref(),

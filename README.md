@@ -35,18 +35,32 @@ pair's quote token or a HIP-3 dex's collateral asset; a leg accepted here but
 refused there would be signed and then denied at the claim.
 `approve_builder_fee.json` approves the maximum fee a builder may charge; like
 `usd_class_transfer.json`, it must be signed by the main wallet and is
-deliberately absent from the delegated agent session surface. A delegated
-session may use a builder fee only if it was created with a matching
-`builder_address`/`max_builder_fee_tenths_bps` bound. Half of that bound is an
-enforced control and half is not. Creating a session with it is what puts the
-fee-bearing class in that session key's scope, and Broker checks a claim's
-class against the owner-approved terms at use time, so a session *key* derived
-without one cannot sign a fee-declaring order. That control attaches to the
-derived key, not to the stored record: a record naming another session's key
-reference inherits that key's scope, so the record is not where the guarantee
-lives. The builder address and the rate cap are a different matter — both are
-compared only against `session.json`, a Machine-owned store record, and reach
-neither the key scope nor the claim. Agent sessions provide
+deliberately absent from the delegated agent session surface.
+
+**Builder fees are owner-signed only.** No delegated session key carries the
+fee-bearing class, and `agent_sessions/.../new.json` refuses a
+`builder_address`/`max_builder_fee_tenths_bps` bound rather than storing one it
+cannot honour. The session `builder_order.json` route ships and signs under the
+fee-bearing class, but no session key is scoped to it. Two things at the pinned
+Bloom and Broker revisions have to change before that reverses, and either one
+alone is enough to deny a session-signed builder order:
+
+- A derived key receives its whole route set from `[[key.derive]]`, and the
+  daemon denies the derivation outright if any route in that set shares no
+  operation class with the key's request. Scoping sessions to the
+  builder-order route would therefore oblige every session key to request the
+  fee-bearing class — including plain ones, which must not have it, since the
+  class in the key scope is the only part of the builder bound that anything
+  outside the Machine enforces. The builder address and the rate cap are
+  compared against `session.json`, a Machine-owned store record, and reach
+  neither the key scope nor the claim.
+- The reusable key-scope approval a session key signs against is prepared with
+  no value limits, and Broker denies a claim declaring a fee asset outside
+  those limits with `VALUE_ASSET_NOT_ALLOWED`. A builder fee is the first
+  declared value ever to reach that approval. Owner-signed orders are
+  unaffected: their exact approvals derive value limits from the claim itself.
+
+Agent sessions provide
 owner-approved creation, bounded Signer-owned agent-key actions,
 cancel-all, close-all, audit, and immutable action receipts keyed by client
 order ID under
