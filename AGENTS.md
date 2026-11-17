@@ -27,8 +27,8 @@ fee-bearing class, and `agent_sessions/[wallet]/[index]/new.json` refuses a
 `builder_address`/`max_builder_fee_tenths_bps` bound outright rather than
 storing one it cannot honour, so send builder-bearing orders to
 `exchange/[wallet]/[index]/builder_order.json`. The session
-`builder_order.json` route ships but no session key is scoped to it; README.md
-records the two pinned-revision reasons. `withdraw.json` submits Hyperliquid's `withdraw3`
+`builder_order.json` route ships but refuses every call, and no session key is
+scoped to it; README.md records the two pinned-revision reasons. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and
 settles on Arbitrum minus the venue's flat fee, so venue acceptance is never
 settlement proof. Operation records are listed at `withdrawals/` and readable

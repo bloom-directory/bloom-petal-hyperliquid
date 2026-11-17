@@ -3,7 +3,7 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write one or more bounded session orders that carry a builder fee; Bloom signs them with the stored agent key under the fee-bearing hyperliquid.builder_order class, which the session must have been created with a builder bound to use",
+            "description": "UNAVAILABLE at the pinned Bloom contract: every call to this route is refused, and agent_sessions/[wallet]/[index]/new.json refuses the builder bound it would need. Builder fees are owner-signed only; write builder-bearing orders to exchange/[wallet]/[index]/builder_order.json. Two things must change in Bloom first: a derived key's scope must be narrowed to the classes it requested rather than the derivation being refused outright, and the reusable key-scope approval must carry value limits, or Broker denies the fee claim with VALUE_ASSET_NOT_ALLOWED. When this route works, it will write one or more bounded session orders carrying a builder fee, signed with the stored agent key under the fee-bearing hyperliquid.builder_order class.",
             "request_schema": {
                 "action": {
                     "type": "order",
@@ -17,7 +17,7 @@ petal::route_file!(
                         "c": "required client order id: 0x plus 32 hex digits, new for every order. This route's success evidence is keyed on it, so an order without one cannot be confirmed"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
-                    "builder": {"b": "lowercase builder address matching the session's builder_address", "f": "fee in tenths of a basis point, at most the session's max_builder_fee_tenths_bps and the venue cap"}
+                    "builder": {"b": "lowercase builder address; would have to match the session's builder_address, which cannot be set at the pinned contract", "f": "fee in tenths of a basis point, at most the session's max_builder_fee_tenths_bps and the venue cap"}
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
@@ -90,6 +90,24 @@ petal::route_file!(
         }
         if let Err(error) = crate::validate_order_cloids(orders) {
             return petal::error(-3, error);
+        }
+        // Checked after route fit, so a caller who sent the wrong action type
+        // or a malformed order still learns that first.
+        //
+        // No session key carries the fee-bearing class at the pinned Bloom, and
+        // `new.json` refuses the bound this route would check against, so every
+        // call fails. Left to run on, the caller would reach `session_policy`
+        // and be told the fee is "outside the session's approved builder
+        // bound" -- true, but it reads as something a bound would fix, and no
+        // bound can be set. `session_key_classes` in route/src/workflow.rs has
+        // the two Bloom reasons; both are in README.md.
+        if !crate::SESSION_BUILDER_FEES_AVAILABLE {
+            return petal::error(
+                -3,
+                "session-signed builder fees are not available at the pinned Bloom contract; \
+                 submit builder-bearing orders through the owner-signed \
+                 exchange/[wallet]/[index]/builder_order.json route",
+            );
         }
         crate::session_action_write(ctx, network, &wallet, session, request)
     }

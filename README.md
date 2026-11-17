@@ -41,7 +41,8 @@ deliberately absent from the delegated agent session surface.
 fee-bearing class, and `agent_sessions/.../new.json` refuses a
 `builder_address`/`max_builder_fee_tenths_bps` bound rather than storing one it
 cannot honour. The session `builder_order.json` route ships and signs under the
-fee-bearing class, but no session key is scoped to it. Two things at the pinned
+fee-bearing class, but refuses every call and no session key is scoped to it.
+Two things at the pinned
 Bloom and Broker revisions have to change before that reverses, and either one
 alone is enough to deny a session-signed builder order:
 

@@ -1898,6 +1898,17 @@ fn request_session_key(
     .map_err(|error| backend(error.message()))
 }
 
+/// Whether the delegated session surface may carry builder fees.
+///
+/// `false` at the pinned Bloom contract, where two separate things deny the
+/// path -- see `session_key_classes` below for both, and README.md for the
+/// reader-facing version. The session `builder_order.json` route reads this
+/// and refuses every call; `new.json` refuses the bound the route would check
+/// against. Flipping it to `true` is one of the two edits that re-enable the
+/// path, the other being the session builder-order route's return to
+/// `[[key.derive]].allowed_routes` in petal.toml.
+pub const SESSION_BUILDER_FEES_AVAILABLE: bool = false;
+
 /// The operation classes a session key may sign under: the fee-free
 /// `hyperliquid.agent_action` surface, for every session. The fee-bearing
 /// builder-order class is deliberately absent, so no session key can sign an
@@ -4000,6 +4011,17 @@ mod tests {
             !allowed.contains("[session]/builder_order.json"),
             "the session builder-order route is back in the delegated key scope, which denies \
              every session created without a builder bound"
+        );
+        // The manifest and the route's own gate have to move together: the
+        // route refuses every call while the gate is false, and denies every
+        // plain session's key derivation while it is listed above. Flipping
+        // either alone ships a route that cannot work, or a Petal whose
+        // sessions cannot be created.
+        assert!(
+            !SESSION_BUILDER_FEES_AVAILABLE,
+            "SESSION_BUILDER_FEES_AVAILABLE is true while the session builder-order route is \
+             absent from [[key.derive]].allowed_routes, so the route is reachable but no \
+             session key is scoped to it"
         );
     }
 
