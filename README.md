@@ -38,12 +38,15 @@ refused there would be signed and then denied at the claim.
 deliberately absent from the delegated agent session surface. A delegated
 session may use a builder fee only if it was created with a matching
 `builder_address`/`max_builder_fee_tenths_bps` bound. Half of that bound is an
-enforced control and half is not: creating a session with it is what puts the
-fee-bearing class in that session key's Signer-enforced scope, so a session
-created without one cannot sign a fee-declaring order however its stored
-record is later edited, while the builder address and the rate cap are checked
-against `session.json`, a Machine-owned store record, and enter neither the
-key scope nor the claim. Agent sessions provide
+enforced control and half is not. Creating a session with it is what puts the
+fee-bearing class in that session key's scope, and Broker checks a claim's
+class against the owner-approved terms at use time, so a session *key* derived
+without one cannot sign a fee-declaring order. That control attaches to the
+derived key, not to the stored record: a record naming another session's key
+reference inherits that key's scope, so the record is not where the guarantee
+lives. The builder address and the rate cap are a different matter — both are
+compared only against `session.json`, a Machine-owned store record, and reach
+neither the key scope nor the claim. Agent sessions provide
 owner-approved creation, bounded Signer-owned agent-key actions,
 cancel-all, close-all, audit, and immutable action receipts keyed by client
 order ID under

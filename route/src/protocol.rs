@@ -219,6 +219,14 @@ impl ExchangeAction {
                     // Any perp leg (core or HIP-3) takes the perp cap, else
                     // any spot leg the spot cap. Hyperliquid documents no
                     // cap for outcomes; the fee claim refuses them anyway.
+                    //
+                    // The spot arm is venue bookkeeping, not a licence: a
+                    // builder-bearing spot leg never reaches a signature,
+                    // because `ensure_builder_leg_can_be_bounded` refuses
+                    // every spot asset before the bound is computed. Same for
+                    // the HIP-3 half of the perp arm. This stays because
+                    // `approve_builder_fee` shares the caps and does not go
+                    // through that check.
                     let cap = if orders
                         .iter()
                         .any(|o| is_core_perp_asset(o.asset) || is_hip3_perp_asset(o.asset))
@@ -1281,7 +1289,9 @@ mod tests {
                 .unwrap_err()
                 .contains("venue cap of 100")
         );
-        // at the spot cap (asset id >= SPOT_ASSET_ID_OFFSET): accepted
+        // at the spot cap (asset id >= SPOT_ASSET_ID_OFFSET): accepted by
+        // `validate`, which only applies the venue cap. A builder-bearing
+        // spot leg is refused later, by the fee claim.
         assert_eq!(
             order_with_builder(SPOT_ASSET_ID_OFFSET, addr, 1_000).validate(),
             Ok(())
@@ -1314,6 +1324,10 @@ mod tests {
     }
 
     #[test]
+    // `validate` only applies the venue cap, so a mixed batch is shaped here
+    // as the venue would see it. The fee claim refuses any spot leg before
+    // signing, so this batch is unreachable with a builder attached; the cap
+    // precedence is still what `validate` owns.
     fn mixed_perp_and_spot_orders_use_the_stricter_perp_cap() {
         let addr = "0x0000000000000000000000000000000000000001";
         let mixed_batch = |fee_tenths_bps: u32| -> ExchangeAction {

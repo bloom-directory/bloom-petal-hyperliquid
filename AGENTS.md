@@ -19,14 +19,15 @@ through the session route of the same name), which signs under
 is, is set out in README.md; the rules that decide whether
 a call succeeds are: a builder-bearing sell must be post-only (`Alo`); a
 builder-bearing trigger order is refused; and a builder-bearing leg is
-accepted only on core perps, the one case where the fee asset is known to be
-USDC, so spot pairs are refused whichever token quotes them and whichever side
-the leg takes, and so are HIP-3 perps and outcome markets. A delegated session
+accepted only on core perps, the one case where the fee asset is known from
+the signed order alone, so spot pairs are refused whichever token quotes them
+and whichever side the leg takes, and so are HIP-3 perps and outcome markets. A delegated session
 may use a builder fee only if it was created with a matching
 `builder_address`/`max_builder_fee_tenths_bps` bound. Only half of that bound
 is an enforced control: it is what adds the fee-bearing class to the session
-key's Signer-enforced scope, so a session created without it cannot sign a
-fee-declaring order at all, but the address and the rate cap are checked
+key's broker-enforced scope, so a session *key* derived without it cannot sign
+a fee-declaring order — the control attaches to the derived key, not to the
+stored record — but the address and the rate cap are checked
 against `session.json`, a Machine-owned store record, and enter neither the
 key scope nor the claim. `withdraw.json` submits Hyperliquid's `withdraw3`
 action: it debits the gross amount from the account's withdrawable USDC and

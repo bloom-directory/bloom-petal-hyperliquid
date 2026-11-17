@@ -4,6 +4,16 @@ use bloom_petals::package::{PreparedPetalPackage, RouteIndexRecord};
 
 const AGENT_ACTION_INTENT: &str = "hyperliquid.agent_action";
 const BUILDER_ORDER_INTENT: &str = "hyperliquid.builder_order";
+/// The chain and asset this Petal's builder-fee claim declares, mirroring
+/// `ClaimEffects::builder_order_fee` in `route/src/workflow.rs`. Broker denies
+/// a claim whose declared fee asset is not the one the pinned Bloom catalogued
+/// for the class (`FEE_ASSET_MISMATCH`), so these must be the catalogued pair.
+const FEE_CLAIM_CHAIN: &str = "hyperliquid";
+const FEE_CLAIM_ASSET: &str = "usdc";
+/// The name the pinned Bloom's catalog row refers to the class by. The row
+/// names this const rather than the class string, so pinning the row means
+/// matching on the identifier.
+const CLASS_CONST: &str = "HYPERLIQUID_BUILDER_ORDER_CLASS";
 const SESSION_BUILDER_ORDER_ROUTE: (&str, &str) = (
     "[network]/agent_sessions/[wallet]/[index]/[session]/builder_order.json",
     "r000008",
@@ -231,35 +241,79 @@ fn pinned_bloom_catalogues_the_builder_order_class_with_a_fee_asset() {
         .unwrap_or_else(|error| panic!("read {}: {error}", enrollment.display()));
     assert!(
         source.contains(&format!(
-            "const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = \"{BUILDER_ORDER_INTENT}\";"
+            "const {CLASS_CONST}: &str = \"{BUILDER_ORDER_INTENT}\";"
         )),
-        "the pinned Bloom does not catalogue {BUILDER_ORDER_INTENT} as a fee-bearing class"
+        "the pinned Bloom does not name {BUILDER_ORDER_INTENT} as a fee-bearing class"
     );
-    // Both remaining assertions are about the *enrollment* paths, so both read
-    // the production half only. The pinned Bloom's own tests deliberately
-    // plant `fee_asset: None` fixtures to exercise its heal; those are not a
-    // contract the Petal depends on, and grepping the whole file conflated the
-    // two. This split is only as good as the marker being unique: a second
-    // `#[cfg(test)]` earlier in the file would silently cut the window short
-    // and weaken the `None` check below, so pin the count rather than trust
-    // it. Zero would mean the pin dropped its test module entirely -- also
-    // worth a failure, since the reasoning above would no longer hold.
-    assert_eq!(
-        source.matches("#[cfg(test)]").count(),
-        1,
-        "this test splits the pinned Bloom's enrollment source at its single \
-         `#[cfg(test)]` to separate production from fixtures; that marker is no \
-         longer unique, so the split can no longer be trusted"
-    );
+
+    // Everything below is about the *enrollment* paths, so all of it reads the
+    // production half only: the pin's own tests deliberately plant
+    // `fee_asset: None` fixtures to exercise its heal, and grepping the whole
+    // file conflated those with a real enrollment path.
+    //
+    // The window ends at the first `#[cfg(test)]`. A marker *before* the
+    // catalog would cut it short ahead of everything asserted here, which the
+    // next assertion refuses outright. A marker after it -- a nested
+    // `#[cfg(test)]` among the pin's own tests, which is routine -- leaves the
+    // split unchanged and is not an error. The split is positional, not
+    // semantic: a production item written *after* the test module would escape
+    // this window, so the `fee_asset: None` sweep at the end is a backstop, not
+    // a proof. The catalog assertions do not lean on the split for their force.
     let (production, _) = source
         .split_once("#[cfg(test)]")
-        .expect("the count above proves the marker is present");
+        .unwrap_or((source.as_str(), ""));
+    let catalog_declaration = "const FEE_BEARING_OPERATION_CLASSES:";
+    assert!(
+        production.contains(catalog_declaration),
+        "`{catalog_declaration}` is not in the pinned Bloom's production half; either the \
+         catalog is gone or a `#[cfg(test)]` now precedes it, which would hide every \
+         assertion below"
+    );
+
+    // The catalogued row itself, not merely the class name. Naming the class
+    // is what the assertion above does, and it is not enough on its own: the
+    // enrolled fee asset comes from this table, so a pin that emptied the
+    // table, or kept the row and changed its asset, would deny *every* builder
+    // order -- `FEE_NOT_ALLOWED` for an absent row, `FEE_ASSET_MISMATCH` for
+    // the wrong asset -- while every other assertion in this test still
+    // passed. Both of those mutations did pass before this block existed.
+    //
+    // Matched per row rather than across the whole table, so a second venue's
+    // row cannot satisfy this one's fields.
+    let table = production
+        .split_once(catalog_declaration)
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(initializer, _)| initializer)
+        .expect("the assertion above proves the declaration is present");
+    let row = table
+        .split("CataloguedFeeAsset {")
+        .find(|row| row.contains(&format!("operation_class: {CLASS_CONST}")))
+        .unwrap_or_else(|| {
+            panic!(
+                "the pinned Bloom's fee-bearing class table has no row for {CLASS_CONST}, so \
+                 {BUILDER_ORDER_INTENT} is enrolled fee-free and Broker denies every \
+                 builder-fee claim under it with FEE_NOT_ALLOWED"
+            )
+        });
+    for field in [
+        format!("chain: {FEE_CLAIM_CHAIN:?}"),
+        format!("asset: {FEE_CLAIM_ASSET:?}"),
+    ] {
+        assert!(
+            row.contains(&field),
+            "the pinned Bloom catalogues {BUILDER_ORDER_INTENT} without `{field}`; this \
+             Petal's claim declares {FEE_CLAIM_CHAIN}/{FEE_CLAIM_ASSET}, and Broker denies a \
+             claim whose fee asset is not the catalogued one with FEE_ASSET_MISMATCH"
+        );
+    }
+
     assert!(
         production
             .matches("fee_asset: catalogued_fee_asset(")
             .count()
             >= 2,
-        "the pinned Bloom must catalogue fee assets per class on both the developer and release enrollment paths"
+        "the pinned Bloom must derive each class's fee asset from that table on both the \
+         developer and release enrollment paths"
     );
     assert!(
         !production.contains("fee_asset: None"),
