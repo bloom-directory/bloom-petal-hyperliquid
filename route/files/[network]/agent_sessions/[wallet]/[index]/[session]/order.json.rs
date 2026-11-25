@@ -17,7 +17,7 @@ petal::route_file!(
                         "c": "required client order id: 0x plus 32 hex digits, new for every order. This route's success evidence is keyed on it, so an order without one cannot be confirmed"
                     }],
                     "grouping": "na, normalTpsl, or positionTpsl",
-                    "builder": "not accepted here; write a builder-bearing order to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class and requires the session's builder bound"
+                    "builder": "not accepted here, and not by any session route: builder fees are owner-signed only. Write a builder-bearing order to exchange/[wallet]/[index]/builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class with the main wallet"
                 },
                 "nonce": "optional unsigned integer; omit to let Bloom allocate a monotonic nonce",
                 "expiresAfter": "optional Unix timestamp in milliseconds"
@@ -84,7 +84,7 @@ petal::route_file!(
         if request.action.carries_builder() {
             return petal::error(
                 -3,
-                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
+                "order.json cannot carry a builder fee, and no session route can: builder fees are owner-signed only. Write the same body to exchange/[wallet]/[index]/builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class with the main wallet",
             );
         }
         if let Err(error) = crate::validate_order_cloids(orders) {

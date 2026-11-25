@@ -78,7 +78,10 @@ enforces builder-side preconditions the Petal cannot check on the user's
 behalf: the builder needs at least 100 USDC in perps account value and must
 use standard account abstraction mode, and each user may hold at most 10
 active builder approvals at a time. Builder fees are capped by the venue at
-0.1% (100 tenths of a basis point) on perps and 1% (1000) on spot.
+0.1% (100 tenths of a basis point) on perps and 1% (1000) on spot;
+`approve_builder_fee.json` caps the approval at the perp ceiling, because that
+is the most any order this Petal can place could charge, and a standing grant
+above it could never be used from here.
 
 The withdrawal route is `withdraw.json` with body
 `{"destination": "<Arbitrum address>", "amount": "<USDC decimal>"}`. It signs

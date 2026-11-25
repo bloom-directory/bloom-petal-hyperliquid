@@ -224,9 +224,12 @@ impl ExchangeAction {
                     // builder-bearing spot leg never reaches a signature,
                     // because `ensure_builder_leg_can_be_bounded` refuses
                     // every spot asset before the bound is computed. Same for
-                    // the HIP-3 half of the perp arm. This stays because
-                    // `approve_builder_fee` shares the caps and does not go
-                    // through that check.
+                    // the HIP-3 half of the perp arm. It stays so this
+                    // validation states the venue's rule for each asset
+                    // class, whichever check refuses the leg afterwards;
+                    // `approve_builder_fee` is capped at the perp ceiling
+                    // alone, since that is the most any order placed here can
+                    // charge.
                     let cap = if orders
                         .iter()
                         .any(|o| is_core_perp_asset(o.asset) || is_hip3_perp_asset(o.asset))

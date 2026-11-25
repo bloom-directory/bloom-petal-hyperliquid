@@ -1229,10 +1229,16 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
     if resolved_builder != resolved_builder.to_ascii_lowercase() {
         return invalid("builder address must be lowercase");
     }
-    if req.max_fee_tenths_bps > protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS {
+    // The approval is a standing on-chain grant, so it is capped at the most
+    // any order this Petal can place could charge. Builder-bearing legs are
+    // accepted only on core perps, where the venue's own ceiling is the perp
+    // cap; the venue's higher spot ceiling is never reachable from here, and
+    // approving up to it would let the owner sign a grant ten times larger
+    // than any order they can place through this Petal.
+    if req.max_fee_tenths_bps > protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS {
         return invalid(format!(
-            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval. One approval covers perp and spot orders, so it is bounded by the venue's spot ceiling; each perp order is still capped at {}",
-            protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS,
+            "max_fee_tenths_bps must be 0..={}; 0 revokes the builder's approval. This Petal places builder-bearing orders only on core perps, where the venue caps the fee at {} tenths of a basis point, so no approval above that is needed",
+            protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS,
             protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS
         ));
     }
@@ -1345,9 +1351,12 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
             if let Err(e) = protocol::validate_exchange_response(&v) {
                 return backend(e);
             }
-            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
-                return e;
-            }
+            // The record first: the venue has accepted, so what a retry must
+            // find is the approval record, not the diagnostic copy of the
+            // response. Saved the other way round, a failed `last_response`
+            // write would return an error with the cap in force and no
+            // record of it, and the retry would resubmit on the pending
+            // nonce instead of taking the corroboration shortcut.
             if let Err(e) = commit_builder_fee_approval(
                 approval_key,
                 req.max_fee_tenths_bps,
@@ -1355,6 +1364,9 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
                 pending_nonce_key,
                 nonce,
             ) {
+                return e;
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
                 return e;
             }
             ok_write()
@@ -1479,7 +1491,7 @@ fn builder_fee_approval_advisory(
         lines.push("A cap of 0% revokes this builder's approval.".to_owned());
     } else {
         lines.push(
-            "Only orders that name this builder pay it; Hyperliquid enforces its own ceilings of 0.1% on perps and 1% on spot."
+            "Only orders that name this builder pay it. This Petal places builder-bearing orders only on core perps, where Hyperliquid enforces its own ceiling of 0.1%."
                 .to_owned(),
         );
     }
@@ -4552,6 +4564,63 @@ mod tests {
         assert_eq!(order_claim_effects(&plain).unwrap(), ClaimEffects::none());
     }
 
+    /// The approval is a standing grant, so it is bounded by the most any
+    /// order this Petal can place could charge: the perp ceiling. The venue's
+    /// higher spot ceiling is unreachable from here, since every spot leg is
+    /// refused before it is signed.
+    #[test]
+    fn a_builder_fee_approval_is_capped_at_the_perp_ceiling() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        crate::host::test_reset();
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![],
+            actor: None,
+        });
+        let builder = "0x0000000000000000000000000000000000000001";
+        let approve = |cap: u32| {
+            approve_builder_fee(
+                &ctx,
+                Network::Testnet,
+                "main".to_owned(),
+                format!(r#"{{"builder":"{builder}","max_fee_tenths_bps":{cap}}}"#).as_bytes(),
+            )
+        };
+        let petal::DispatchResponse::Error { code, message } =
+            approve(protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS + 1)
+        else {
+            panic!("a cap above the perp ceiling must be refused");
+        };
+        assert_eq!(code, -3);
+        assert!(message.contains("0..=100"), "{message}");
+        assert!(!message.contains("spot"), "{message}");
+        // The old bound, the venue's spot ceiling, is refused outright.
+        assert!(matches!(
+            approve(protocol::MAX_SPOT_BUILDER_FEE_TENTHS_BPS),
+            petal::DispatchResponse::Error { .. }
+        ));
+        // The perp ceiling itself passes the cap check and reaches the nonce
+        // reservation, the first store write; every write is made to fail so
+        // the call stops there, short of signing, and the error is the
+        // store's rather than the cap's.
+        crate::host::test_fail_writes_matching(Some(""));
+        let petal::DispatchResponse::Error { message, .. } =
+            approve(protocol::MAX_PERP_BUILDER_FEE_TENTHS_BPS)
+        else {
+            panic!("the injected write failure must surface");
+        };
+        crate::host::test_fail_writes_matching(None);
+        assert!(!message.contains("max_fee_tenths_bps must be"), "{message}");
+        assert!(message.contains("injected write failure"), "{message}");
+    }
+
     #[test]
     fn builder_advisories_name_the_recipient_and_the_rate() {
         let builder = "0x0000000000000000000000000000000000000001";
@@ -4566,6 +4635,7 @@ mod tests {
         assert!(approval.contains("0.01%"));
         assert!(approval.contains("10 tenths of a basis point"));
         assert!(approval.contains("explicit in this request"));
+        assert!(!approval.contains("spot"), "{approval}");
         let revoke = String::from_utf8(builder_fee_approval_advisory(
             Network::Testnet,
             builder,

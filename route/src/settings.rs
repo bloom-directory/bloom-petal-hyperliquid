@@ -15,9 +15,9 @@ use serde::Serialize;
 /// data, not an advisory: `approve_builder_fee` signs an `approveBuilderFee`
 /// message whose `builder` and `maxFeeRate` leaves travel in the payload's
 /// `bloom.message.review.v1` envelope, which Broker checks against the exact
-/// preimage hash before rendering. That rendering needs Bloom #224 and Broker
-/// #103; until they land the leaves are not displayed, which the README tracks
-/// as a pre-merge gate.
+/// preimage hash before rendering each typed leaf. Both are properties of the
+/// Bloom and Broker revisions this Petal pins, which `ci.yml` and
+/// `scripts/check-triad-package.sh` record.
 ///
 /// Set it as a lowercase `0x` address;
 /// `release_default_if_set_is_a_lowercase_address` checks whatever a build
