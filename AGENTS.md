@@ -6,10 +6,14 @@ account reads are best-effort POST requests to Hyperliquid's `/info` endpoint.
 Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 `cancel_by_cloid.json`, `schedule_cancel.json`, `update_leverage.json`,
 `raw_signed.json`, `usd_send.json`, `usd_class_transfer.json`,
-`approve_builder_fee.json`, `builder_order.json`, and `withdraw.json`.
-`usd_class_transfer.json` moves USDC between the wallet's own spot and perp
-engines; it and `approve_builder_fee.json` are owner-only, signed by the main
-wallet, and deliberately absent from the delegated agent session surface.
+`approve_builder_fee.json`, `builder_order.json`, `set_abstraction.json`, and
+`withdraw.json`. `usd_class_transfer.json` moves USDC between the wallet's own
+spot and perp engines; `set_abstraction.json` switches the account's mode
+(`disabled` is standard; new accounts start in `unifiedAccount`, in which the
+venue refuses `usd_send.json` and `usd_class_transfer.json`), and
+`users/<account>/abstraction.json` reads it. Those two and
+`approve_builder_fee.json` are owner-only, signed by the main wallet, and
+deliberately absent from the delegated agent session surface.
 `send_asset.json` is a deprecated alias for `usd_send.json`; it does not
 implement Hyperliquid's generalized `sendAsset` action. An order carrying a
 per-order `builder` fee is written to `builder_order.json` (owner-signed, or

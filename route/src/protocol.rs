@@ -604,6 +604,10 @@ fn user_typed(network: Network, kind: &str, message: Value) -> Result<TypedData,
             "UsdClassTransfer",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"amount","type":"string"},{"name":"toPerp","type":"bool"},{"name":"nonce","type":"uint64"}]),
         ),
+        "userSetAbstraction" => (
+            "UserSetAbstraction",
+            json!([{"name":"hyperliquidChain","type":"string"},{"name":"user","type":"address"},{"name":"abstraction","type":"string"},{"name":"nonce","type":"uint64"}]),
+        ),
         "approveBuilderFee" => (
             "ApproveBuilderFee",
             json!([{"name":"hyperliquidChain","type":"string"},{"name":"maxFeeRate","type":"string"},{"name":"builder","type":"address"},{"name":"nonce","type":"uint64"}]),
@@ -770,6 +774,63 @@ pub fn usd_class_transfer_payload(
     let payload = typed_signing_payload(&user_typed(network, "usdClassTransfer", msg)?)?;
     Ok((
         usd_class_transfer_action(network, amount, to_perp, nonce),
+        payload,
+    ))
+}
+/// The account modes Hyperliquid's `userSetAbstraction` accepts, spelled as
+/// the venue spells them. `disabled` is the standard account, with separate
+/// spot and perp USDC; `unifiedAccount` merges them, and while it is active
+/// the venue refuses `usdSend` and `usdClassTransfer` with "Action disabled
+/// when unified account is active". The venue reports an account that never
+/// set a mode as `default`, which is a reading, not a value it accepts here.
+pub const ACCOUNT_ABSTRACTIONS: &[&str] = &["disabled", "unifiedAccount", "portfolioMargin"];
+pub fn parse_account_abstraction(raw: &str) -> Result<&'static str, String> {
+    ACCOUNT_ABSTRACTIONS
+        .iter()
+        .copied()
+        .find(|mode| *mode == raw)
+        .ok_or_else(|| {
+            format!(
+                "abstraction must be one of {}",
+                ACCOUNT_ABSTRACTIONS.join(", ")
+            )
+        })
+}
+fn set_abstraction_message(
+    network: Network,
+    user: Address,
+    abstraction: &str,
+    nonce: u64,
+) -> Value {
+    json!({"hyperliquidChain":network.chain(),"user":format!("{user:#x}"),"abstraction":abstraction,"nonce":nonce})
+}
+fn set_abstraction_action(network: Network, user: Address, abstraction: &str, nonce: u64) -> Value {
+    json!({"type":"userSetAbstraction","hyperliquidChain":network.chain(),"signatureChainId":format!("0x{:x}",network.signature_chain_id()),"user":format!("{user:#x}"),"abstraction":abstraction,"nonce":nonce})
+}
+pub fn set_abstraction_hash(
+    network: Network,
+    user: Address,
+    abstraction: &str,
+    nonce: u64,
+) -> Result<(Value, B256), String> {
+    let msg = set_abstraction_message(network, user, abstraction, nonce);
+    let td = user_typed(network, "userSetAbstraction", msg)?;
+    let hash: B256 = td.eip712_signing_hash().map_err(|e| e.to_string())?;
+    Ok((
+        set_abstraction_action(network, user, abstraction, nonce),
+        hash,
+    ))
+}
+pub fn set_abstraction_payload(
+    network: Network,
+    user: Address,
+    abstraction: &str,
+    nonce: u64,
+) -> Result<(Value, SigningPayload), String> {
+    let msg = set_abstraction_message(network, user, abstraction, nonce);
+    let payload = typed_signing_payload(&user_typed(network, "userSetAbstraction", msg)?)?;
+    Ok((
+        set_abstraction_action(network, user, abstraction, nonce),
         payload,
     ))
 }
@@ -1632,6 +1693,108 @@ mod tests {
             expected
         );
         assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
+    }
+
+    #[test]
+    fn set_abstraction_wire_action_matches_official_field_order() {
+        let user = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        for network in [Network::Mainnet, Network::Testnet] {
+            let (action, hash) = set_abstraction_hash(network, user, "disabled", 99).unwrap();
+            assert_eq!(action["type"], "userSetAbstraction");
+            assert_eq!(action["hyperliquidChain"], network.chain());
+            assert_eq!(
+                action["signatureChainId"],
+                format!("0x{:x}", network.signature_chain_id())
+            );
+            assert_eq!(action["user"], "0x0000000000000000000000000000000000000001");
+            assert_eq!(action["abstraction"], "disabled");
+            assert_eq!(action["nonce"], 99);
+            assert!(action.get("amount").is_none());
+            assert!(action.get("time").is_none());
+
+            let td = user_typed(
+                network,
+                "userSetAbstraction",
+                set_abstraction_message(network, user, "disabled", 99),
+            )
+            .unwrap();
+            assert_eq!(
+                td.resolver
+                    .encode_type("HyperliquidTransaction:UserSetAbstraction")
+                    .unwrap(),
+                "HyperliquidTransaction:UserSetAbstraction(string hyperliquidChain,address user,string abstraction,uint64 nonce)"
+            );
+            assert_eq!(td.eip712_signing_hash().unwrap(), hash);
+            if matches!(network, Network::Testnet) {
+                assert_eq!(
+                    format!("{hash:#x}"),
+                    "0x81fa346177aff3cb390ff464ae19496a8d8805327c3d87cc8eae5f4d9a8c548f",
+                    "fixed vector generated independently with hyperliquid-python-sdk 0.24.1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_abstraction_modes_users_and_networks_produce_distinct_hashes() {
+        let user = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        let other_user = parse_address("0x0000000000000000000000000000000000000002").unwrap();
+        let (_, disabled) = set_abstraction_hash(Network::Mainnet, user, "disabled", 99).unwrap();
+        let (_, unified) =
+            set_abstraction_hash(Network::Mainnet, user, "unifiedAccount", 99).unwrap();
+        let (_, portfolio) =
+            set_abstraction_hash(Network::Mainnet, user, "portfolioMargin", 99).unwrap();
+        let (_, testnet) = set_abstraction_hash(Network::Testnet, user, "disabled", 99).unwrap();
+        let (_, someone_else) =
+            set_abstraction_hash(Network::Mainnet, other_user, "disabled", 99).unwrap();
+        let (_, other_nonce) =
+            set_abstraction_hash(Network::Mainnet, user, "disabled", 100).unwrap();
+        for other in [unified, portfolio, testnet, someone_else, other_nonce] {
+            assert_ne!(disabled, other);
+        }
+        // A mode change must never collide with a transfer signed on the same nonce.
+        let (_, transfer) = usd_class_transfer_hash(Network::Mainnet, "12.5", true, 99).unwrap();
+        assert_ne!(disabled, transfer);
+    }
+
+    #[test]
+    fn set_abstraction_payload_preimage_preserves_the_signing_hash() {
+        let user = parse_address("0x0000000000000000000000000000000000000001").unwrap();
+        for mode in ACCOUNT_ABSTRACTIONS {
+            let (action, expected) = set_abstraction_hash(Network::Testnet, user, mode, 7).unwrap();
+            let (payload_action, payload) =
+                set_abstraction_payload(Network::Testnet, user, mode, 7).unwrap();
+            assert_eq!(action, payload_action);
+            assert_eq!(payload.hash, expected);
+            assert_eq!(
+                B256::from_slice(&Keccak256::digest(&payload.preimage)),
+                expected
+            );
+            assert_eq!(&payload.preimage[..2], &[0x19, 0x01]);
+        }
+    }
+
+    #[test]
+    fn account_abstraction_values_are_the_venues_own() {
+        for mode in ["disabled", "unifiedAccount", "portfolioMargin"] {
+            assert_eq!(parse_account_abstraction(mode).unwrap(), mode);
+        }
+        // `default` is what the venue reports for an account that never set a
+        // mode; it is not a mode that can be requested.
+        for bad in [
+            "default",
+            "Disabled",
+            "unified_account",
+            "standard",
+            "",
+            " disabled",
+        ] {
+            let error = parse_account_abstraction(bad).unwrap_err();
+            assert!(
+                error.contains("disabled, unifiedAccount, portfolioMargin"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -34,8 +34,9 @@ and refuses every one of these, because the signed order does not carry a spot
 pair's quote token or a HIP-3 dex's collateral asset; a leg accepted here but
 refused there would be signed and then denied at the claim.
 `approve_builder_fee.json` approves the maximum fee a builder may charge; like
-`usd_class_transfer.json`, it must be signed by the main wallet and is
-deliberately absent from the delegated agent session surface.
+`usd_class_transfer.json` and `set_abstraction.json`, it must be signed by the
+main wallet and is deliberately absent from the delegated agent session
+surface.
 
 **Builder fees are owner-signed only.** No delegated session key carries the
 fee-bearing class, and `agent_sessions/.../new.json` refuses a
@@ -82,6 +83,18 @@ active builder approvals at a time. Builder fees are capped by the venue at
 `approve_builder_fee.json` caps the approval at the perp ceiling, because that
 is the most any order this Petal can place could charge, and a standing grant
 above it could never be used from here.
+
+`set_abstraction.json` switches the account between Hyperliquid's account
+modes with the owner-signed `userSetAbstraction` action, and
+`users/<account>/abstraction.json` reads the current one (`default` for an
+account that never set a mode). Hyperliquid puts new accounts in unified
+account mode (`unifiedAccount`), which merges spot and perp USDC and makes the
+venue refuse `usd_send.json` and `usd_class_transfer.json` with "Action
+disabled when unified account is active"; `{"abstraction": "disabled"}`
+restores standard mode, which those routes and a builder's own account need.
+The signed `user` must be the signing wallet: the route takes it from the body
+or from the owner address recovered from an earlier signature, and refuses to
+submit when the recovered signer is anyone else.
 
 The withdrawal route is `withdraw.json` with body
 `{"destination": "<Arbitrum address>", "amount": "<USDC decimal>"}`. It signs

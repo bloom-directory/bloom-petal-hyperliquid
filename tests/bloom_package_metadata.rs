@@ -58,6 +58,10 @@ const OWNER_SIGNING_ROUTES: &[(&str, &str)] = &[
         "hyperliquid.usd_send",
     ),
     (
+        "[network]/exchange/[wallet]/[index]/set_abstraction.json",
+        "hyperliquid.set_abstraction",
+    ),
+    (
         "[network]/exchange/[wallet]/[index]/update_leverage.json",
         "hyperliquid.update_leverage",
     ),

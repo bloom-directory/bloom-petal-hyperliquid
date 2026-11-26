@@ -801,6 +801,9 @@ fn reconcile_reads(leaf: &str) -> &'static str {
         "cancel.json" | "cancel_by_cloid.json" | "schedule_cancel.json" => {
             "users/<account>/frontend_open_orders.json, to see whether the orders are still open"
         }
+        "set_abstraction.json" => {
+            "users/<account>/abstraction.json, to see the account's current mode"
+        }
         "update_leverage.json" => {
             "users/<account>/clearinghouse.json, to see the asset's current leverage"
         }
@@ -1090,6 +1093,145 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
 /// default today, and why, for `settings/status.json`.
 pub fn builder_address_status() -> settings::BuilderAddressStatus {
     settings::default_builder_address_status()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetAbstraction {
+    #[serde(default)]
+    user: Option<String>,
+    abstraction: String,
+    #[serde(default)]
+    nonce: Option<u64>,
+}
+fn set_abstraction_user_mismatch(user: &str, owner: &str) -> String {
+    format!(
+        "user {user} is not this wallet's owner address {owner}; nothing was sent. Hyperliquid changes the mode of the signing account only, so name that address as user or omit it"
+    )
+}
+/// What the owner sees when signing an account mode change.
+fn set_abstraction_advisory(n: Network, user: &str, abstraction: &str) -> Vec<u8> {
+    let mode = match abstraction {
+        "disabled" => {
+            "standard mode (disabled): spot and perp USDC are separate balances again, and usdSend and usdClassTransfer are allowed"
+        }
+        "unifiedAccount" => {
+            "unified account mode (unifiedAccount): spot and perp USDC are merged, and Hyperliquid refuses usdSend and usdClassTransfer while it is active"
+        }
+        _ => "portfolio margin mode (portfolioMargin)",
+    };
+    format!(
+        "Switches account {user} on Hyperliquid {} to {mode}.\nThis moves no funds and pays no fee; it changes how the venue treats this account's balances and which actions it accepts.",
+        n.chain()
+    )
+    .into_bytes()
+}
+/// Switches the account between Hyperliquid's account modes with the
+/// `userSetAbstraction` user action. Hyperliquid requires the main wallet's
+/// signature, so — like `usd_class_transfer` — this is owner-only and
+/// deliberately absent from the delegated agent session surface.
+///
+/// The signed `user` must be the signing account. Signer holds the key, so
+/// the Petal cannot read that address off anything before a signature
+/// exists: it takes `user` from the body, or from the address recovered from
+/// an earlier owner signature, and refuses to submit when the signer it
+/// recovers from this signature is anyone else.
+pub fn set_abstraction(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchResponse {
+    let req = match serde_json::from_slice::<SetAbstraction>(body) {
+        Ok(x) => x,
+        Err(e) => return invalid(format!("invalid set_abstraction body: {e}")),
+    };
+    let abstraction = match protocol::parse_account_abstraction(&req.abstraction) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let cached_owner = cached_owner_address(&w);
+    let user_hex = match (&req.user, &cached_owner) {
+        (Some(raw), _) => match protocol::parse_address(raw) {
+            Ok(address) => format!("{address:#x}"),
+            Err(e) => return invalid(e),
+        },
+        (None, Some(owner)) => owner.clone(),
+        (None, None) => {
+            return invalid(
+                "user is required: this wallet has not signed through this Petal yet, so its address is not known here. Name the wallet's own account address as user",
+            );
+        }
+    };
+    // Refuse a `user` that is not this wallet's owner before the ceremony
+    // whenever the owner address is already known from an earlier signature,
+    // so the owner is not asked for a passkey tap the check below would then
+    // waste. The authoritative check on the recovered signer still runs below.
+    if let Some(owner) = cached_owner.as_deref()
+        && owner != user_hex
+    {
+        return invalid(set_abstraction_user_mismatch(&user_hex, owner));
+    }
+    let user = match protocol::parse_address(&user_hex) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let (nonce, pending_nonce_key, completed) =
+        match owner_nonce(n, &w, "set_abstraction.json", body, req.nonce) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+    if completed {
+        return ok_write();
+    }
+    let (action, payload) = match protocol::set_abstraction_payload(n, user, abstraction, nonce) {
+        Ok(x) => x,
+        Err(e) => return invalid(e),
+    };
+    let sig = match owner_sign_or_approval(
+        ctx,
+        &w,
+        &payload,
+        "hyperliquid.set_abstraction",
+        OwnerApproval {
+            pending_nonce_key: pending_nonce_key.as_deref(),
+            nonce,
+            kind: "set_abstraction",
+            advisory: Some(set_abstraction_advisory(n, &user_hex, abstraction)),
+            // A mode change moves nothing and pays nothing.
+            effects: ClaimEffects::none(),
+        },
+    ) {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+    let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+        Ok(address) => address,
+        Err(e) => return backend(e),
+    };
+    remember_owner_address(&w, &owner_address);
+    if owner_address != user_hex {
+        // Nothing has been sent, and the nonce record still says so; the
+        // corrected body is a new identity and takes a fresh nonce.
+        return invalid(set_abstraction_user_mismatch(&user_hex, &owner_address));
+    }
+    if let Some(key) = pending_nonce_key.as_ref()
+        && let Err(e) = save_pending(key, nonce, false)
+    {
+        return e;
+    }
+    match http_json(n, "/exchange", protocol::user_payload(action, nonce, sig)) {
+        Ok(v) => {
+            if let Err(e) = protocol::validate_exchange_response(&v) {
+                return backend(e);
+            }
+            if let Err(e) = save_json(last_response_key(n, &w), &v, false) {
+                return e;
+            }
+            if let Some(key) = pending_nonce_key
+                && let Err(e) = save_pending(&key, nonce, true)
+            {
+                return e;
+            }
+            ok_write()
+        }
+        Err(e) => e,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5304,6 +5446,133 @@ mod tests {
                 "the error must say which identifier belongs where"
             );
         }
+    }
+
+    #[test]
+    fn set_abstraction_body_names_a_mode_and_optionally_the_account() {
+        assert!(
+            serde_json::from_slice::<SetAbstraction>(
+                br#"{"user":"0x0000000000000000000000000000000000000001"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_slice::<SetAbstraction>(br#"{"abstraction":"disabled","amount":"1"}"#)
+                .is_err()
+        );
+        let req =
+            serde_json::from_slice::<SetAbstraction>(br#"{"abstraction":"disabled"}"#).unwrap();
+        assert_eq!(req.user, None);
+        assert_eq!(req.abstraction, "disabled");
+        assert_eq!(req.nonce, None);
+    }
+
+    /// The signed `user` has to be the signing account, and Signer holds the
+    /// key, so the route takes the address from the body or from the owner
+    /// signature it last recovered, and refuses the rest before any ceremony.
+    #[test]
+    fn an_account_mode_change_is_refused_before_signing_unless_it_names_the_owner() {
+        struct Route;
+        impl petal::RouteIdentity for Route {
+            const PATH: &'static str = "test";
+            const CANONICAL_PATH: &'static str = "test";
+            const PARAMS: &'static [(&'static str, usize)] = &[];
+        }
+        crate::host::test_reset();
+        let ctx = Ctx::bind::<Route>(petal::RawCtx {
+            petal_root: String::new(),
+            package_hash: String::new(),
+            path: String::new(),
+            params: vec![],
+            actor: None,
+        });
+        let write = |body: &str| {
+            set_abstraction(&ctx, Network::Testnet, "main".to_owned(), body.as_bytes())
+        };
+        let refused = |body: &str| match write(body) {
+            petal::DispatchResponse::Error { code, message } => {
+                assert_eq!(code, -3, "{message}");
+                message
+            }
+            other => panic!("{body} must be refused, got {other:?}"),
+        };
+        // The venue's reading for a never-set account is not a mode to request.
+        let message = refused(r#"{"abstraction":"default"}"#);
+        assert!(
+            message.contains("disabled, unifiedAccount, portfolioMargin"),
+            "{message}"
+        );
+        // No owner signature yet, so the body has to name the account.
+        let message = refused(r#"{"abstraction":"disabled"}"#);
+        assert!(message.contains("user is required"), "{message}");
+        let message = refused(r#"{"user":"0x01","abstraction":"disabled"}"#);
+        assert!(message.contains("42-character"), "{message}");
+        // Once the owner is known, another account's address is refused
+        // before the ceremony, and the mixed-case spelling of the owner's own
+        // address is accepted.
+        let owner = "0x00000000000000000000000000000000000000ab";
+        remember_owner_address("main", owner);
+        let message = refused(
+            r#"{"user":"0x0000000000000000000000000000000000000001","abstraction":"disabled"}"#,
+        );
+        assert!(
+            message.contains("not this wallet's owner address"),
+            "{message}"
+        );
+        assert!(message.contains(owner), "{message}");
+        // The owner's address, named or implied, passes every check above and
+        // reaches the nonce reservation, the first store write; every write is
+        // made to fail so the call stops there, short of signing.
+        for body in [
+            r#"{"abstraction":"disabled"}"#,
+            r#"{"user":"0x00000000000000000000000000000000000000AB","abstraction":"unifiedAccount"}"#,
+        ] {
+            crate::host::test_fail_writes_matching(Some(""));
+            let response = write(body);
+            crate::host::test_fail_writes_matching(None);
+            let petal::DispatchResponse::Error { code, message } = response else {
+                panic!("the injected write failure must surface for {body}");
+            };
+            // The store's error, not a refusal of the body.
+            assert_eq!(code, -4, "{message}");
+            assert!(message.contains("injected write failure"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_uncertain_account_mode_change_points_at_the_mode_read() {
+        let error = resume_pending(
+            &pending(10, false, Some(true)),
+            "set_abstraction.json",
+            true,
+            10,
+        )
+        .unwrap_err();
+        assert!(error.contains("abstraction.json"), "{error}");
+        assert!(!error.contains("spot_state.json"), "{error}");
+    }
+
+    #[test]
+    fn mode_change_advisories_name_the_account_and_the_consequence() {
+        let owner = "0x00000000000000000000000000000000000000ab";
+        let standard = String::from_utf8(set_abstraction_advisory(
+            Network::Testnet,
+            owner,
+            "disabled",
+        ))
+        .unwrap();
+        assert!(standard.contains(owner));
+        assert!(standard.contains("Testnet"));
+        assert!(standard.contains("standard mode"));
+        assert!(standard.contains("moves no funds"));
+        let unified = String::from_utf8(set_abstraction_advisory(
+            Network::Mainnet,
+            owner,
+            "unifiedAccount",
+        ))
+        .unwrap();
+        assert!(unified.contains("refuses usdSend and usdClassTransfer"));
+        assert!(unified.contains("Mainnet"));
     }
 
     #[test]
