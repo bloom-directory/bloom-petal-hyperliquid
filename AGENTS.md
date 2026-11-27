@@ -11,7 +11,11 @@ Exchange writes accept JSON bodies documented by `order.json`, `cancel.json`,
 spot and perp engines; `set_abstraction.json` switches the account's mode
 (`disabled` is standard; new accounts start in `unifiedAccount`, in which the
 venue refuses `usd_send.json` and `usd_class_transfer.json`), and
-`users/<account>/abstraction.json` reads it. Those two and
+`users/<account>/abstraction.json` reads it. Those two transfer routes check
+the mode before staging a ceremony once an owner signature has taught this
+Petal the account's address; before that, the venue's refusal comes after the
+ceremony, so read `abstraction.json` and switch the mode first. A builder fee
+cannot be combined with `vaultAddress`. Those two and
 `approve_builder_fee.json` are owner-only, signed by the main wallet, and
 deliberately absent from the delegated agent session surface.
 `send_asset.json` is a deprecated alias for `usd_send.json`; it does not

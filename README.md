@@ -92,6 +92,17 @@ account mode (`unifiedAccount`), which merges spot and perp USDC and makes the
 venue refuse `usd_send.json` and `usd_class_transfer.json` with "Action
 disabled when unified account is active"; `{"abstraction": "disabled"}`
 restores standard mode, which those routes and a builder's own account need.
+Once this Petal knows the account's address — it is recovered from the first
+owner signature made through it, since Bloom hands the route only the wallet
+name and account number — `usd_send.json` and `usd_class_transfer.json` read
+the mode first and refuse in unified account mode before staging a ceremony;
+the same recovered address lets `builder_order.json` refuse an unapproved
+builder, and `set_abstraction.json` a wrong `user`, before the ceremony rather
+than after it. A wallet that has never signed through this Petal gets the
+venue's refusal after the ceremony instead, so approve the builder or switch
+the mode first. A builder fee cannot be combined with `vaultAddress`: the
+approval is read and the fee declared for the signing wallet, not the vault
+that would trade.
 The signed `user` must be the signing wallet: the route takes it from the body
 or from the owner address recovered from an earlier signature, and refuses to
 submit when the recovered signer is anyone else.

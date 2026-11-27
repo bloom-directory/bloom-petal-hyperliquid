@@ -3,7 +3,7 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "write a Hyperliquid order that carries a builder fee ({\"b\": lowercase builder address, \"f\": fee in tenths of a basis point}); signed under the fee-bearing hyperliquid.builder_order class and requires Bloom approval. The body is order.json's, which documents it in full; every order needs its own c, a client order id of 0x plus 32 hex digits, so an uncertain submission can be reconciled"
+            "description": "write a Hyperliquid order that carries a builder fee ({\"b\": lowercase builder address, \"f\": fee in tenths of a basis point}); signed under the fee-bearing hyperliquid.builder_order class and requires Bloom approval. The body is order.json's, which documents it in full; every order needs its own c, a client order id of 0x plus 32 hex digits, so an uncertain submission can be reconciled. Cannot be combined with vaultAddress. The builder must already be approved through approve_builder_fee.json; once this Petal has recovered the owner address from any owner signature (that approval included), an unapproved builder is refused before the ceremony rather than by the venue after it"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

@@ -595,6 +595,22 @@ fn remember_owner_address(w: &str, address: &str) {
     let _ = save_json(owner_address_key(w), &address.to_owned(), false);
 }
 
+/// A builder fee is approved, checked and declared for the signing account:
+/// `maxBuilderFee` is read for the owner, and the claim names the fee as the
+/// owner's debit. An order placed for a vault or subaccount trades on that
+/// account instead, so the check would pass on the wrong account and the
+/// venue would refuse after the ceremony. Refuse the pair until the vault's
+/// own approval can be read and declared.
+fn validate_owner_target(req: &SignSubmit) -> Result<(), String> {
+    if req.vault_address.is_some() && req.action.carries_builder() {
+        return Err(
+            "a builder fee cannot be combined with vaultAddress: the fee is approved, checked and declared for the signing wallet, not the vault that would trade; omit builder or vaultAddress"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn owner_action_write(
     ctx: &Ctx,
     n: Network,
@@ -609,6 +625,16 @@ pub fn owner_action_write(
     if let Err(error) = req.action.validate_owner_review() {
         return invalid(error);
     }
+    if let Err(error) = validate_owner_target(&req) {
+        return invalid(error);
+    }
+    // The claim (and with it every market and bound refusal) comes before the
+    // nonce and the ceremony, so an order this Petal will refuse anyway
+    // neither reserves a nonce nor sends the owner to approve its builder.
+    let effects = match order_claim_effects(&req.action) {
+        Ok(effects) => effects,
+        Err(e) => return invalid(e),
+    };
     let (nonce, pending_nonce_key, completed) = match owner_nonce(n, &w, operation, body, req.nonce)
     {
         Ok(x) => x,
@@ -630,13 +656,6 @@ pub fn owner_action_write(
             Err(e) => return invalid(e),
         };
     let carries_builder = req.action.carries_builder();
-    // The claim (and with it every market and bound refusal) comes first, so
-    // an order this Petal will refuse anyway never sends the owner to approve
-    // its builder.
-    let effects = match order_claim_effects(&req.action) {
-        Ok(effects) => effects,
-        Err(e) => return invalid(e),
-    };
     // Refuse an unapproved builder before the ceremony whenever the owner
     // address is already known from an earlier signature, so the owner is
     // not asked for a passkey tap the venue would then make pointless. The
@@ -976,6 +995,9 @@ pub fn usd_send(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> DispatchRespon
     if completed {
         return ok_write();
     }
+    if let Err(e) = ensure_account_mode_allows(n, &w, "usdSend") {
+        return e;
+    }
     let (action, payload) = match protocol::usd_send_payload(n, dest, &req.amount, nonce) {
         Ok(x) => x,
         Err(e) => return invalid(e),
@@ -1042,6 +1064,9 @@ pub fn usd_class_transfer(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Disp
         };
     if completed {
         return ok_write();
+    }
+    if let Err(e) = ensure_account_mode_allows(n, &w, "usdClassTransfer") {
+        return e;
     }
     let (action, payload) =
         match protocol::usd_class_transfer_payload(n, &req.amount, req.to_perp, nonce) {
@@ -1118,7 +1143,9 @@ fn set_abstraction_advisory(n: Network, user: &str, abstraction: &str) -> Vec<u8
         "unifiedAccount" => {
             "unified account mode (unifiedAccount): spot and perp USDC are merged, and Hyperliquid refuses usdSend and usdClassTransfer while it is active"
         }
-        _ => "portfolio margin mode (portfolioMargin)",
+        _ => {
+            "portfolio margin mode (portfolioMargin): the venue margins this account's positions as one portfolio, which changes its margin requirements and when it is liquidated; which transfers the venue allows in this mode is not checked by this Petal"
+        }
     };
     format!(
         "Switches account {user} on Hyperliquid {} to {mode}.\nThis moves no funds and pays no fee; it changes how the venue treats this account's balances and which actions it accepts.",
@@ -1480,9 +1507,14 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
         Ok(sig) => sig,
         Err(response) => return response,
     };
-    if let Ok(owner_address) = protocol::recover_signer_from_json(&payload.hash, &sig) {
-        remember_owner_address(&w, &owner_address);
-    }
+    // A signature the signer cannot be recovered from is not one Hyperliquid
+    // would accept either; refuse before submitting, as the other owner
+    // routes do, instead of learning that from the venue.
+    let owner_address = match protocol::recover_signer_from_json(&payload.hash, &sig) {
+        Ok(address) => address,
+        Err(e) => return backend(e),
+    };
+    remember_owner_address(&w, &owner_address);
     if let Some(key) = pending_nonce_key.as_ref()
         && let Err(e) = save_pending(key, nonce, false)
     {
@@ -3415,6 +3447,52 @@ fn unverified_builder_order_cap(e: DispatchResponse) -> DispatchResponse {
     ))
 }
 
+fn live_account_abstraction(n: Network, account: &str) -> Result<String, DispatchResponse> {
+    http_json(
+        n,
+        "/info",
+        json!({"type": "userAbstraction", "user": account}),
+    )?
+    .as_str()
+    .map(str::to_owned)
+    .ok_or_else(|| backend("Hyperliquid returned a non-string userAbstraction response"))
+}
+
+/// Why `action` cannot be sent while the account is in `mode`, if it cannot.
+/// Hyperliquid refuses usdSend and usdClassTransfer in unified account mode,
+/// the mode every new account starts in, and the refusal would otherwise
+/// arrive only after the owner's ceremony.
+fn account_mode_refusal(mode: &str, action: &str) -> Option<String> {
+    (mode == "unifiedAccount").then(|| {
+        format!(
+            "this account is in unified account mode, in which Hyperliquid refuses {action}; nothing was sent. Write {{\"abstraction\":\"disabled\"}} to set_abstraction.json (owner ceremony) to restore standard mode, then retry"
+        )
+    })
+}
+
+/// Says that the transfer was not sent and that nothing changed.
+fn unverified_account_mode(e: DispatchResponse) -> DispatchResponse {
+    let cause = cap_check_cause(&e);
+    backend(format!(
+        "could not check the account's mode with Hyperliquid, so nothing was sent; this is safe to retry: {cause}"
+    ))
+}
+
+/// Refuse a transfer the venue would refuse for the account's mode before the
+/// owner is asked to approve it. The account address is only known here once
+/// an owner signature has been recovered through this Petal; before that the
+/// check cannot run and the venue's own refusal is the first word.
+fn ensure_account_mode_allows(n: Network, w: &str, action: &str) -> Result<(), DispatchResponse> {
+    let Some(owner) = cached_owner_address(w) else {
+        return Ok(());
+    };
+    let mode = live_account_abstraction(n, &owner).map_err(unverified_account_mode)?;
+    match account_mode_refusal(&mode, action) {
+        Some(reason) => Err(invalid(reason)),
+        None => Ok(()),
+    }
+}
+
 /// Hyperliquid silently rejects a builder-fee order unless the account has
 /// already signed a separate `approveBuilderFee` action authorizing at least
 /// the requested rate for that builder. Checking this ourselves turns that
@@ -5065,6 +5143,50 @@ mod tests {
                 "1042.json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn owner_orders_refuse_a_builder_fee_on_a_vault() {
+        // The builder approval is read and the fee declared for the signing
+        // wallet; a vault order trades on the vault. Refused before any
+        // nonce or ceremony, so the owner is never asked to approve it.
+        let order = r#"{"type":"order","orders":[],"grouping":"na","builder":{"b":"0x9bb7c5d75a745ebdbce3674dc3c1f0659af50c63","f":10}}"#;
+        let with_vault = serde_json::from_str::<SignSubmit>(&format!(
+            r#"{{"action":{order},"vaultAddress":"0x0000000000000000000000000000000000000001"}}"#
+        ))
+        .unwrap();
+        let error = validate_owner_target(&with_vault).unwrap_err();
+        assert!(error.contains("vaultAddress"), "{error}");
+        assert!(error.contains("builder"), "{error}");
+
+        let without_vault =
+            serde_json::from_str::<SignSubmit>(&format!(r#"{{"action":{order}}}"#)).unwrap();
+        assert_eq!(validate_owner_target(&without_vault), Ok(()));
+        let vault_without_builder = SignSubmit {
+            action: ExchangeAction::ScheduleCancel { time: Some(123) },
+            nonce: None,
+            vault_address: Some("0x0000000000000000000000000000000000000001".into()),
+            expires_after: None,
+        };
+        assert_eq!(validate_owner_target(&vault_without_builder), Ok(()));
+    }
+
+    #[test]
+    fn unified_account_mode_refuses_transfers_before_the_ceremony() {
+        let reason = account_mode_refusal("unifiedAccount", "usdSend").unwrap();
+        assert!(reason.contains("usdSend"), "{reason}");
+        assert!(reason.contains("set_abstraction.json"), "{reason}");
+        assert!(reason.contains(r#"{"abstraction":"disabled"}"#), "{reason}");
+        assert!(reason.contains("nothing was sent"), "{reason}");
+        // Standard mode, a never-set account and portfolio margin pass to the
+        // venue: only unified account mode is documented to refuse these.
+        for mode in ["disabled", "default", "portfolioMargin"] {
+            assert_eq!(
+                account_mode_refusal(mode, "usdClassTransfer"),
+                None,
+                "{mode}"
+            );
+        }
     }
 
     #[test]
