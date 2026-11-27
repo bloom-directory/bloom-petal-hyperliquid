@@ -25,6 +25,16 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid signed body: {error}")),
         };
+        // A relayed signature skips every builder check: the fee is neither
+        // bounded, nor approved, nor declared to the owner here, and the
+        // order could be spot, a trigger or a crossing sell. Builder fees go
+        // through the owner-signed route only.
+        if request.action.carries_builder() {
+            return petal::error(
+                -3,
+                "raw_signed.json cannot relay an order that carries a builder fee: nothing here bounds or declares the fee; write the unsigned body to builder_order.json instead",
+            );
+        }
         crate::submit_l1(
             network,
             wallet,

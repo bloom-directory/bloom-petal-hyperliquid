@@ -82,7 +82,9 @@ active builder approvals at a time. Builder fees are capped by the venue at
 0.1% (100 tenths of a basis point) on perps and 1% (1000) on spot;
 `approve_builder_fee.json` caps the approval at the perp ceiling, because that
 is the most any order this Petal can place could charge, and a standing grant
-above it could never be used from here.
+above it could never be used from here. `raw_signed.json` refuses an order
+that carries a builder: a relayed signature bounds, approves and declares
+nothing, so builder fees reach the venue only through `builder_order.json`.
 
 `set_abstraction.json` switches the account between Hyperliquid's account
 modes with the owner-signed `userSetAbstraction` action, and

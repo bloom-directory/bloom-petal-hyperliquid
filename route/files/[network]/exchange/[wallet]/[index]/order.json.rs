@@ -16,7 +16,7 @@ petal::route_file!(
             "action": {
                 "orders": "required non-empty list; one request may hold several orders while the owner review stays under 256 fields",
                 "grouping": "required: \"na\" for independent orders, \"normalTpsl\" for an entry followed by its TP/SL orders, \"positionTpsl\" for TP/SL on the open position",
-                "builder": "rejected: builder fees are not supported"
+                "builder": "not accepted here: write the same body to builder_order.json, which signs it under the fee-bearing hyperliquid.builder_order class"
             },
             "order": {
                 "a": "required asset id: a perp's index in <network>/perp_meta.json universe; a spot pair is 10000 + its index in <network>/spot_meta.json. Mainnet and testnet differ",

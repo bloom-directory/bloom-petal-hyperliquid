@@ -519,6 +519,33 @@ fn submitted_record(existing: Option<PendingNonce>, nonce: u64, completed: bool)
     }
 }
 
+/// Whether the nonce under `key` was ever sent to Hyperliquid, by the marker
+/// `save_pending` creates before the first send and never removes.
+fn nonce_was_sent(key: Option<&str>) -> Result<bool, DispatchResponse> {
+    match key {
+        Some(key) => Ok(load_bytes(&sent_marker_key(key))?.is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Forget a nonce record the venue has contradicted, so the next
+/// `owner_nonce` for the same body reserves a fresh nonce.
+///
+/// Only for an action whose effect is idempotent and readable back — a mode
+/// switch, a fee-cap approval — and only once `/info` has shown that the
+/// effect the record claims is not in force. A fresh nonce for such an
+/// action cannot duplicate anything; for an order it could, which is why
+/// orders never come here and resend on the nonce they have.
+fn discard_pending(key: &str) -> Result<(), DispatchResponse> {
+    for key in [key.to_owned(), sent_marker_key(key)] {
+        match crate::host::store_del(&key) {
+            Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
+            Err(e) => return Err(backend(e.message())),
+        }
+    }
+    Ok(())
+}
+
 struct OwnerApproval<'a> {
     pending_nonce_key: Option<&'a str>,
     nonce: u64,
@@ -655,12 +682,22 @@ pub fn owner_action_write(
             Ok(h) => h,
             Err(e) => return invalid(e),
         };
-    let carries_builder = req.action.carries_builder();
+    // A retry of an order that was already sent resends it on the same
+    // nonce, which Hyperliquid executes at most once. The cap checks below
+    // are preflight for a first send only: run on a resend they would refuse
+    // with "nothing was sent" or "approve first" after something may have
+    // been sent, and an agent acting on that could place the order again
+    // with a new `c`, opening a duplicate position.
+    let sent = match nonce_was_sent(pending_nonce_key.as_deref()) {
+        Ok(sent) => sent,
+        Err(e) => return e,
+    };
+    let check_builder_cap = req.action.carries_builder() && !sent;
     // Refuse an unapproved builder before the ceremony whenever the owner
     // address is already known from an earlier signature, so the owner is
     // not asked for a passkey tap the venue would then make pointless. The
     // authoritative check on the recovered signer still runs below.
-    if carries_builder
+    if check_builder_cap
         && let Some(owner_address) = cached_owner_address(&w)
         && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
     {
@@ -687,7 +724,7 @@ pub fn owner_action_write(
         Err(e) => return backend(e),
     };
     remember_owner_address(&w, &owner_address);
-    if carries_builder
+    if check_builder_cap
         && let Err(e) = ensure_builder_fee_is_approved(n, &owner_address, &req.action)
     {
         return e;
@@ -814,8 +851,11 @@ fn resume_pending(
 /// Where an owner can see whether an uncertain action of this route executed.
 fn reconcile_reads(leaf: &str) -> &'static str {
     match leaf {
-        "order.json" => {
+        "order.json" | "builder_order.json" => {
             "users/<account>/frontend_open_orders.json and fills.json, matched by each order's c"
+        }
+        "approve_builder_fee.json" => {
+            "users/<account>/max_builder_fee/<builder>.json, to see the cap now in force"
         }
         "cancel.json" | "cancel_by_cloid.json" | "schedule_cancel.json" => {
             "users/<account>/frontend_open_orders.json, to see whether the orders are still open"
@@ -1198,13 +1238,35 @@ pub fn set_abstraction(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dispatc
         Ok(x) => x,
         Err(e) => return invalid(e),
     };
-    let (nonce, pending_nonce_key, completed) =
+    let (mut nonce, mut pending_nonce_key, completed) =
         match owner_nonce(n, &w, "set_abstraction.json", body, req.nonce) {
             Ok(x) => x,
             Err(e) => return e,
         };
+    // The record is keyed on the body alone, so the same body written again
+    // after another mode change (disabled, unifiedAccount, disabled; or a
+    // switch from another client) finds a completed record for a mode that
+    // is no longer in force. Answer from the record only when the venue
+    // shows the requested mode; otherwise the write is a new action and
+    // takes a fresh nonce. A mode switch is idempotent, so the fresh nonce
+    // cannot duplicate anything.
     if completed {
-        return ok_write();
+        match live_account_abstraction(n, &user_hex) {
+            Ok(live) if live == abstraction => return ok_write(),
+            Ok(_) => {
+                if let Some(key) = pending_nonce_key.as_deref()
+                    && let Err(e) = discard_pending(key)
+                {
+                    return e;
+                }
+                (nonce, pending_nonce_key, _) =
+                    match owner_nonce(n, &w, "set_abstraction.json", body, None) {
+                        Ok(x) => x,
+                        Err(e) => return e,
+                    };
+            }
+            Err(e) => return unverified_account_mode(e),
+        }
     }
     let (action, payload) = match protocol::set_abstraction_payload(n, user, abstraction, nonce) {
         Ok(x) => x,
@@ -1457,11 +1519,51 @@ pub fn approve_builder_fee(ctx: &Ctx, n: Network, w: String, body: &[u8]) -> Dis
     }
     let generation = approval.as_ref().map_or(0, |state| state.generation);
     let identity = approve_builder_fee_identity(body, &resolved_builder, generation);
-    let (nonce, pending_nonce_key, completed) =
+    let (mut nonce, mut pending_nonce_key, completed) =
         match owner_nonce(n, &w, "approve_builder_fee.json", &identity, req.nonce) {
             Ok(x) => x,
             Err(e) => return e,
         };
+    // A nonce that was sent but whose response was lost has no approval
+    // record, so the retry would miss the shortcut above and resubmit on a
+    // nonce Hyperliquid refuses as reused, failing although the cap may be
+    // in force. Let the venue settle it: if `maxBuilderFee` already equals
+    // the request (a revocation included), record the approval and answer
+    // success; if not, the send never landed or was overtaken, and the
+    // retry is a new action on a fresh nonce. Approving a cap is idempotent,
+    // so the fresh nonce cannot duplicate anything. Without the owner address
+    // nothing can be read, and the resend proceeds as before.
+    if !completed
+        && let Some(key) = pending_nonce_key.clone()
+        && matches!(nonce_was_sent(Some(&key)), Ok(true))
+        && let Some(account) = cached_owner_address(&w)
+    {
+        match live_builder_fee_cap(n, &account, &resolved_builder) {
+            Ok(live) if live == u64::from(req.max_fee_tenths_bps) => {
+                if let Err(e) = commit_builder_fee_approval(
+                    approval_key,
+                    req.max_fee_tenths_bps,
+                    generation,
+                    Some(key),
+                    nonce,
+                ) {
+                    return e;
+                }
+                return ok_write();
+            }
+            Ok(_) => {
+                if let Err(e) = discard_pending(&key) {
+                    return e;
+                }
+                (nonce, pending_nonce_key, _) =
+                    match owner_nonce(n, &w, "approve_builder_fee.json", &identity, None) {
+                        Ok(x) => x,
+                        Err(e) => return e,
+                    };
+            }
+            Err(e) => return unverified_builder_fee_cap(e),
+        }
+    }
     // Not the guard for the window between a venue success and the approval
     // record below. In that window the stored record still reads
     // `completed: false`, because it is marked completed only after the
@@ -5143,6 +5245,50 @@ mod tests {
                 "1042.json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn a_discarded_record_gives_the_same_body_a_fresh_nonce() {
+        // A completed record the venue contradicts (the mode or cap it claims
+        // is not in force) is forgotten with its sent marker, so the same
+        // body reserves a new nonce instead of reporting a stale success.
+        let (n, w, leaf) = (Network::Testnet, "main", "set_abstraction.json");
+        let body = br#"{"abstraction":"disabled"}"#;
+        crate::host::test_reset();
+
+        let (first, key, completed) = owner_nonce(n, w, leaf, body, None).unwrap();
+        assert!(!completed);
+        let key = key.expect("a reserved nonce is keyed");
+        save_pending(&key, first, true).unwrap();
+        assert!(nonce_was_sent(Some(&key)).unwrap());
+        let (_, _, completed) = owner_nonce(n, w, leaf, body, None).unwrap();
+        assert!(completed, "the record alone still reads completed");
+
+        discard_pending(&key).unwrap();
+        assert!(!nonce_was_sent(Some(&key)).unwrap());
+        let (second, _, completed) = owner_nonce(n, w, leaf, body, None).unwrap();
+        assert!(!completed, "a fresh record has nothing to resume");
+        assert_ne!(
+            first, second,
+            "the old nonce stays reserved; a fresh one is taken"
+        );
+        // Discarding what is already gone is not an error.
+        discard_pending(&key).unwrap();
+    }
+
+    #[test]
+    fn reconcile_reads_name_where_builder_routes_show_their_outcome() {
+        // A resting builder order changes no balance, so the transfer text
+        // would send the caller to resubmit; an approval shows in the cap.
+        assert_eq!(
+            reconcile_reads("builder_order.json"),
+            reconcile_reads("order.json")
+        );
+        assert!(reconcile_reads("builder_order.json").contains("fills.json"));
+        assert!(
+            reconcile_reads("approve_builder_fee.json").contains("max_builder_fee/<builder>.json")
+        );
+        assert!(reconcile_reads("usd_send.json").contains("clearinghouse.json"));
     }
 
     #[test]
