@@ -3,7 +3,7 @@ petal::route_file!(
         .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
     read: |_ctx: &petal::Ctx| {
         petal::read_json_value(&crate::serde_json::json!({
-            "description": "deprecated compatibility alias for usd_send.json; this submits Hyperliquid usdSend, not sendAsset"
+            "description": "deprecated compatibility alias for usd_send.json; this submits Hyperliquid usdSend, not sendAsset. Refused before any ceremony while the account is in unified account mode, which new accounts start in: read users/<account>/abstraction.json and write {\"abstraction\":\"disabled\"} to set_abstraction.json first"
         }))
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {

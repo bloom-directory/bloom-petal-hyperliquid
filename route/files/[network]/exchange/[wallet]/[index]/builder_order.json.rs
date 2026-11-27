@@ -1,0 +1,49 @@
+petal::route_file!(
+    spec: petal::signing_write_spec("hyperliquid.builder_order")
+        .caps(&["bloom:http", "bloom:store", "bloom:sign"]),
+    read: |_ctx: &petal::Ctx| {
+        petal::read_json_value(&crate::serde_json::json!({
+            "description": "write a Hyperliquid order that carries a builder fee ({\"b\": lowercase builder address, \"f\": fee in tenths of a basis point}); signed under the fee-bearing hyperliquid.builder_order class and requires Bloom approval. The body is order.json's, which documents it in full; every order needs its own c, a client order id of 0x plus 32 hex digits, so an uncertain submission can be reconciled. Rules: core perps only (no spot, HIP-3 or outcome assets); no trigger orders; a sell leg must be post-only (tif Alo) so its fee can be bounded; it cannot be combined with vaultAddress; and the builder must already be approved through approve_builder_fee.json for at least f; once this Petal has recovered the owner address from any owner signature (that approval included), an unapproved builder is refused before the ceremony rather than by the venue after it"
+        }))
+    },
+    write: |ctx: &petal::Ctx, body: &[u8]| {
+        if let Err(response) = crate::validate_body_size(body) {
+            return response;
+        }
+        let network = match petal::param(ctx, "network").and_then(|value| {
+            crate::Network::parse(value).map_err(|error| petal::error(-3, error))
+        }) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+            crate::parse_wallet_id(value).map_err(|error| petal::error(-3, error))
+        }) {
+            Ok(wallet) => wallet,
+            Err(response) => return response,
+        };
+        let request = match crate::serde_json::from_slice::<crate::SignSubmit>(body) {
+            Ok(request) => request,
+            Err(error) => return petal::error(-3, format!("invalid exchange body: {error}")),
+        };
+        let crate::ExchangeAction::Order { orders, .. } = &request.action else {
+            return petal::error(
+                -3,
+                format!(
+                    "builder_order.json cannot submit action type {}",
+                    request.action.kind()
+                ),
+            );
+        };
+        if !request.action.carries_builder() {
+            return petal::error(
+                -3,
+                "builder_order.json requires an order carrying a builder fee; write orders without one to order.json",
+            );
+        }
+        if let Err(error) = crate::validate_order_cloids(orders) {
+            return petal::error(-3, error);
+        }
+        crate::owner_action_write(ctx, network, wallet, "builder_order.json", body, request)
+    }
+);

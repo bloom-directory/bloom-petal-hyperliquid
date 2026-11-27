@@ -16,7 +16,7 @@ petal::route_file!(
             "action": {
                 "orders": "required non-empty list; one request may hold several orders while the owner review stays under 256 fields",
                 "grouping": "required: \"na\" for independent orders, \"normalTpsl\" for an entry followed by its TP/SL orders, \"positionTpsl\" for TP/SL on the open position",
-                "builder": "rejected: builder fees are not supported"
+                "builder": "not accepted here: write the same body to builder_order.json, which signs it under the fee-bearing hyperliquid.builder_order class"
             },
             "order": {
                 "a": "required asset id: a perp's index in <network>/perp_meta.json universe; a spot pair is 10000 + its index in <network>/spot_meta.json. Mainnet and testnet differ",
@@ -59,14 +59,14 @@ petal::route_file!(
                 ),
             );
         };
-        if orders.iter().any(|order| order.cloid.is_none()) {
+        if request.action.carries_builder() {
             return petal::error(
                 -3,
-                "every order needs c, a unique client order id (0x plus 32 hex digits), so an uncertain submission can be reconciled",
+                "order.json cannot carry a builder fee; write the same body to builder_order.json, which signs under the fee-bearing hyperliquid.builder_order class",
             );
         }
-        if crate::shares_cloid(orders) {
-            return petal::error(-3, "two orders share c; give each order its own client order id");
+        if let Err(error) = crate::validate_order_cloids(orders) {
+            return petal::error(-3, error);
         }
         crate::owner_action_write(ctx, network, wallet, "order.json", body, request)
     }
